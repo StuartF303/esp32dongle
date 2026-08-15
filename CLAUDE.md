@@ -125,8 +125,25 @@ gotchas. Captured 2026-08-15 while the device was still factory-fresh.
 All three original open questions (PSRAM, LCD, microSD) are now settled — see above.
 
 
-Everything to date is **read-only**. Nothing has been written to the device. Confirm with
-stuart before flashing anything — the factory demo is the only firmware on board and
-there is no OTA slot to fall back to.
+**First write to the device: 2026-08-15.** `restore.sh --yes` was run as a deliberate test of
+the recovery path while the device was still factory-fresh — it wrote the same bytes already
+present, re-verified all five regions, and the device booted cleanly afterwards
+(`Hello T-Dongle-S3`, SD mounted, Wi-Fi scan). **The restore path is proven end to end:
+write → verify → boot.** Repartitioning is now safe to attempt.
 
-No application code yet. Target project undecided as of 2026-08-15.
+No application code yet. Architecture and feature plan agreed 2026-08-15 — see
+`ARCHITECTURE.md`. Headlines:
+
+- Transport-agnostic command bus; USB CDC, HTTP/WebSocket and BLE GATT are adapters onto it.
+- **ESP32-S3 is BLE-only** (no Bluetooth Classic, no SPP/PAN), and iOS has no Web Bluetooth,
+  so a phone web UI must arrive over Wi-Fi. BLE is a control/provisioning channel, not the
+  UI channel.
+- Tool modules (hid, msc, storage, wifiscan, blescan, display) register with a registry and
+  are enable/disable-able at runtime with exclusive resource claims.
+- Repartitioning to a 16 MB dual-OTA layout is **authorised by stuart**, and the restore
+  path it depends on has been verified end to end (see above).
+
+`restore.sh` takes `--yes`/`-y` for unattended use. Without it, and with stdin not a terminal,
+it refuses (exit 2) rather than prompting into the void — so `echo y | ./restore.sh` no longer
+works. Recovery from any bad flash: hold BOOT (GPIO 0) while plugging in for ROM download mode.
+The S3 ROM loader is mask ROM and cannot be erased, so the device is not brickable.

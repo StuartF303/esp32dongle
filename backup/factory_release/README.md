@@ -6,8 +6,15 @@ read off the device on **2026-08-15** before anything was ever written to it.
 To put the dongle back exactly as it came:
 
 ```bash
-./restore.sh
+./restore.sh                 # prompts before writing
+./restore.sh --yes           # no prompt — for scripts and agents (-y also works)
+./restore.sh --with-nvs      # also restore the factory NVS contents
+./restore.sh --port /dev/X   # a different serial port
 ```
+
+`--yes` exists so the script can run unattended. It is never implied: without it, and with
+stdin not a terminal, the script **refuses to run** (exit 2) rather than prompting into the
+void. It still prints everything it is about to write before it writes it, either way.
 
 ## What the device was running
 
@@ -63,6 +70,10 @@ Every image was read back and checked against the device with
   rewrite it — the factory header declares an 8 MB flash size even though the chip is
   16 MB, and that is how it shipped.
 - **Recovery if a flash goes wrong:** hold the BOOT button (GPIO 0) while plugging the
-  dongle in to force the ROM download mode, then run `restore.sh`.
+  dongle in to force the ROM download mode, then run `restore.sh`. The S3's ROM loader is
+  in mask ROM and cannot be erased, so a bad flash is recoverable no matter what state the
+  SPI flash is left in.
+- **Piping an answer no longer works.** `echo y | ./restore.sh` used to be consumed by the
+  `read` prompt and proceed; it now refuses (exit 2). Pass `--yes` explicitly instead.
 - **Keep the microSD card FAT32.** The factory app has no exFAT support, so reformatting
   the card exFAT on a PC will make it unmountable on the dongle again.

@@ -5,20 +5,29 @@
 #   ./restore.sh                 # restore bootloader + partition table + app + spiffs
 #   ./restore.sh --with-nvs      # also restore the factory NVS contents
 #   ./restore.sh --port /dev/X   # use a different serial port
+#   ./restore.sh --yes           # skip the confirmation prompt (-y also works)
 #
 # Every image in this directory was read from the device and verified byte-for-byte
 # against it with `esptool verify-flash` before being saved.
+#
+# The confirmation prompt is the default; it's only skipped when --yes/-y is passed.
+# If stdin isn't a terminal and --yes wasn't given, the script refuses to run instead
+# of letting the interactive `read` fail silently.
 #
 set -euo pipefail
 
 PORT=/dev/ttyACM0
 WITH_NVS=0
+ASSUME_YES=0
 
 while (($#)); do
     case $1 in
         --port)     PORT=$2; shift 2 ;;
         --with-nvs) WITH_NVS=1; shift ;;
-        -h|--help)  sed -n '2,12p' "$0"; exit 0 ;;
+        -y|--yes)   ASSUME_YES=1; shift ;;
+        # Print the header block by scanning to `set -euo pipefail` rather than a fixed
+        # line range, so editing the comment above can't silently truncate --help.
+        -h|--help)  sed -n '2,/^set -euo pipefail/{/^set -euo pipefail/d;p}' "$0"; exit 0 ;;
         *)          echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -52,8 +61,16 @@ echo "About to WRITE to $PORT:"
 for ((i = 0; i < ${#FILES[@]}; i += 2)); do
     printf '  %-10s %s\n' "${FILES[i]}" "${FILES[i+1]}"
 done
-read -rp "Proceed? [y/N] " reply
-[[ $reply == [yY] ]] || { echo "aborted"; exit 1; }
+
+if ((ASSUME_YES)); then
+    echo "--yes given, skipping confirmation."
+elif [[ -t 0 ]]; then
+    read -rp "Proceed? [y/N] " reply
+    [[ $reply == [yY] ]] || { echo "aborted"; exit 1; }
+else
+    echo "stdin is not a terminal; refusing to prompt. Pass --yes/-y to proceed non-interactively." >&2
+    exit 2
+fi
 
 "${ESP[@]}" "${ARGS[@]}" "${FILES[@]}"
 
