@@ -1,0 +1,8 @@
+# Scratch dumps and analysis artefacts — the canonical images live in
+# backup/factory_release/, which is deliberately NOT ignored.
+*.strings
+part_*.bin
+sub_*.bin
+fix_*.bin
+appdump.bin
+apphdr.bin

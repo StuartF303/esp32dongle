@@ -1,0 +1,26 @@
+Known-good boot log — factory firmware, 115200 baud on /dev/ttyACM0, with a
+FAT32-formatted 128 GB microSD fitted. Captured 2026-08-15.
+
+Hello T-Dongle-S3
+SD_MMC Card Type: SD_MMCHC
+SD_MMC Card Size: 120580
+Total space: 120534MB
+Used space: 0MB
+scan start
+scan done
+7 networks found
+1: <ssid redacted> (-72)*
+2: <ssid redacted> (-75)*
+3: <ssid redacted> (-76)*
+4: <ssid redacted> (-80)*
+5: <ssid redacted> (-80)*
+6: <ssid redacted> (-82)*
+7: <ssid redacted> (-88)*
+
+The scan results are whatever Wi-Fi is in range, so the SSID list will differ on any
+other capture — only the surrounding structure matters. Without a card, or with a card
+the firmware cannot read, lines 2-5 are replaced by:
+
+E (3001) vfs_fat_sdmmc: mount_to_vfs failed (0xffffffff).
+[  3247][E][SD_MMC.cpp:142] begin(): Failed to mount filesystem. ...
+Card Mount Failed
