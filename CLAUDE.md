@@ -93,6 +93,21 @@ schematics under `schematic/`, and PlatformIO board JSONs under `boards/`.
 Bash tool. Do **not** retry with `sudo` from the Bash tool: that shell has no TTY, so
 sudo cannot prompt. Ask stuart to run it in his own terminal and paste the output.
 
+## HID event access
+
+`stuart` was added to the `input` group on 2026-08-16 so the dongle's own keystrokes can be
+verified programmatically instead of by typing into a focused window. The group is in the
+database but **not** in this session's effective groups — the Bash tool inherits them from the
+running Claude Code process, so a desktop re-login alone will not help. Use `sg` instead of
+restarting anything:
+
+```bash
+sg input -c 'cat /dev/input/by-id/usb-*T-Dongle*-event-kbd'
+```
+
+Read **only the dongle's own node**. The `input` group also exposes stuart's real keyboard
+(`usb-Razer_Razer_BlackWidow_Elite-event-kbd`); do not read it.
+
 esptool is not installed system-wide. Invoke via uv:
 
 ```bash

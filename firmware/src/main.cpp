@@ -1,10 +1,11 @@
 // usbdongle W1 — cooperative main loop and command console over USB CDC.
 //
 // Builds on the W0 bring-up skeleton (chip/partition/OTA banner on boot).
-// New in W1: a non-blocking Scheduler drives everything in loop() instead of
-// delay(), and Console implements the line-delimited JSON command protocol
-// from ../ARCHITECTURE.md section 2 over the same USB CDC link. No module
-// registry yet — see console.h for why — and still no LCD, SD, Wi-Fi or BLE.
+// A non-blocking Scheduler drives everything in loop() instead of delay(),
+// Console implements the line-delimited JSON command protocol from
+// ../ARCHITECTURE.md section 2 over USB CDC, and the module registry
+// (registry.h) owns what is running and which resources it holds. Still no
+// LCD, SD, Wi-Fi or BLE.
 
 #include <Arduino.h>
 #include <esp_chip_info.h>
@@ -13,7 +14,9 @@
 
 #include "console.h"
 #include "led.h"
+#include "mod_led.h"
 #include "partition_info.h"
+#include "registry.h"
 #include "scheduler.h"
 
 namespace {
@@ -124,7 +127,28 @@ void setup() {
   printRunningPartitionAndOtaState();
 
   Console::begin();
-  scheduler.addTask("led.heartbeat", 500, Led::heartbeatTask);
+
+  // Register every module, then replay the persisted enable-set. Registration
+  // order is also restore order, so the outcome of an unsatisfiable persisted
+  // combination is deterministic.
+  registry.add(ledModuleDescriptor());
+  registry.restoreFromNvs();
+
+  const ModuleRestoreReport &restore = registry.restoreReport();
+  if (!restore.nvsRead) {
+    // No NVS namespace at all: first boot after a flash or an NVS erase.
+    // Bring the default set up so the device isn't silently inert. This is
+    // distinguishable from "the user turned everything off", which persists
+    // an empty string into an existing namespace.
+    ModuleActionResult r;
+    registry.enable("led", false, r);
+    Serial.printf("\nmodules: no persisted state, defaulting to \"led\" (%s)\n", r.msg);
+  } else {
+    Serial.printf("\nmodules: restored %u, skipped %u, unknown %u (see the `modules` command)\n",
+                  (unsigned)restore.restoredCount, (unsigned)restore.skippedCount, (unsigned)restore.unknownCount);
+  }
+
+  scheduler.addTask("led.heartbeat", 500, ledModuleTask);
   scheduler.addTask("heartbeat.event", 5000, heartbeatEventTask);
   scheduler.addTask("console.poll", 0, Console::poll);
 

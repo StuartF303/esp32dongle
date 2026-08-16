@@ -6,15 +6,18 @@
 //   event:    {"ev":"...","d":{...}}
 //
 // Also accepts a bare word as shorthand, so the console is typeable by hand:
-//   info            -> {"act":"info"}
-//   led ff0000      -> {"act":"led","p":{"rgb":"ff0000"}}
-//   log debug       -> {"act":"log","p":{"level":"debug"}}
-//   <anything else> -> {"act":"<word>","p":{"arg":"<rest>"}}
+//   info             -> {"act":"info"}
+//   led ff0000       -> {"act":"led","p":{"rgb":"ff0000"}}
+//   log debug        -> {"act":"log","p":{"level":"debug"}}
+//   enable led       -> {"act":"enable","p":{"id":"led"}}
+//   enable msc force -> {"act":"enable","p":{"id":"msc","force":true}}
+//   <anything else>  -> {"act":"<word>","p":{"arg":"<rest>"}}
 //
-// There is no module registry yet (that's later W1/W3 work per
-// ARCHITECTURE.md section 6) — commands below are built-in to the console
-// itself. The dispatch table shape is deliberately close to what a future
-// module registry entry looks like, so wiring modules in later is additive.
+// Two kinds of command reach here:
+//   * built-ins (help/info/parts/mem/uptime/tasks/log/reboot, plus
+//     modules/enable/disable/selftest) — the table in console.cpp;
+//   * anything carrying "mod", which is handed straight to the module
+//     registry (registry.h). The console does no module-specific work.
 
 #pragma once
 

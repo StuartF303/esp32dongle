@@ -7,7 +7,9 @@ namespace {
 const uint8_t APA102_DATA_PIN = 40;
 const uint8_t APA102_CLOCK_PIN = 39;
 
-bool overrideActive = false;
+bool overrideActive_ = false;
+bool blinkOn_ = false;
+uint8_t lastR_ = 0, lastG_ = 0, lastB_ = 0;
 
 void apa102SendByte(uint8_t b) {
   for (uint8_t bit = 0; bit < 8; bit++) {
@@ -36,6 +38,10 @@ void apa102SetColor(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 8) {
   apa102SendByte(0xFF);
   apa102SendByte(0xFF);
   apa102SendByte(0xFF);
+
+  lastR_ = r;
+  lastG_ = g;
+  lastB_ = b;
 }
 
 }  // namespace
@@ -49,19 +55,36 @@ void begin() {
 }
 
 void setOverrideColor(uint8_t r, uint8_t g, uint8_t b) {
-  overrideActive = true;
+  overrideActive_ = true;
   apa102SetColor(r, g, b);
 }
 
-void heartbeatTask() {
-  static bool on = false;
+void clearOverride() {
+  overrideActive_ = false;
+  blinkOn_ = false;
+  apa102SetColor(0, 0, 0);
+}
 
-  if (overrideActive) {
-    return;  // console has taken manual control
+bool overrideActive() { return overrideActive_; }
+
+void off() {
+  blinkOn_ = false;
+  apa102SetColor(0, 0, 0);
+}
+
+void currentColor(uint8_t *r, uint8_t *g, uint8_t *b) {
+  *r = lastR_;
+  *g = lastG_;
+  *b = lastB_;
+}
+
+void heartbeatTask() {
+  if (overrideActive_) {
+    return;  // manual colour set; leave it alone
   }
 
-  on = !on;
-  if (on) {
+  blinkOn_ = !blinkOn_;
+  if (blinkOn_) {
     apa102SetColor(20, 12, 0);
   } else {
     apa102SetColor(0, 0, 0);

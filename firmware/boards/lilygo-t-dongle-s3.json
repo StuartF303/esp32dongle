@@ -5,7 +5,6 @@
     },
     "core": "esp32",
     "extra_flags": [
-      "-DARDUINO_USB_MODE=1",
       "-DARDUINO_USB_CDC_ON_BOOT=1",
       "-DARDUINO_RUNNING_CORE=1",
       "-DARDUINO_EVENT_RUNNING_CORE=1",
@@ -21,7 +20,8 @@
       ]
     ],
     "mcu": "esp32s3",
-    "variant": "esp32s3"
+    "variant": "esp32s3",
+    "_comment_usb_mode": "ARDUINO_USB_MODE is deliberately NOT set here. Both envs in platformio.ini define it explicitly (0 = TinyUSB composite, 1 = USB-Serial/JTAG); setting it here too caused 67 '-DARDUINO_USB_MODE redefined' warning pairs per build, which mask real warnings."
   },
   "connectivity": [
     "bluetooth",
