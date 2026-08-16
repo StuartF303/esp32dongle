@@ -12,13 +12,22 @@ real on this board, and the obvious explanation was wrong more than once.
 
 ```bash
 cd ~/projects/usbdongle/firmware
-~/.local/bin/pio run -d .              # build (guard script runs first)
-~/.local/bin/pio run -d . -t upload    # flash — REPARTITIONS, destroys factory demo
+~/.local/bin/pio run -d .              # build (guard scripts run first)
+~/.local/bin/pio run -d . -t upload    # flash
+sleep 5                                # native USB re-enumerates after the reset
 uv run --with pyserial python tools/console.py info
 ```
 
-Deploy takes ~10 s end to end. Do not add `sudo`; the Bash tool has no TTY and sudo cannot
+Deploy is ~12 s end to end. Do not add `sudo`; the Bash tool has no TTY and sudo cannot
 prompt. `stuart` is already in `dialout`.
+
+**Two build environments.** Default is `t-dongle-s3-tinyusb` (`ARDUINO_USB_MODE=0`) — TinyUSB
+composite, required for `hid`/`msc`. `-e t-dongle-s3` is the `ARDUINO_USB_MODE=1` fallback: the
+fixed-function USB-Serial/JTAG peripheral, ~2 s faster to flash and the **only** way to get
+USB-JTAG. Both share one partition table; switching between them is just a reflash.
+
+The TinyUSB env needs `scripts/touch_reset.py` (already wired in) to flash at all — see the
+`No serial data received` row below.
 
 `pio` is at `~/.local/bin/pio` (uv-managed). It is **not** on the Bash tool's `PATH` — use the
 full path or the call fails with `command not found`.
@@ -99,7 +108,9 @@ above `0x800000` will be rejected and `littlefs` will not work.
 | `parts` shows `app0 @ 0x10000` / a `spiffs` partition | The repartition did not take — factory table still present | Re-flash. Check the `upload` output actually said `at 0x00020000` |
 | Serial read returns nothing while esptool is running | esptool holds the port exclusively | Do one or the other, never both |
 | `restore.sh` exits 2 with "stdin is not a terminal" | Deliberate. It refuses to prompt into the void | Pass `--yes`. `echo y \| ./restore.sh` no longer works |
+| `A fatal error occurred: Failed to connect to ESP32-S3: No serial data received.` on the TinyUSB env | Under `ARDUINO_USB_MODE=0` the DTR/RTS reset is implemented in **firmware**, not the fixed-function peripheral, so esptool's reset never fires. Measured 3/3 uploads fail without a touch, 3/3 clean with | `scripts/touch_reset.py` pulses the port at 1200 baud (Arduino touch convention) and is wired into the env. If it prints `skipping touch`, the port auto-detect failed — check `/dev/ttyACM0` exists. Last resort: hold BOOT while replugging |
 | `error: no response within 3.0s` on the **first** command right after `-t upload` | Not a fault. The post-flash reset re-enumerates native USB, and the 3 s default is too tight while the host re-attaches | `sleep 5` after upload, or `--timeout 8` on the first call. It answers normally from then on |
+| `{"ok":false,"e":{"code":"ELINE","msg":"line too long, discarded"}}` on the first command after a **failed** upload | Not a fault — the console recovering correctly. esptool's SLIP sync frames were left in the device's RX buffer and parsed as one over-long line | Ignore it and re-issue the command. If it repeats indefinitely, something is genuinely spamming the port |
 | Device enumerates but console times out repeatedly, even with a long timeout and no heartbeat events on a passive listen | App wedged, or flashed a bad build | Hold **BOOT (GPIO 0)** while plugging in → ROM download mode, then reflash |
 | Console commands each take ~2 s; LED heartbeat stutters | `Serial.setTxTimeoutMs(0)` missing from `setup()`. `HWCDC::write` has a 256-byte TX ring and retries `xRingbufferSend` 20× at a 100 ms default when the host is attached but not draining — normal while debugging. Tasks run in registration order, so a blocked write in `heartbeat.event` delays `console.poll` | Restore `Serial.setTxTimeoutMs(0)` immediately after `Serial.begin()` |
 

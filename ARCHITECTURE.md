@@ -233,7 +233,36 @@ The S3 has **two** USB peripherals sharing one PHY, and they are mutually exclus
   anticipates `303a:82c1`) and gives up USB-JTAG.
 
 So enabling `hid` or `msc` is not just a module toggle — it is a build-time USB mode change that
-alters how the device enumerates on the host. Plan for it in W1 rather than discovering it in W3.
+alters how the device enumerates on the host.
+
+**Resolved 2026-08-16: TinyUSB (`ARDUINO_USB_MODE=0`) is the primary build.** Both modes were
+built and flashed to the real device and the trade-off measured rather than estimated:
+
+| | MODE=1 (USB-Serial/JTAG) | MODE=0 (TinyUSB) |
+|---|---|---|
+| Static RAM | 23,040 B | 55,208 B (**+32 KB**) |
+| Flash | 322,486 B | 376,582 B (+54 KB) |
+| Free heap at idle | 345,592 B | 308,336 B (**−37 KB**) |
+| Largest free block | 286,708 B | 258,036 B |
+| Deploy loop | ~10.0 s | ~12.2 s |
+| Composite CDC+HID+MSC | impossible | available |
+| USB-JTAG | available | **gone** |
+
+Losing USB-JTAG costs nothing recoverable elsewhere: S3 JTAG is on GPIO 39–42, and on this board
+39/40 are the APA102 while 41/42 are not broken out — an external probe was never possible. The
+`coredump` partition carries post-mortem duty instead.
+
+**The 37 KB of heap is the number to watch.** That is spent before `hid` or `msc` do anything,
+on a board with no PSRAM, and Wi-Fi + NimBLE + an HTTP server still have to fit.
+
+`ARDUINO_USB_MODE` is a preprocessor `#if` selecting the `Serial` class
+(`HardwareSerial.h:442`) — there is **no runtime or boot-time switch**. The `t-dongle-s3` env is
+retained as a reflash-away fallback for any session that wants JTAG.
+
+One trap this uncovered: under TinyUSB, esptool's DTR/RTS reset is implemented in firmware, so
+`pio run -t upload` fails with `No serial data received` — measured 3/3. A 1200-baud touch
+(`scripts/touch_reset.py`, wired into the env) drops it into the ROM bootloader and restores a
+fully automated flash loop.
 
 #### OTA rollback is not automatic
 
