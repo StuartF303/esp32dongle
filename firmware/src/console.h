@@ -2,8 +2,14 @@
 //
 // Line-delimited JSON per ARCHITECTURE.md section 2:
 //   request:  {"id":7,"act":"info"}                (optional "mod", optional "p" params object)
-//   response: {"id":7,"ok":true,"d":{...}}          or {"id":7,"ok":false,"e":{"code":"...","msg":"..."}}
+//   response: {"id":7,"ok":true,"d":{...}}          or {"id":7,"ok":false,"e":{"code":"...","msg":"..."},"d":{...}}
 //   event:    {"ev":"...","d":{...}}
+//
+// `d` now survives an error response when it is non-empty: a partial result
+// (a truncated scan, a listing with unreadable entries, a self-test that ran
+// fine and found failures) is data the caller needs, and throwing it away to
+// keep the shape tidy made every such command choose between reporting the
+// failure and reporting the numbers.
 //
 // Also accepts a bare word as shorthand, so the console is typeable by hand:
 //   info             -> {"act":"info"}
@@ -18,14 +24,18 @@
 //     modules/enable/disable/selftest) — the table in console.cpp;
 //   * anything carrying "mod", which is handed straight to the module
 //     registry (registry.h). The console does no module-specific work.
+//
+// This is a TRANSPORT. It supplies the CmdContext (transport "cdc",
+// AUTH_PHYSICAL — a cable is consent) and registers itself as an event sink on
+// the bus (bus.h). Modules never call into here; see the `cdc` module
+// descriptor in mod_cdc.h for how the console appears in the registry.
 
 #pragma once
 
-#include <ArduinoJson.h>
-
 namespace Console {
 
-// Call once from setup(), after Serial.begin().
+// Call once from setup(), after Serial.begin(). Registers this transport's
+// event sink with the bus.
 void begin();
 
 // Scheduler task: drains whatever's waiting on Serial, non-blocking, and
@@ -33,9 +43,8 @@ void begin();
 // responsiveness — this only does work when bytes are actually waiting.
 void poll();
 
-// Sends an unsolicited event line: {"ev":"<name>","d":{...}}. `fill` is
-// called with the (empty) "d" object to populate; pass nullptr for an event
-// with no data.
-void sendEvent(const char *name, void (*fill)(JsonObject d));
+// True while the host has the CDC port open (reported by the `cdc` module's
+// status). Always true on builds where the framework cannot tell.
+bool connected();
 
 }  // namespace Console

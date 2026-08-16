@@ -68,10 +68,24 @@ Line-delimited JSON. Request/response are correlated by `id`; events are unsolic
 {"id": 7, "mod": "hid", "act": "type", "p": {"text": "hello"}}
 // response
 {"id": 7, "ok": true, "d": {}}
-{"id": 7, "ok": false, "e": {"code": "EBUSY", "msg": "USB claimed by msc"}}
+{"id": 7, "ok": false, "e": {"code": "EBUSY", "msg": "..."}, "d": {"partial": "..."}}
+// queued: the work was accepted, completion arrives later as an event
+{"id": 7, "ok": true, "accepted": true, "d": {"job": 3}}
 // event
 {"ev": "wifiscan.result", "d": {"ssid": "...", "rssi": -62}}
 ```
+
+**`d` survives an error** (added 2026-08-16). An error response carries `e` *and* any
+non-empty `d`; only an empty `d` is omitted. Failure and partial data are not alternatives:
+a self-test that ran fine and found three broken cases, a directory listing with two
+unreadable entries, a scan truncated by a timeout — all of them have to report the failure
+*and* hand back what they got. The earlier rule (drop `d` on any error) forced every such
+command to choose, and they all chose `ok:true` with the real outcome buried in a counter.
+
+**Three dispatch outcomes, not two.** `DISPATCH_ACCEPTED` exists because the scheduler is
+cooperative: `hid.type` of a long macro is ~8 ms per two HID reports and would hold the loop
+task for tens of seconds if it ran inline. Accepted work returns a job handle in `d` and
+reports completion as an event correlated by the request `id`.
 
 Rationale for JSON over CBOR: debuggable by hand over the serial console, and the payloads are
 small. If BLE throughput becomes a real problem the encoding is one layer to swap — the module
@@ -92,18 +106,31 @@ Each module registers a descriptor rather than being wired in by hand:
 
 ```c
 {
-  .id        = "hid",
-  .name      = "USB Keyboard",
-  .category  = CAT_INPUT,
-  .claims    = CLAIM_USB,          // bitmask of exclusive resources
-  .enable    = hid_enable,
-  .disable   = hid_disable,
-  .dispatch  = hid_dispatch,
+  .id              = "hid",
+  .name            = "USB Keyboard",
+  .category        = "input",
+  .claims          = Claims::claim(RES_USB, CLAIM_SHARED),
+  .defaultEnabled  = false,          // hid is opt-in, always
+  .bootTimeBinding = true,           // its USB interface binds before setup()
+  .essential       = false,
+  .enable = ..., .disable = ..., .dispatch = ..., .status = ...,
+  .actions = HID_ACTIONS, .actionCount = 3,   // static, .rodata
+  .tick = hidTick, .tickIntervalMs = 10,      // registry registers & gates it
 }
 ```
 
 `GET /api/modules` returns the descriptor list, and the web UI renders itself from that — so a
-new module needs **zero** front-end changes.
+new module needs **zero** front-end changes. That only works if the descriptor says what the
+module *does*, so it carries an **action table** (`act` / `help` / `params`), and a computed
+**`blocked_by`** array per module — the same `firstConflict()` walk `enable()` uses, so the
+arbitration rule the UI displays cannot drift from the one the device enforces.
+
+**`bootTimeBinding`** is the escape hatch for hardware whose real gate is boot, not runtime.
+A TinyUSB interface is registered from a C++ static constructor and the descriptor set is
+frozen by `USB.begin()` in `app_main`, before `setup()` runs — so `hid` cannot be started
+later, by any means. Enabling such a module records the intent, persists it, and returns
+`pendingRestart`; the module decides whether to bind by reading the same persisted set from
+its own static constructor (`ModulePersist::wasEnabledAtBoot()`).
 
 **Two levels of gating, both needed:**
 
@@ -111,10 +138,27 @@ new module needs **zero** front-end changes.
   are the budget.
 - **Runtime** — what is active now, persisted in NVS, toggled from the phone.
 
-Runtime claims are what make this more than cosmetic. `CLAIM_USB` means HID and MSC cannot both
-be on; `CLAIM_SD` means MSC (which hands the card to the host PC) locks out the storage browser;
-`CLAIM_RADIO_EXCL` means Wi-Fi monitor mode can't run while it's your only link to the device.
-The registry refuses the impossible combination with a clear error instead of hanging.
+Runtime claims are what make this more than cosmetic. Each module declares, per resource,
+`NONE` / `SHARED` / `EXCLUSIVE`; a module may start iff every resource it wants exclusively is
+unheld and every resource it wants shared is not held exclusively. The registry refuses the
+impossible combination with a clear error naming every blocker, instead of hanging.
+
+**Claim model, corrected 2026-08-16 against the framework rather than intuition:**
+
+- **USB is `SHARED`, for everyone.** TinyUSB on this framework builds ONE composite device
+  descriptor at boot: CDC, HID and MSC coexist, which is the entire reason `ARDUINO_USB_MODE=0`
+  was adopted. Marking USB exclusive would be inventing a physical constraint that does not
+  exist — and would make the serial console uncoexistable with both tools. Any hid/msc mutual
+  exclusion is therefore a **policy** those modules enforce themselves, not a resource conflict.
+- **`msc`'s real exclusivity is over SD**, which it hands to the host PC as a raw block device.
+  That is what locks out `storage`.
+- **The radio is two resources, `wifi` and `ble`, not one.** They behave identically while both
+  are shared, but conflating them is wrong at exclusive: Wi-Fi monitor mode must lock out other
+  Wi-Fi users and has no business evicting `blescan`. NVS persists module *ids*, never resource
+  indices, so this split cost no migration.
+- **The transports are modules too.** `cdc` claims USB shared and is `essential`: it is enabled
+  at every boot regardless of NVS and cannot be disabled. Before that, a `force` enable could
+  have reported `stopped: []` while taking away the only link to the device.
 
 ---
 
@@ -212,12 +256,14 @@ here — it gives us an out-of-band channel most IoT devices lack.
 
 | Module | Claims | Notes |
 |---|---|---|
-| `hid` | USB | Keyboard + mouse injection, macro playback from LittleFS/SD. Composite with CDC so the serial console survives. |
-| `msc` | USB, SD | Expose the SD card to the host PC as a drive. Mutually exclusive with `hid` and `storage`. |
-| `storage` | SD | Browse / upload / download the card from the phone. **Card must stay FAT32** (see CLAUDE.md). |
-| `wifiscan` | RADIO | AP survey, RSSI, channel occupancy, log to SD. Monitor mode needs `RADIO_EXCL`. |
-| `blescan` | RADIO | Device scan, beacon advertise, presence logging. |
-| `display` | LCD | Push text/images to the 160×80 ST7735 from the phone. |
+| `cdc` | usb: shared | The serial console itself, `essential` — always on, cannot be disabled. |
+| `hid` | usb: shared | Keyboard + mouse injection, macro playback from LittleFS/SD. Composite with CDC so the serial console survives. **`bootTimeBinding`** — arming it requires a reboot. Never default-enabled. |
+| `msc` | usb: shared, sd: **exclusive** | Expose the SD card to the host PC as a drive. Locks out `storage` by claim; exclusion with `hid` is module policy, not a claim. Also `bootTimeBinding`. |
+| `storage` | sd: shared | Browse / upload / download the card from the phone. **Card must stay FAT32** (see CLAUDE.md). |
+| `wifiscan` | wifi: shared (**exclusive** in monitor mode) | AP survey, RSSI, channel occupancy, log to SD. |
+| `blescan` | ble: shared | Device scan, beacon advertise, presence logging. Unaffected by Wi-Fi monitor mode. |
+| `display` | lcd: exclusive | Push text/images to the 160×80 ST7735 from the phone. |
+| `led` | led: exclusive | APA102 status colour / heartbeat. The W1 reference module. |
 | `gpio` | — | Thin on the base model: only GPIO 43/44 are broken out. |
 
 Notably absent: IR, microphone, QWIIC — those are Plus-variant hardware this board does not have.

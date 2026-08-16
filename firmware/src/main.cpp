@@ -12,8 +12,10 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 
+#include "bus.h"
 #include "console.h"
 #include "led.h"
+#include "mod_cdc.h"
 #include "mod_led.h"
 #include "partition_info.h"
 #include "registry.h"
@@ -79,18 +81,37 @@ void printChipInfo() {
   Serial.println("------------");
 }
 
-// Scheduler task: periodic liveness/free-heap event over the JSON console.
+// Scheduler task: periodic liveness/free-heap event over the event bus.
 // This used to be a plain Serial.printf() line, but once the console is live
 // stdout is a JSON-lines protocol — a bare text line here would break any
 // host-side line parser (including tools/console.py), so it's an "ev" event
 // per ARCHITECTURE.md section 2 instead.
-void fillHeartbeatEvent(JsonObject d) {
+//
+// Emitted on the BUS, not on the console: when W2 adds WebSocket and BLE
+// adapters they subscribe and this line does not change. Nothing outside a
+// transport should name a transport.
+void fillHeartbeatEvent(JsonObject d, void *ctx) {
+  (void)ctx;
   d["uptime_ms"] = millis();
   d["free_heap"] = ESP.getFreeHeap();
 }
 
-void heartbeatEventTask() {
-  Console::sendEvent("heartbeat", fillHeartbeatEvent);
+void heartbeatEventTask() { Bus::emit("heartbeat", fillHeartbeatEvent, nullptr); }
+
+// Registration failures are silent bugs otherwise: a module that never made it
+// into the table simply is not there, and the only symptom is a user asking
+// where it went.
+void addModule(const ModuleDescriptor *desc) {
+  if (!registry.add(desc)) {
+    Serial.printf("!! registry.add(\"%s\") FAILED — module unavailable this boot\n",
+                  (desc && desc->id) ? desc->id : "?");
+  }
+}
+
+void addTask(const char *name, uint32_t intervalMs, SchedulerTaskFn fn) {
+  if (!scheduler.addTask(name, intervalMs, fn)) {
+    Serial.printf("!! scheduler.addTask(\"%s\") FAILED — task will never run\n", name);
+  }
 }
 
 }  // namespace
@@ -128,29 +149,44 @@ void setup() {
 
   Console::begin();
 
+  // The lock must exist before the first add(). Everything after this point is
+  // guarded; see the threading note in registry.h.
+  registry.begin();
+
   // Register every module, then replay the persisted enable-set. Registration
   // order is also restore order, so the outcome of an unsatisfiable persisted
-  // combination is deterministic.
-  registry.add(ledModuleDescriptor());
+  // combination is deterministic. Each module's periodic tick is registered
+  // with the scheduler by add() from the descriptor — hence `cdc` and `led`
+  // going in before the two tasks below, which belong to no module.
+  addModule(cdcModuleDescriptor());
+  addModule(ledModuleDescriptor());
+
+  // Applies each descriptor's defaultEnabled on a virgin NVS, and SEALS the
+  // registry — no module may register after this.
   registry.restoreFromNvs();
 
   const ModuleRestoreReport &restore = registry.restoreReport();
-  if (!restore.nvsRead) {
-    // No NVS namespace at all: first boot after a flash or an NVS erase.
-    // Bring the default set up so the device isn't silently inert. This is
-    // distinguishable from "the user turned everything off", which persists
-    // an empty string into an existing namespace.
-    ModuleActionResult r;
-    registry.enable("led", false, r);
-    Serial.printf("\nmodules: no persisted state, defaulting to \"led\" (%s)\n", r.msg);
+  if (restore.nvsTooLong) {
+    Serial.printf(
+        "\n!! modules: persisted set is %u bytes, too long to read — NOTHING was restored.\n"
+        "   Only essential modules are up. The next enable/disable rewrites it.\n",
+        (unsigned)restore.nvsStoredLen);
+  } else if (!restore.nvsRead) {
+    // Nothing persisted at all: first boot after a flash or an NVS erase.
+    // The descriptors' defaultEnabled decided what came up. Distinguishable
+    // from "the user turned everything off", which persists an empty string.
+    Serial.printf("\nmodules: no persisted state, applied descriptor defaults (%u up)\n",
+                  (unsigned)restore.restoredCount);
   } else {
-    Serial.printf("\nmodules: restored %u, skipped %u, unknown %u (see the `modules` command)\n",
-                  (unsigned)restore.restoredCount, (unsigned)restore.skippedCount, (unsigned)restore.unknownCount);
+    Serial.printf("\nmodules: restored %u, skipped %u, unknown %u, armed %u (see the `modules` command)\n",
+                  (unsigned)restore.restoredCount, (unsigned)restore.skippedCount, (unsigned)restore.unknownCount,
+                  (unsigned)restore.armedCount);
   }
 
-  scheduler.addTask("led.heartbeat", 500, ledModuleTask);
-  scheduler.addTask("heartbeat.event", 5000, heartbeatEventTask);
-  scheduler.addTask("console.poll", 0, Console::poll);
+  addTask("heartbeat.event", 5000, heartbeatEventTask);
+  // Not a module tick: the console must keep answering even if the `cdc`
+  // module were somehow off, or a mistake would be unrecoverable over USB.
+  addTask("console.poll", 0, Console::poll);
 
   Serial.println();
   Serial.println("setup() complete — entering scheduler loop. Try: help");

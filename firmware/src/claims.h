@@ -17,11 +17,10 @@
 // ARCHITECTURE.md section 2 originally sketched): `wifiscan` and `blescan`
 // genuinely can run together — Wi-Fi/BLE coexistence is real on the ESP32-S3
 // and both radios share one antenna path under a coexistence arbiter — so
-// both take RADIO *shared*. Wi-Fi monitor mode cannot share, so it takes
-// RADIO *exclusive* and locks both of them out. `msc` hands the SD card to
-// the host PC as a block device, so it takes USB and SD *exclusive* and locks
-// out `hid` (USB) and `storage` (SD). A single-owner bitmask cannot express
-// the first case without lying about the second.
+// both take their own radio *shared*. `msc` hands the SD card to the host PC
+// as a block device, so it takes SD *exclusive* and locks out `storage`
+// (SD shared). A single-owner bitmask cannot express the first case without
+// lying about the second.
 
 #pragma once
 
@@ -30,12 +29,20 @@
 namespace Claims {
 
 // Physical/logical resources modules contend for. Extend by adding before
-// RES_COUNT; RESOURCE_NAMES below must be kept in the same order (there is a
-// static_assert-style guard in resourceName()).
+// RES_COUNT; resourceName() below must be kept in the same order — the
+// static_assert next to it fails the build if this enum grows without it.
+//
+// Wi-Fi and BLE are DELIBERATELY separate (split 2026-08-16). They behave
+// identically while both are SHARED, so conflating them costs nothing there —
+// but it is wrong at EXCLUSIVE: Wi-Fi monitor mode has to lock out other
+// Wi-Fi users and has no reason whatsoever to evict `blescan`. NVS persists
+// module *ids*, never resource indices (see registry.cpp), so reordering or
+// splitting this enum has no migration cost.
 enum Resource : uint8_t {
-  RES_USB = 0,   // the OTG/CDC peripheral and its descriptor set
+  RES_USB = 0,   // the OTG peripheral and its (boot-frozen) descriptor set
   RES_SD,        // the SDMMC 4-bit bus (GPIO 12/16/14/17/21/18)
-  RES_RADIO,     // Wi-Fi + BLE, arbitrated together — they share one antenna
+  RES_WIFI,      // the Wi-Fi MAC: STA/AP/monitor mode
+  RES_BLE,       // the BLE controller + host stack
   RES_LCD,       // ST7735 on SPI2_HOST (GPIO 3/5/4/2/1, backlight 38)
   RES_LED,       // APA102 on GPIO 40 (data) / 39 (clock)
   RES_COUNT
@@ -109,14 +116,21 @@ constexpr ClaimSet claim(Resource r1, Mode m1, Resource r2, Mode m2, Resource r3
 
 // ---- names (wire-visible; keep them short and stable) -------------------
 
+// Real guard, not a comment: adding a resource without extending
+// resourceName() below now fails the build instead of shipping "?" onto the
+// wire and into every UI that renders claims.
+static_assert(RES_COUNT == 6, "update resourceName() when the Resource enum changes");
+
 inline const char *resourceName(uint8_t r) {
   switch (r) {
     case RES_USB:
       return "usb";
     case RES_SD:
       return "sd";
-    case RES_RADIO:
-      return "radio";
+    case RES_WIFI:
+      return "wifi";
+    case RES_BLE:
+      return "ble";
     case RES_LCD:
       return "lcd";
     case RES_LED:

@@ -1,18 +1,31 @@
 #include "registry.h"
 
 #include <Preferences.h>
+#include <nvs_flash.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "scheduler.h"
 
 Registry registry;
 
 namespace {
 
+// ---- persisted format ----------------------------------------------------
+//
 // NVS storage for the enabled-module set. One string key, "id1,id2,...",
 // rather than a bitmask over registration indices: a bitmask silently means
 // something different the moment modules are reordered or one is removed,
-// which is exactly the "code changed" case this has to survive.
+// which is exactly the "code changed" case this has to survive. It is also
+// why splitting Claims::RES_RADIO cost no migration — resource indices are
+// never persisted.
+//
+// !! TWO READERS !! Registry::restoreFromNvs() and
+// ModulePersist::wasEnabledAtBoot() both parse this, and the latter runs
+// before the Registry exists (file-scope TinyUSB construction — see the
+// header). Both live in this file so the format has one home; if you change
+// the separator, the key or the namespace, change both functions below.
 //
 // This lives in the 32 K `nvs` partition at 0x9000 (ARCHITECTURE.md section 3;
 // the 4 K `nvs_keys` at 0x11000 is reserved-but-unused, for NVS encryption
@@ -42,19 +55,184 @@ void appendf(char *buf, size_t size, size_t *pos, const char *fmt, ...) {
   }
 }
 
+// ---- lock ----------------------------------------------------------------
+//
+// RAII, because Registry::enable() alone has eight early returns and a
+// hand-written take/give pair leaks the mutex the first time someone adds a
+// ninth. Also carries the reentrancy flag, so "took the lock" and "marked a
+// call in progress" cannot get out of step either.
+//
+// A null handle (begin() never called) degrades to a no-op rather than
+// crashing: a registry that works unlocked is strictly better than a device
+// that panics in setup().
+class Guard {
+ public:
+  Guard(SemaphoreHandle_t h, bool *flag) : h_(h), flag_(flag), reentered_(false) {
+    if (h_ != nullptr) {
+      xSemaphoreTakeRecursive(h_, portMAX_DELAY);
+    }
+    if (flag_ != nullptr) {
+      reentered_ = *flag_;
+      if (!reentered_) {
+        *flag_ = true;
+      }
+    }
+  }
+  ~Guard() {
+    if (flag_ != nullptr && !reentered_) {
+      *flag_ = false;
+    }
+    if (h_ != nullptr) {
+      xSemaphoreGiveRecursive(h_);
+    }
+  }
+  Guard(const Guard &) = delete;
+  Guard &operator=(const Guard &) = delete;
+
+  // True when a mutating registry call was ALREADY in progress on this task —
+  // i.e. a module callback re-entered the registry that is calling it.
+  bool reentered() const { return reentered_; }
+
+ private:
+  SemaphoreHandle_t h_;
+  bool *flag_;
+  bool reentered_;
+};
+
+// ---- scheduler trampolines ----------------------------------------------
+//
+// The Scheduler takes a plain void(*)() with no context, so each module slot
+// gets its own one-line thunk. One scheduler entry per module (named after the
+// module) keeps the per-module timing visible in the `tasks` command, which is
+// how a hogging module gets caught.
+template <uint8_t I>
+void moduleTick() {
+  registry.tickAt(I);
+}
+
+SchedulerTaskFn const MODULE_TICKS[] = {
+    moduleTick<0>, moduleTick<1>, moduleTick<2>,  moduleTick<3>,  moduleTick<4>,  moduleTick<5>,
+    moduleTick<6>, moduleTick<7>, moduleTick<8>,  moduleTick<9>,  moduleTick<10>, moduleTick<11>,
+};
+static_assert(sizeof(MODULE_TICKS) / sizeof(MODULE_TICKS[0]) == Registry::MAX_MODULES,
+              "one tick trampoline per module slot — add/remove thunks when MAX_MODULES changes");
+
 }  // namespace
+
+// ---- error helper --------------------------------------------------------
+
+void cmdErrorf(CmdError *err, const char *code, const char *fmt, ...) {
+  if (err == nullptr) {
+    return;
+  }
+  err->code = code;
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(err->msg, sizeof(err->msg), fmt, args);
+  va_end(args);
+}
+
+// ---- persisted state, without a Registry ---------------------------------
+
+bool ModulePersist::wasEnabledAtBoot(const char *id) {
+  if (id == nullptr || id[0] == '\0') {
+    return false;
+  }
+
+  // NVS IS NOT UP YET when this is called from where it has to be called from.
+  // Traced on this toolchain (Arduino-ESP32 3.3.11 / IDF 5.5.5), by
+  // disassembling the linked image:
+  //
+  //   start_cpu0_default()            startup.c:89
+  //     do_global_ctors()             <-- static ctors, incl. USBHID/USBMSC and
+  //                                       therefore this call. Scheduler NOT
+  //                                       running, NVS NOT initialised.
+  //   esp_startup_start_app()         app_startup.c:65 -> vTaskStartScheduler()
+  //     main_task() -> app_main()
+  //       Serial.begin(); USB.begin() <-- tinyusb_init(): DESCRIPTORS FROZEN
+  //       initArduino()               <-- nvs_flash_init() finally happens here
+  //       xTaskCreate(loopTask) -> setup()
+  //
+  // So the only hook that exists before the descriptor set is frozen is a
+  // static constructor, and at that moment Preferences cannot open anything.
+  // Hence the explicit nvs_flash_init() below: it is idempotent, and
+  // initArduino()'s own later call then returns ESP_OK immediately.
+  //
+  // A NO_FREE_PAGES / NEW_VERSION error is deliberately NOT handled here.
+  // initArduino() erases and retries in that case; doing it from a static
+  // constructor would mean wiping NVS before the app has drawn breath.
+  esp_err_t nvsErr = nvs_flash_init();
+  if (nvsErr != ESP_OK) {
+    return false;
+  }
+
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, true)) {
+    return false;  // no namespace yet: nothing has ever been armed
+  }
+  char buf[Registry::PERSIST_BUF_SIZE];  // same size as the writer's, by construction
+  size_t got = prefs.getString(NVS_KEY, buf, sizeof(buf));
+  prefs.end();
+  if (got == 0) {
+    // Absent, empty, or too long for buf — all of which mean "we cannot prove
+    // this module was armed". Fail closed: no interface gets bound.
+    return false;
+  }
+  buf[sizeof(buf) - 1] = '\0';
+
+  size_t idLen = strlen(id);
+  const char *cur = buf;
+  while (*cur != '\0') {
+    const char *comma = strchr(cur, ',');
+    size_t len = (comma != nullptr) ? (size_t)(comma - cur) : strlen(cur);
+    if (len == idLen && strncmp(cur, id, idLen) == 0) {
+      return true;
+    }
+    if (comma == nullptr) {
+      break;
+    }
+    cur = comma + 1;
+  }
+  return false;
+}
 
 // ---- registration --------------------------------------------------------
 
+void Registry::begin() {
+  if (lock_ == nullptr) {
+    lock_ = xSemaphoreCreateRecursiveMutex();
+  }
+}
+
 bool Registry::add(const ModuleDescriptor *desc) {
+  Guard g(lock_, nullptr);
+
+  if (sealed_) {
+    // mods_[] is only safe to hand out as raw pointers, and enabled_/desired_
+    // only safe to index, because nothing registers after boot. Enforced, not
+    // assumed.
+    return false;
+  }
   if (count_ >= MAX_MODULES || desc == nullptr || desc->id == nullptr || desc->id[0] == '\0') {
     return false;
+  }
+  if (strlen(desc->id) > MAX_ID_LEN) {
+    return false;  // would overrun the persisted set; see PERSIST_BUF_SIZE
   }
   if (indexOf(desc->id) >= 0) {
     return false;  // duplicate id: ids are wire-visible and must be unique
   }
+
+  // Register the tick BEFORE committing the module, so a full scheduler table
+  // fails the whole registration instead of leaving a module whose periodic
+  // work silently never runs.
+  if (desc->tick != nullptr && !scheduler.addTask(desc->id, desc->tickIntervalMs, MODULE_TICKS[count_])) {
+    return false;
+  }
+
   mods_[count_] = desc;
   enabled_[count_] = false;
+  desired_[count_] = false;
   count_++;
   return true;
 }
@@ -71,9 +249,18 @@ int8_t Registry::indexOf(const char *id) const {
   return -1;
 }
 
-bool Registry::isEnabled(const char *id) const {
+bool Registry::isEnabled(const char *id) {
+  Guard g(lock_, nullptr);
   int8_t idx = indexOf(id);
   return idx >= 0 && enabled_[idx];
+}
+
+void Registry::tickAt(uint8_t i) {
+  Guard g(lock_, nullptr);
+  if (i >= count_ || !enabled_[i] || mods_[i]->tick == nullptr) {
+    return;  // disabled (or gone): the module's periodic work stops dead
+  }
+  mods_[i]->tick();
 }
 
 // ---- start/stop ----------------------------------------------------------
@@ -92,7 +279,13 @@ bool Registry::startModule(uint8_t idx, const char **errMsg) {
   enabled_[idx] = true;
   if (mods_[idx]->enable != nullptr && !mods_[idx]->enable(errMsg)) {
     enabled_[idx] = false;
+    if (!restoring_) {
+      desired_[idx] = false;
+    }
     return false;
+  }
+  if (!restoring_) {
+    desired_[idx] = true;
   }
   return true;
 }
@@ -113,13 +306,56 @@ bool Registry::stopModule(uint8_t idx, const char **errMsg) {
   // forever does not fix that bug, it just spreads the damage. So the state is
   // always "disabled" afterwards, and the error says so explicitly.
   enabled_[idx] = false;
+  if (!restoring_) {
+    desired_[idx] = false;
+  }
   return ok;
+}
+
+// ---- arbitration ---------------------------------------------------------
+
+uint8_t Registry::blockersOf(uint8_t idx, const char **ids, uint8_t maxIds, char *why, size_t whySize) const {
+  uint8_t n = 0;
+  size_t pos = 0;
+  if (why != nullptr && whySize > 0) {
+    why[0] = '\0';
+  }
+
+  // Collect EVERY blocker, not just the first: a caller told "blocked by hid"
+  // that then disables hid and is told "blocked by storage" has been made to
+  // guess, twice.
+  for (uint8_t j = 0; j < count_; j++) {
+    if (j == idx || !enabled_[j]) {
+      continue;
+    }
+    uint8_t res = Claims::firstConflict(mods_[idx]->claims, mods_[j]->claims);
+    if (res == Claims::RES_COUNT) {
+      continue;
+    }
+    if (ids != nullptr && n < maxIds) {
+      ids[n] = mods_[j]->id;
+    }
+    n++;
+    if (why != nullptr) {
+      appendf(why, whySize, &pos, "%s'%s' holds %s (%s)", pos ? "; " : "", mods_[j]->id, Claims::resourceName(res),
+              Claims::modeName(mods_[j]->claims.mode[res]));
+    }
+  }
+  return n < maxIds ? n : maxIds;
 }
 
 // ---- enable / disable ----------------------------------------------------
 
 void Registry::enable(const char *id, bool force, ModuleActionResult &out) {
   out = ModuleActionResult{};
+
+  Guard g(lock_, &inCall_);
+  if (g.reentered()) {
+    out.code = "EREENTRANT";
+    snprintf(out.msg, sizeof(out.msg),
+             "refusing to enable '%s': a module callback re-entered the registry mid-operation", id ? id : "");
+    return;
+  }
 
   int8_t idxSigned = indexOf(id);
   if (idxSigned < 0) {
@@ -130,9 +366,10 @@ void Registry::enable(const char *id, bool force, ModuleActionResult &out) {
   uint8_t idx = (uint8_t)idxSigned;
   const ModuleDescriptor *desc = mods_[idx];
 
-  // Already enabled: a no-op success, not an error. Idempotence matters here
-  // because a UI, a persisted-state replay and a script can all ask at once.
-  if (enabled_[idx]) {
+  // Already enabled AND already armed: a no-op success, not an error.
+  // Idempotence matters here because a UI, a persisted-state replay and a
+  // script can all ask at once.
+  if (enabled_[idx] && desired_[idx]) {
     out.ok = true;
     out.changed = false;
     out.enabledAfter = true;
@@ -140,26 +377,40 @@ void Registry::enable(const char *id, bool force, ModuleActionResult &out) {
     return;
   }
 
-  // Collect EVERY blocker, not just the first: a caller told "blocked by hid"
-  // that then disables hid and is told "blocked by storage" has been made to
-  // guess, twice.
-  size_t pos = 0;
-  char why[160];
-  why[0] = '\0';
-  for (uint8_t j = 0; j < count_; j++) {
-    if (j == idx || !enabled_[j]) {
-      continue;
+  // Boot-time-bound module, live request: its USB interface was accepted or
+  // refused before setup() ran and nothing here can change that now. Record
+  // the intent, touch no hardware, and say plainly that it needs a reboot.
+  // (During restoreFromNvs() this branch is skipped — the boot binding has
+  // just happened, so the normal path runs and the module's own enable()
+  // verifies the interface really is there.)
+  //
+  // NOTE: claims are deliberately NOT evaluated here. An armed-but-unbound
+  // module holds nothing, so there is nothing to arbitrate yet; the conflict
+  // check happens at the next boot, in restoreFromNvs(), against whatever is
+  // actually running then. Arming cannot be refused for a conflict that may
+  // well be gone by the time it matters.
+  if (desc->bootTimeBinding && !restoring_) {
+    bool wasArmed = desired_[idx];
+    desired_[idx] = true;
+    persist();
+    out.ok = true;
+    out.changed = !wasArmed;
+    out.enabledAfter = enabled_[idx];
+    out.pendingRestart = !enabled_[idx];
+    if (out.pendingRestart) {
+      out.code = "EREBOOT";
+      snprintf(out.msg, sizeof(out.msg),
+               "module '%s' is armed%s and will bind its USB interface at the next boot; it is NOT running now. "
+               "Reboot to apply.",
+               desc->id, wasArmed ? " (already)" : "");
+    } else {
+      snprintf(out.msg, sizeof(out.msg), "module '%s' is already bound and running", desc->id);
     }
-    uint8_t res = Claims::firstConflict(desc->claims, mods_[j]->claims);
-    if (res == Claims::RES_COUNT) {
-      continue;
-    }
-    if (out.blockedByCount < ModuleActionResult::MAX_LIST) {
-      out.blockedBy[out.blockedByCount++] = mods_[j]->id;
-    }
-    appendf(why, sizeof(why), &pos, "%s'%s' holds %s (%s)", pos ? "; " : "", mods_[j]->id,
-            Claims::resourceName(res), Claims::modeName(mods_[j]->claims.mode[res]));
+    return;
   }
+
+  char why[160];
+  out.blockedByCount = blockersOf(idx, out.blockedBy, ModuleActionResult::MAX_LIST, why, sizeof(why));
 
   if (out.blockedByCount > 0) {
     if (!force) {
@@ -180,30 +431,51 @@ void Registry::enable(const char *id, bool force, ModuleActionResult &out) {
       return;
     }
 
+    // An `essential` blocker is not stoppable by anyone, force included —
+    // `cdc` is the link this very reply is going out on. Checked BEFORE
+    // anything is stopped, so a refusal costs no collateral.
+    for (uint8_t j = 0; j < count_; j++) {
+      if (j == idx || !enabled_[j] || !mods_[j]->essential ||
+          Claims::coexist(desc->claims, mods_[j]->claims)) {
+        continue;
+      }
+      out.ok = false;
+      out.code = "EESSENTIAL";
+      out.enabledAfter = false;
+      snprintf(out.msg, sizeof(out.msg),
+               "cannot enable '%s' even with force: '%s' blocks it and cannot be stopped (%s). Nothing was changed.",
+               desc->id, mods_[j]->id, mods_[j]->name);
+      return;
+    }
+
     for (uint8_t j = 0; j < count_; j++) {
       if (j == idx || !enabled_[j] || Claims::coexist(desc->claims, mods_[j]->claims)) {
         continue;
       }
       const char *derr = nullptr;
-      bool stopped = stopModule(j, &derr);
-      if (out.stoppedCount < ModuleActionResult::MAX_LIST) {
-        out.stopped[out.stoppedCount++] = mods_[j]->id;
+      if (stopModule(j, &derr)) {
+        if (out.stoppedCount < ModuleActionResult::MAX_LIST) {
+          out.stopped[out.stoppedCount++] = mods_[j]->id;
+        }
+        continue;
       }
-      if (!stopped) {
-        // Abort rather than press on: the blocker's claims were released (see
-        // stopModule) but its hardware state is now unknown, and starting the
-        // target on top of that is how you get a wedged bus. Say exactly what
-        // was stopped and that the target did NOT start.
-        out.ok = false;
-        out.code = "EDISABLE";
-        out.enabledAfter = false;
-        persist();
-        snprintf(out.msg, sizeof(out.msg),
-                 "force-enable of '%s' aborted: '%s' failed to stop (%s). %u module(s) were stopped; '%s' is NOT "
-                 "enabled.",
-                 desc->id, mods_[j]->id, derr ? derr : "no reason given", (unsigned)out.stoppedCount, desc->id);
-        return;
+
+      // Abort rather than press on: the blocker's claims were released (see
+      // stopModule) but its hardware state is now unknown, and starting the
+      // target on top of that is how you get a wedged bus. Say exactly what
+      // was stopped, what refused to stop, and that the target did NOT start.
+      if (out.failedToStopCount < ModuleActionResult::MAX_LIST) {
+        out.failedToStop[out.failedToStopCount++] = mods_[j]->id;
       }
+      out.ok = false;
+      out.code = "EDISABLE";
+      out.enabledAfter = false;
+      persist();
+      snprintf(out.msg, sizeof(out.msg),
+               "force-enable of '%s' aborted: '%s' failed to stop (%s). %u module(s) were stopped cleanly; '%s' is "
+               "NOT enabled.",
+               desc->id, mods_[j]->id, derr ? derr : "no reason given", (unsigned)out.stoppedCount, desc->id);
+      return;
     }
   }
 
@@ -240,6 +512,14 @@ void Registry::enable(const char *id, bool force, ModuleActionResult &out) {
 void Registry::disable(const char *id, ModuleActionResult &out) {
   out = ModuleActionResult{};
 
+  Guard g(lock_, &inCall_);
+  if (g.reentered()) {
+    out.code = "EREENTRANT";
+    snprintf(out.msg, sizeof(out.msg),
+             "refusing to disable '%s': a module callback re-entered the registry mid-operation", id ? id : "");
+    return;
+  }
+
   int8_t idxSigned = indexOf(id);
   if (idxSigned < 0) {
     out.code = "ENOMOD";
@@ -249,11 +529,62 @@ void Registry::disable(const char *id, ModuleActionResult &out) {
   uint8_t idx = (uint8_t)idxSigned;
   const ModuleDescriptor *desc = mods_[idx];
 
-  if (!enabled_[idx]) {
+  if (desc->essential) {
+    // Refused in the registry, not in the module's disable(): stopModule()
+    // clears enabled_ even when disable() returns false (see the stance
+    // above), so a module cannot veto its own shutdown from inside the
+    // callback. The veto has to live here to mean anything.
+    out.ok = false;
+    out.code = "EESSENTIAL";
+    out.enabledAfter = enabled_[idx];
+    snprintf(out.msg, sizeof(out.msg), "module '%s' (%s) cannot be disabled: it is this device's control link.",
+             desc->id, desc->name);
+    return;
+  }
+
+  if (desc->bootTimeBinding && !restoring_) {
+    // Symmetric with enable(): a bound USB interface cannot be withdrawn at
+    // runtime. Disarm it for the next boot and say so; do NOT claim it stopped.
+    bool wasArmed = desired_[idx];
+    desired_[idx] = false;
+    persist();
     out.ok = true;
-    out.changed = false;
+    out.changed = wasArmed;
+    out.enabledAfter = enabled_[idx];
+    out.pendingRestart = enabled_[idx];
+    if (out.pendingRestart) {
+      out.code = "EREBOOT";
+      snprintf(out.msg, sizeof(out.msg),
+               "module '%s' is disarmed and will not bind at the next boot, but its USB interface is already bound "
+               "and STAYS ACTIVE until you reboot.",
+               desc->id);
+    } else {
+      snprintf(out.msg, sizeof(out.msg), "module '%s' is disarmed; it was not bound at this boot.", desc->id);
+    }
+    return;
+  }
+
+  if (!enabled_[idx]) {
+    // Not live — so its disable() must NOT be called. This is not only the
+    // "already off" case: a module that is persisted-on but FAILED to start at
+    // boot (or was blocked by a conflict) sits here with desired_ still set,
+    // and calling a teardown on hardware that was never brought up is how you
+    // get a driver deinitialising a peripheral it does not own. All this can
+    // legitimately do is withdraw the intent.
+    bool wasDesired = desired_[idx];
+    desired_[idx] = false;
+    persist();
+    out.ok = true;
+    out.changed = wasDesired;
     out.enabledAfter = false;
-    snprintf(out.msg, sizeof(out.msg), "module '%s' is already disabled", desc->id);
+    if (wasDesired) {
+      snprintf(out.msg, sizeof(out.msg),
+               "module '%s' was not running (blocked or failed to start at boot); removed from the persisted set so "
+               "it will not be retried.",
+               desc->id);
+    } else {
+      snprintf(out.msg, sizeof(out.msg), "module '%s' is already disabled", desc->id);
+    }
     return;
   }
 
@@ -266,6 +597,9 @@ void Registry::disable(const char *id, ModuleActionResult &out) {
   if (!ok) {
     out.ok = false;
     out.code = "EDISABLE";
+    if (out.failedToStopCount < ModuleActionResult::MAX_LIST) {
+      out.failedToStop[out.failedToStopCount++] = desc->id;
+    }
     snprintf(out.msg, sizeof(out.msg),
              "module '%s' reported a failed shutdown (%s); its claims were released anyway and it is now disabled.",
              desc->id, derr ? derr : "no reason given");
@@ -273,12 +607,19 @@ void Registry::disable(const char *id, ModuleActionResult &out) {
   }
 
   out.ok = true;
+  if (out.stoppedCount < ModuleActionResult::MAX_LIST) {
+    out.stopped[out.stoppedCount++] = desc->id;
+  }
   snprintf(out.msg, sizeof(out.msg), "module '%s' disabled", desc->id);
 }
 
 // ---- listing / dispatch --------------------------------------------------
 
-void Registry::list(JsonArray out) const {
+void Registry::list(JsonArray out) {
+  Guard g(lock_, nullptr);
+
+  const char *blockers[MAX_MODULES];
+
   for (uint8_t i = 0; i < count_; i++) {
     const ModuleDescriptor *m = mods_[i];
     JsonObject o = out.add<JsonObject>();
@@ -286,6 +627,12 @@ void Registry::list(JsonArray out) const {
     o["name"] = m->name;
     o["category"] = m->category;
     o["enabled"] = enabled_[i];
+    o["essential"] = m->essential;
+    o["boot_time_binding"] = m->bootTimeBinding;
+    // Everything a UI needs to render "reboot to apply" without knowing why:
+    // `armed` is the persisted intent, `pending_restart` is intent != live.
+    o["armed"] = desired_[i];
+    o["pending_restart"] = desired_[i] != enabled_[i];
 
     // Only non-NONE claims are rendered, so the object reads as "what this
     // module takes" rather than a wall of "none".
@@ -296,8 +643,28 @@ void Registry::list(JsonArray out) const {
       }
     }
 
+    // Same firstConflict() walk enable() uses — see blockersOf(). Empty for an
+    // already-enabled module, by definition. This is here so the arbitration
+    // rule is not reimplemented in JavaScript and then allowed to drift from
+    // the one the device actually enforces.
+    uint8_t nb = blockersOf(i, blockers, MAX_MODULES, nullptr, 0);
+    JsonArray blockedBy = o["blocked_by"].to<JsonArray>();
+    for (uint8_t b = 0; b < nb; b++) {
+      blockedBy.add(blockers[b]);
+    }
+
+    // What the module DOES. Static .rodata, so this costs flash, not RAM.
+    JsonArray actions = o["actions"].to<JsonArray>();
+    for (uint8_t a = 0; a < m->actionCount; a++) {
+      JsonObject ao = actions.add<JsonObject>();
+      ao["act"] = m->actions[a].act;
+      ao["help"] = m->actions[a].help;
+      ao["params"] = m->actions[a].params;
+    }
+
     // status() is only called while the module is enabled — a disabled module
-    // may have deinitialised the very peripheral it would read.
+    // may have deinitialised the very peripheral it would read. The lock is
+    // held across the call, so that is now enforced rather than hoped for.
     if (enabled_[i] && m->status != nullptr) {
       JsonObject s = o["status"].to<JsonObject>();
       m->status(s);
@@ -305,54 +672,65 @@ void Registry::list(JsonArray out) const {
   }
 }
 
-bool Registry::dispatch(const char *id, const char *act, JsonObjectConst p, JsonObject d, const char **errCode,
-                        const char **errMsg) {
+DispatchResult Registry::dispatch(const char *id, const char *act, const CmdContext &ctx, JsonObjectConst p,
+                                  JsonObject d, CmdError *err) {
+  Guard g(lock_, &inCall_);
+  if (g.reentered()) {
+    cmdErrorf(err, "EREENTRANT", "module '%s' re-entered the registry from a callback", id ? id : "");
+    return DISPATCH_FAIL;
+  }
+
   int8_t idxSigned = indexOf(id);
   if (idxSigned < 0) {
-    *errCode = "ENOMOD";
-    snprintf(errBuf_, sizeof(errBuf_), "no such module: '%s'", id ? id : "");
-    *errMsg = errBuf_;
-    return false;
+    cmdErrorf(err, "ENOMOD", "no such module: '%s'", id ? id : "");
+    return DISPATCH_FAIL;
   }
   uint8_t idx = (uint8_t)idxSigned;
   const ModuleDescriptor *m = mods_[idx];
 
   if (!enabled_[idx]) {
-    *errCode = "EDISABLED";
-    snprintf(errBuf_, sizeof(errBuf_), "module '%s' is disabled; enable it first", m->id);
-    *errMsg = errBuf_;
-    return false;
+    if (m->bootTimeBinding && desired_[idx]) {
+      // Armed but not bound. "enable it first" would be a lie — it IS enabled,
+      // as far as the user's last instruction goes; what it needs is a reboot.
+      cmdErrorf(err, "EREBOOT", "module '%s' is armed but only binds at boot; reboot to use it", m->id);
+      return DISPATCH_FAIL;
+    }
+    cmdErrorf(err, "EDISABLED", "module '%s' is disabled; enable it first", m->id);
+    return DISPATCH_FAIL;
   }
 
   if (m->dispatch == nullptr) {
-    *errCode = "ENOACT";
-    snprintf(errBuf_, sizeof(errBuf_), "module '%s' takes no actions", m->id);
-    *errMsg = errBuf_;
-    return false;
+    cmdErrorf(err, "ENOACT", "module '%s' takes no actions", m->id);
+    return DISPATCH_FAIL;
   }
 
   if (act == nullptr) {
-    *errCode = "ENOACT";
-    snprintf(errBuf_, sizeof(errBuf_), "missing \"act\" for module '%s'", m->id);
-    *errMsg = errBuf_;
-    return false;
+    cmdErrorf(err, "ENOACT", "missing \"act\" for module '%s'", m->id);
+    return DISPATCH_FAIL;
   }
 
-  return m->dispatch(act, p, d, errCode, errMsg);
+  return m->dispatch(ctx, act, p, d, err);
 }
 
 // ---- persistence ---------------------------------------------------------
 
 void Registry::persist() {
-  if (persistSuppressed_) {
+  if (restoring_) {
+    // Replaying stored intent is not changing it. A module skipped this boot
+    // therefore stays in the persisted set and comes back on its own once the
+    // conflict is gone.
     return;
   }
 
+  // desired_, NOT enabled_: they differ for a bootTimeBinding module that has
+  // been armed or disarmed since the last reboot, and for a module that was
+  // skipped at boot because its resources were taken. Persisting enabled_
+  // would quietly delete both kinds of intent at the next write.
   char out[PERSIST_BUF_SIZE];
   size_t pos = 0;
   out[0] = '\0';
   for (uint8_t i = 0; i < count_; i++) {
-    if (enabled_[i]) {
+    if (desired_[i]) {
       appendf(out, sizeof(out), &pos, "%s%s", pos ? "," : "", mods_[i]->id);
     }
   }
@@ -372,55 +750,95 @@ void Registry::persist() {
 }
 
 void Registry::restoreFromNvs() {
+  Guard g(lock_, nullptr);
+
   report_ = ModuleRestoreReport{};
   report_.nvsWriteOk = true;
   memset(buf_, 0, sizeof(buf_));
 
+  size_t storedLen = 0;  // NVS length INCLUDING the NUL, 0 if the key is absent
+  size_t got = 0;
   Preferences prefs;
-  if (!prefs.begin(NVS_NAMESPACE, true)) {
-    // The namespace does not exist yet: first boot after a flash or an NVS
-    // erase. Not an error, and never a reason to stop booting.
-    report_.nvsRead = false;
-    return;
+  if (prefs.begin(NVS_NAMESPACE, true)) {
+    storedLen = prefs.getStringLength(NVS_KEY);
+    got = prefs.getString(NVS_KEY, buf_, sizeof(buf_));
+    prefs.end();
   }
-  prefs.getString(NVS_KEY, buf_, sizeof(buf_));
-  prefs.end();
-  report_.nvsRead = true;
   buf_[sizeof(buf_) - 1] = '\0';
 
-  // Split in place. Each token stays a NUL-terminated string inside buf_,
-  // which is a member, so report_.unknown[] may safely point into it.
+  // Three distinct outcomes, and the old code collapsed them into one.
+  //   storedLen == 0            -> nothing persisted: first boot, or NVS erased.
+  //   storedLen > 0, got > 0    -> read it (note "" is a legitimate stored value:
+  //                                the user turned everything off).
+  //   storedLen > 0, got == 0   -> the stored string is LONGER than buf_.
+  //     Preferences::getString() returns 0 and leaves the buffer untouched, so
+  //     this used to look exactly like "nothing is enabled": every module
+  //     silently off, no error anywhere, forever. Now it is reportable.
+  report_.nvsRead = storedLen > 0;
+  report_.nvsStoredLen = storedLen;
+  report_.nvsTooLong = (storedLen > 0 && got == 0);
+  if (report_.nvsTooLong) {
+    buf_[0] = '\0';  // do not parse a buffer getString() never wrote to
+  }
+
   bool want[MAX_MODULES] = {false};
-  char *cur = buf_;
-  while (cur != nullptr && *cur != '\0') {
-    char *comma = strchr(cur, ',');
-    if (comma != nullptr) {
-      *comma = '\0';
+
+  if (!report_.nvsRead) {
+    // First boot: the descriptors decide, not a hardcoded id list in main.cpp.
+    for (uint8_t i = 0; i < count_; i++) {
+      want[i] = mods_[i]->defaultEnabled;
     }
-    if (*cur != '\0') {
-      int8_t idx = indexOf(cur);
-      if (idx >= 0) {
-        want[idx] = true;
-      } else if (report_.unknownCount < ModuleRestoreReport::MAX_LIST) {
-        // A persisted id we no longer build. Recorded, then ignored.
-        report_.unknown[report_.unknownCount++] = cur;
+  } else if (!report_.nvsTooLong) {
+    // Split in place. Each token stays a NUL-terminated string inside buf_,
+    // which is a member, so report_.unknown[] may safely point into it.
+    char *cur = buf_;
+    while (cur != nullptr && *cur != '\0') {
+      char *comma = strchr(cur, ',');
+      if (comma != nullptr) {
+        *comma = '\0';
       }
+      if (*cur != '\0') {
+        int8_t idx = indexOf(cur);
+        if (idx >= 0) {
+          want[idx] = true;
+        } else if (report_.unknownCount < ModuleRestoreReport::MAX_LIST) {
+          // A persisted id we no longer build. Recorded, then ignored.
+          report_.unknown[report_.unknownCount++] = cur;
+        }
+      }
+      cur = (comma != nullptr) ? comma + 1 : nullptr;
     }
-    cur = (comma != nullptr) ? comma + 1 : nullptr;
+  }
+
+  // An essential module comes up whatever NVS says — including when NVS is
+  // unreadable, which is precisely when you most want the console.
+  for (uint8_t i = 0; i < count_; i++) {
+    if (mods_[i]->essential) {
+      want[i] = true;
+    }
+  }
+
+  // Record the intent BEFORE trying to act on it, and leave it alone
+  // afterwards: a module that fails to start or is skipped this boot keeps its
+  // place in the persisted set, so the next persist() (triggered by some
+  // unrelated toggle) cannot quietly delete it.
+  for (uint8_t i = 0; i < count_; i++) {
+    desired_[i] = want[i];
   }
 
   // Replay in REGISTRATION order, not NVS order, so the outcome of an
   // unsatisfiable set is deterministic instead of depending on how the string
   // happened to be written.
-  //
-  // persist() is suppressed for the duration: this is replaying stored intent,
-  // not changing it. A module skipped this boot therefore stays in the
-  // persisted set and comes back on its own once the conflict is gone. The
-  // first explicit enable/disable rewrites the set to what is actually live.
-  persistSuppressed_ = true;
+  restoring_ = true;
   for (uint8_t i = 0; i < count_; i++) {
     if (!want[i]) {
       continue;
+    }
+    if (mods_[i]->bootTimeBinding && report_.armedCount < ModuleRestoreReport::MAX_LIST) {
+      // Whether it actually bound is decided by the module's own file-scope
+      // check against ModulePersist::wasEnabledAtBoot(); its enable() below
+      // verifies that and fails loudly if the interface is missing.
+      report_.armed[report_.armedCount++] = mods_[i]->id;
     }
     ModuleActionResult r;
     enable(mods_[i]->id, false, r);
@@ -433,5 +851,8 @@ void Registry::restoreFromNvs() {
       report_.skipped[report_.skippedCount++] = mods_[i]->id;
     }
   }
-  persistSuppressed_ = false;
+  restoring_ = false;
+
+  // From here on the module set is fixed. add() fails.
+  sealed_ = true;
 }
