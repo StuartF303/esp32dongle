@@ -16,6 +16,7 @@
 #include "console.h"
 #include "led.h"
 #include "mod_cdc.h"
+#include "mod_hid.h"
 #include "mod_led.h"
 #include "partition_info.h"
 #include "registry.h"
@@ -160,6 +161,11 @@ void setup() {
   // going in before the two tasks below, which belong to no module.
   addModule(cdcModuleDescriptor());
   addModule(ledModuleDescriptor());
+  // `hid` is bootTimeBinding: its USB HID interface is bound (or not) by its own
+  // file-scope static constructor before setup() ran. Registering it here makes
+  // its RES_USB claim visible to arbitration and its actions visible to the UI;
+  // whether it actually bound this boot is answered by its own enable().
+  addModule(hidModuleDescriptor());
 
   // Applies each descriptor's defaultEnabled on a virgin NVS, and SEALS the
   // registry — no module may register after this.
