@@ -126,19 +126,70 @@ Current factory layout wastes 12 MB and has **no OTA slot**. Replacement:
 |---|---|---|---|
 | `0x0` | 32 K | bootloader | |
 | `0x8000` | 4 K | partition table | |
-| `0x9000` | 20 K | nvs | config, module enable state, Wi-Fi creds |
-| `0xe000` | 8 K | otadata | |
-| `0x10000` | 4 M | app0 (ota_0) | |
-| `0x410000` | 4 M | app1 (ota_1) | OTA target + rollback |
-| `0x810000` | ~7.9 M | littlefs | web assets, macros, logs, captures |
-| `0xff0000` | 64 K | coredump | |
+| `0x9000` | 32 K | nvs | config, module enable state, Wi-Fi creds, auth PIN/token |
+| `0x11000` | 4 K | nvs_keys | reserved, `encrypted` — makes NVS encryption possible later |
+| `0x12000` | 8 K | otadata | |
+| `0x14000` | 48 K | *(pad)* | deliberate — aligns app0 to the next 64 K boundary |
+| `0x20000` | 4 M | app0 (ota_0) | |
+| `0x420000` | 4 M | app1 (ota_1) | OTA target + rollback |
+| `0x820000` | 7.75 M | littlefs | web assets, macros, small config and log files |
+| `0xfe0000` | 128 K | coredump | |
+
+Sizing decided 2026-08-15 with stuart, after review. The three non-obvious calls:
+
+- **`nvs` 20 K → 32 K.** 20 K was inherited from the factory table, where it held almost
+  nothing. It now has to carry Wi-Fi STA config, ~6 module enable flags, an auth PIN and a
+  rotating session token — and NVS needs spare pages for compaction and wear levelling, so a
+  nearly-full NVS misbehaves rather than simply filling up.
+- **`nvs_keys` reserved.** NVS encryption requires a dedicated 4 K partition. Reserving it now
+  costs 4 K; retrofitting it later costs a full USB reflash. Encryption is *not* enabled yet —
+  this only keeps the door open.
+- **`coredump` 64 K → 128 K.** A dual-core panic with Wi-Fi, NimBLE, an HTTP server and TinyUSB
+  live can exceed 64 K and silently truncate. This device has no other debug channel once it is
+  headless.
+
+App slots stay at 4 M each even though a realistic fully-loaded build is 1.5–2.5 M. The slack
+is what buys "never repartition again", which is the whole point of getting this right once.
+
+**Bulk capture data belongs on the SD card, not `littlefs`** — NOR flash has finite erase
+cycles and the card is 128 GB and replaceable. §4 routes `wifiscan`/`blescan` output to SD
+accordingly.
 
 Dual OTA is the point of the exercise: after the first flash, every iteration goes over the air
 from the phone, and a bad build rolls back instead of bricking.
 
-**Guard rail:** the very first thing to verify after any repartition is that
-`backup/factory_release/restore.sh` still puts the device back. Test the escape hatch before
-relying on it.
+**Guard rail — done, and re-proven after the fact.** `restore.sh --yes` was first run on
+2026-08-15 while the device was still factory-fresh. It was then run again as a full round-trip
+*from the repartitioned layout*: restore → factory demo boots → reflash W1 → console responds.
+That second run is the one that counts, because it is the only evidence `restore.sh` can
+actually overwrite our 16 MB-header bootloader and 7-entry table with the factory 8 MB-header,
+5-entry ones. Recovery is now demonstrated, not merely reasoned about.
+
+### Repartitioning is NOT a standalone step
+
+Decided 2026-08-15 after decoding the factory images:
+
+```
+bootloader.bin  header: flash size = 8MB   (chip is actually 16MB)
+app0.bin        header: flash size = 8MB
+```
+
+The ESP-IDF bootloader validates partition entries against the flash size in its own header and
+rejects any that overrun it. The planned `littlefs` at `0x810000–0xff0000` lies entirely beyond
+8 MB, so writing the new table under the **factory** bootloader would likely refuse to boot —
+not merely lose SPIFFS.
+
+It is fixable (flash the bootloader with `--flash-size 16MB` instead of `keep`, which makes
+esptool rewrite the header and recompute the image hash), but not worth doing on its own:
+
+- A partition table is inert. It only means anything once firmware uses it.
+- Repartitioning now costs the working factory demo — its `spiffs` partition ceases to exist —
+  and buys nothing until `app0` has our own app in it.
+- PlatformIO writes bootloader + partition table + app in a single flash anyway. Our own
+  bootloader will carry a 16 MB header, so the repartition falls out of the first real flash
+  for free.
+
+**So: the repartition happens as part of the W0 firmware flash, not before it.**
 
 ---
 
@@ -171,6 +222,26 @@ here — it gives us an out-of-band channel most IoT devices lack.
 
 Notably absent: IR, microphone, QWIIC — those are Plus-variant hardware this board does not have.
 
+#### The USB mode switch `hid`/`msc` will force
+
+The S3 has **two** USB peripherals sharing one PHY, and they are mutually exclusive at runtime:
+
+- `ARDUINO_USB_MODE=1` — the fixed-function native **USB-Serial/JTAG** block. What W0 uses, and
+  what the factory firmware enumerated as (`303a:1001`). Gives JTAG debug over the same cable.
+- `ARDUINO_USB_MODE=0` — **TinyUSB** over the OTG controller. The only way to get composite
+  CDC+HID+MSC, which `hid` and `msc` both need. Changes the USB PID (LilyGO's own board JSON
+  anticipates `303a:82c1`) and gives up USB-JTAG.
+
+So enabling `hid` or `msc` is not just a module toggle — it is a build-time USB mode change that
+alters how the device enumerates on the host. Plan for it in W1 rather than discovering it in W3.
+
+#### OTA rollback is not automatic
+
+Two OTA slots in the partition table do not by themselves give rollback. It also needs
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` and the app calling
+`esp_ota_mark_app_valid_cancel_rollback()` once it has confirmed itself healthy — e.g. after
+Wi-Fi and the HTTP server are up. Until that call exists, a bad OTA does *not* roll back.
+
 ### UI
 Phone web app (module cards, toggles, per-module panels, WS live data) · on-device LCD (mode,
 IP, PIN, activity)
@@ -179,12 +250,35 @@ IP, PIN, activity)
 
 ## 5. Build stack
 
-Recommendation: **PlatformIO + Arduino-ESP32 3.x** (which is ESP-IDF 5.1 underneath), with
+**Decided 2026-08-15: PlatformIO + Arduino-ESP32 3.x via the `pioarduino` fork**, with
 **NimBLE-Arduino** and **TinyUSB** for composite CDC+HID+MSC.
 
+The fork is required, not a preference. Official `platformio/espressif32@7.0.1` ships
+`framework-arduinoespressif32 ~3.20017.0` — that is Arduino-ESP32 **2.0.17** on IDF 4.4.x.
+PlatformIO never shipped official Arduino 3.x support; it lives in
+`github.com/pioarduino/platform-espressif32`. Arduino 3.x matters here because the `hid` and
+`msc` modules need modern TinyUSB composite support, which the 2.0.x USB stack makes painful.
+
+Trade-off accepted: the fork is community-maintained. Pin an explicit release rather than
+tracking a branch.
+
 Why not raw ESP-IDF: the LCD and SD paths are already solved in LilyGO's Arduino examples, and
-Arduino-ESP32 3.x exposes the IDF APIs we need (partitions, LittleFS, `esp_http_server`,
-TinyUSB) directly. Escape hatch if we hit a wall: Arduino-as-an-IDF-component keeps both.
+Arduino 3.x exposes the IDF APIs we need (partitions, LittleFS, `esp_http_server`, TinyUSB)
+directly. Escape hatch if we hit a wall: Arduino-as-an-IDF-component keeps both.
+
+There is no official `lilygo-t-dongle-s3` board definition in PlatformIO, so the project carries
+its own at `firmware/boards/lilygo-t-dongle-s3.json` (16 MB, no PSRAM).
+
+### Toolchain notes (this machine)
+
+- The pre-existing `~/.platformio/penv` was **broken** — built against Python 3.10, stranded by
+  the upgrade to 3.12. Replaced with `uv tool install platformio` (PlatformIO 6.1.19 at
+  `~/.local/bin/pio`), which is immune to system Python bumps.
+- **`uv tool install platformio` needs `--with pip`.** PlatformIO shells out to `pip` to install
+  esptool's Python dependencies into `tool-esptoolpy`; a uv venv has no pip by default, and the
+  package silently unpacks without its `package.json`, producing a misleading
+  `MissingPackageManifestError` and an equally misleading "sudo apt install python3-dev
+  libffi-dev libssl-dev" hint. Neither is the real cause.
 
 ---
 

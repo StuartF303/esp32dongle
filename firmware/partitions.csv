@@ -1,0 +1,12 @@
+# usbdongle 16 MB dual-OTA layout — see ARCHITECTURE.md section 3.
+# NOTE: the 48K gap between otadata (ends 0x014000) and app0 (starts 0x020000)
+# is intentional 64K alignment padding for the app partitions, not an
+# accounting error — do not "fix" it by shrinking/removing it.
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x8000,
+nvs_keys, data, nvs_keys, 0x11000,  0x1000,   encrypted
+otadata,  data, ota,      0x12000,  0x2000,
+app0,     app,  ota_0,    0x20000,  0x400000,
+app1,     app,  ota_1,    0x420000, 0x400000,
+littlefs, data, littlefs, 0x820000, 0x7C0000,
+coredump, data, coredump, 0xFE0000, 0x20000,

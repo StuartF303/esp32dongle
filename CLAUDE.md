@@ -129,7 +129,18 @@ All three original open questions (PSRAM, LCD, microSD) are now settled — see 
 the recovery path while the device was still factory-fresh — it wrote the same bytes already
 present, re-verified all five regions, and the device booted cleanly afterwards
 (`Hello T-Dongle-S3`, SD mounted, Wi-Fi scan). **The restore path is proven end to end:
-write → verify → boot.** Repartitioning is now safe to attempt.
+write → verify → boot.**
+
+**Repartitioned and running our own firmware, 2026-08-15.** The factory demo is gone; restore
+it with `backup/factory_release/restore.sh --yes` if needed. Live table read back off the
+device confirms the 16 MB dual-OTA layout (`app0` @ `0x20000`, `nvs` 32K, `nvs_keys`,
+`littlefs` @ `0x820000`, ending exactly at `0x01000000`). `info` reports
+`flash_bytes: 16777216` — our bootloader's 16 MB header is in effect, replacing the factory
+one that declared 8 MB.
+
+See the **`flash-dongle` skill** (`.claude/skills/flash-dongle/`) for the build/flash/debug
+command sequence and every failure mode hit so far with its actual cause. Read it before
+flashing rather than rediscovering them.
 
 No application code yet. Architecture and feature plan agreed 2026-08-15 — see
 `ARCHITECTURE.md`. Headlines:
