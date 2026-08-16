@@ -18,6 +18,7 @@
 #include "mod_cdc.h"
 #include "mod_hid.h"
 #include "mod_led.h"
+#include "mod_storage.h"
 #include "partition_info.h"
 #include "registry.h"
 #include "scheduler.h"
@@ -166,6 +167,11 @@ void setup() {
   // its RES_USB claim visible to arbitration and its actions visible to the UI;
   // whether it actually bound this boot is answered by its own enable().
   addModule(hidModuleDescriptor());
+  // `storage` mounts the microSD over SDMMC 4-bit and claims RES_SD SHARED.
+  // Not bootTimeBinding — SDMMC is a runtime peripheral, so enable()/disable()
+  // really do mount and unmount — and not defaultEnabled, so a fresh device
+  // does not expose the card's contents until asked.
+  addModule(storageModuleDescriptor());
 
   // Applies each descriptor's defaultEnabled on a virgin NVS, and SEALS the
   // registry — no module may register after this.
