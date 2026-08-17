@@ -1,0 +1,7 @@
+{
+    "ok": false,
+    "e": {
+        "code": "EAUTH",
+        "msg": "the action 'storage.format' needs auth >= physical; transport 'cdc' is at level 1"
+    }
+}

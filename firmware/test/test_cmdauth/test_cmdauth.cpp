@@ -225,6 +225,108 @@ void test_deny_message_fits_a_tiny_buffer() {
   TEST_ASSERT_EQUAL_size_t(sizeof(tiny) - 1, strlen(tiny));
 }
 
+// ---- the "as" downgrade ---------------------------------------------------
+//
+// Pure-function coverage of CmdAuth::resolveAs(), the whole decision behind
+// the request envelope's optional "as" field — provable here without a
+// device, exactly per the file banner's reasoning for why this policy lives
+// host-side at all.
+
+void test_as_absent_means_unchanged() {
+  CmdAuth::AsResolution r = CmdAuth::resolveAs(nullptr, CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::NO_REQUEST);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::PHYSICAL, r.effective);
+
+  r = CmdAuth::resolveAs(nullptr, CmdAuth::NONE);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::NO_REQUEST);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::NONE, r.effective);
+}
+
+void test_as_below_actual_downgrades() {
+  CmdAuth::AsResolution r = CmdAuth::resolveAs("token", CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::OK);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::TOKEN, r.effective);
+
+  r = CmdAuth::resolveAs("none", CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::OK);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::NONE, r.effective);
+
+  r = CmdAuth::resolveAs("none", CmdAuth::TOKEN);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::OK);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::NONE, r.effective);
+}
+
+void test_as_equal_to_actual_is_a_noop() {
+  const uint8_t levels[] = {CmdAuth::NONE, CmdAuth::TOKEN, CmdAuth::PHYSICAL};
+  for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+    CmdAuth::AsResolution r = CmdAuth::resolveAs(CmdAuth::levelName(levels[i]), levels[i]);
+    TEST_ASSERT_TRUE_MESSAGE(r.outcome == CmdAuth::AsOutcome::OK, CmdAuth::levelName(levels[i]));
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(levels[i], r.effective, CmdAuth::levelName(levels[i]));
+  }
+}
+
+// The property that matters most: asking for MORE than you hold is a clear
+// error and NEVER clamps upward. Checked both by outcome and, separately, by
+// asserting `effective` itself never exceeds `actual` — the min() in
+// resolveAs() is meant to make that true unconditionally, not just on the
+// paths that also check `outcome`.
+void test_as_above_actual_errors_and_never_clamps_up() {
+  CmdAuth::AsResolution r = CmdAuth::resolveAs("physical", CmdAuth::TOKEN);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::ESCALATION);
+  TEST_ASSERT_TRUE(r.effective <= CmdAuth::TOKEN);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::TOKEN, r.effective);  // left at actual, not raised
+
+  r = CmdAuth::resolveAs("physical", CmdAuth::NONE);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::ESCALATION);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::NONE, r.effective);
+
+  r = CmdAuth::resolveAs("token", CmdAuth::NONE);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::ESCALATION);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::NONE, r.effective);
+}
+
+// The property proved exhaustively over the whole (requested, actual) grid,
+// including the unparseable and absent cases: `effective` can never exceed
+// `actual`, by construction, independent of whether the caller also checks
+// `outcome`.
+void test_as_effective_never_exceeds_actual_for_any_input() {
+  const char *requests[] = {nullptr, "", "bogus", "NONE", "none", "token", "physical"};
+  const uint8_t levels[] = {CmdAuth::NONE, CmdAuth::TOKEN, CmdAuth::PHYSICAL};
+  for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+    for (size_t j = 0; j < sizeof(levels) / sizeof(levels[0]); j++) {
+      CmdAuth::AsResolution r = CmdAuth::resolveAs(requests[i], levels[j]);
+      TEST_ASSERT_TRUE(r.effective <= levels[j]);
+    }
+  }
+}
+
+void test_as_unparseable_value_is_an_error() {
+  CmdAuth::AsResolution r = CmdAuth::resolveAs("bogus", CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::UNPARSEABLE);
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::PHYSICAL, r.effective);
+
+  // Case-sensitive, exact match only — matching isListed()'s lookup style
+  // elsewhere in this file. "Token" and " token" are not "token".
+  r = CmdAuth::resolveAs("Token", CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::UNPARSEABLE);
+  r = CmdAuth::resolveAs(" token", CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::UNPARSEABLE);
+  r = CmdAuth::resolveAs("", CmdAuth::PHYSICAL);
+  TEST_ASSERT_TRUE(r.outcome == CmdAuth::AsOutcome::UNPARSEABLE);
+}
+
+void test_parse_level_round_trips_level_name() {
+  const uint8_t levels[] = {CmdAuth::NONE, CmdAuth::TOKEN, CmdAuth::PHYSICAL};
+  for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+    uint8_t out = 255;
+    TEST_ASSERT_TRUE(CmdAuth::parseLevel(CmdAuth::levelName(levels[i]), &out));
+    TEST_ASSERT_EQUAL_UINT8(levels[i], out);
+  }
+  uint8_t out = 255;
+  TEST_ASSERT_FALSE(CmdAuth::parseLevel("bogus", &out));
+  TEST_ASSERT_FALSE(CmdAuth::parseLevel(nullptr, &out));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_levels_are_ordered_and_named);
@@ -241,5 +343,12 @@ int main(int, char **) {
   RUN_TEST(test_deny_message_fits_a_cmderror_buffer_for_every_command);
   RUN_TEST(test_deny_message_survives_degenerate_input);
   RUN_TEST(test_deny_message_fits_a_tiny_buffer);
+  RUN_TEST(test_as_absent_means_unchanged);
+  RUN_TEST(test_as_below_actual_downgrades);
+  RUN_TEST(test_as_equal_to_actual_is_a_noop);
+  RUN_TEST(test_as_above_actual_errors_and_never_clamps_up);
+  RUN_TEST(test_as_effective_never_exceeds_actual_for_any_input);
+  RUN_TEST(test_as_unparseable_value_is_an_error);
+  RUN_TEST(test_parse_level_round_trips_level_name);
   return UNITY_END();
 }

@@ -193,6 +193,95 @@ constexpr uint8_t minimumLevel() {
   return lowest;
 }
 
+// ---- the "as" downgrade (design-capture aid, added 2026-08-17) ----------
+//
+// Console::execute() accepts an optional request-envelope field
+// {"as":"token"} that asks to be DISPATCHED AND RENDERED as though the
+// caller held a lower AuthLevel than it actually does. It exists because the
+// only privileged transport on this dev machine is the USB cable
+// (AUTH_PHYSICAL), so every real capture from here answers `allowed: true`
+// to everything — there is no way, from this machine, to produce a genuine
+// sample of what a lower-level client actually receives. `as` lets the cable
+// ask for that sample honestly, by actually going through the same gate a
+// lower-level caller would hit, rather than by hand-editing a capture that is
+// documented as real device output.
+//
+// STRICTLY DOWNGRADE-ONLY. Why that is safe: lowering your own privilege can
+// only ever REDUCE what a caller can do, so `as` cannot grant anything — the
+// gate downstream still runs against the (now lower) level, so
+// `{"mod":"storage","act":"format","as":"token"}` is refused by that gate
+// exactly as a real token-level caller's `format` would be, and the format
+// code is never reached. The only real risk is a reader mistaking `as` for a
+// way to GRANT a level, which is why a request for MORE than the caller's own
+// level is not silently clamped down to it — that would look, to a skim
+// reader of a captured sample, indistinguishable from a caller that simply
+// asked for less. It is refused outright as EARGS in Console::execute().
+//
+// The escalation case is made impossible BY CONSTRUCTION, not merely tested
+// for: `effective` below is computed with a plain min(), so for every input —
+// including a value a future bug might fail to reject as ESCALATION — the
+// returned level can mathematically never exceed `actual`. The ESCALATION
+// outcome exists to give the caller a clear, explicit error, not to make the
+// downgrade itself safe; safety is the min().
+enum class AsOutcome : uint8_t {
+  NO_REQUEST,   // no "as" field present; `effective` == `actual`, unchanged
+  OK,           // parsed and <= actual; `effective` is the (possibly lower) level to use
+  ESCALATION,   // parsed but > actual — a clear error, never a clamp
+  UNPARSEABLE,  // present but not one of "none"/"token"/"physical"
+};
+
+struct AsResolution {
+  AsOutcome outcome;
+  // Valid for NO_REQUEST and OK. For ESCALATION/UNPARSEABLE this is left at
+  // `actual` (never higher, never garbage) so that even a caller which
+  // forgets to check `outcome` cannot end up using a level above its own —
+  // belt-and-braces on top of the min() above, not a substitute for checking
+  // `outcome`.
+  uint8_t effective;
+};
+
+// Parses one of the existing level names ("none"/"token"/"physical") — the
+// SAME spelling levelName() produces, so a captured `min_auth`/`auth` string
+// can be fed straight back in as an `as` value. Case-sensitive, exact match
+// only (matching isListed()'s lookup style elsewhere in this file).
+inline bool parseLevel(const char *name, uint8_t *out) {
+  if (name == nullptr || out == nullptr) {
+    return false;
+  }
+  if (streq(name, "none")) {
+    *out = NONE;
+    return true;
+  }
+  if (streq(name, "token")) {
+    *out = TOKEN;
+    return true;
+  }
+  if (streq(name, "physical")) {
+    *out = PHYSICAL;
+    return true;
+  }
+  return false;
+}
+
+// The pure decision behind the "as" envelope field. `requested` is the raw
+// "as" string from the request (nullptr if the field was absent); `actual` is
+// the caller's real AuthLevel. See the block comment above for what each
+// outcome means and why `effective` can never exceed `actual`.
+inline AsResolution resolveAs(const char *requested, uint8_t actual) {
+  if (requested == nullptr) {
+    return {AsOutcome::NO_REQUEST, actual};
+  }
+  uint8_t wanted;
+  if (!parseLevel(requested, &wanted)) {
+    return {AsOutcome::UNPARSEABLE, actual};
+  }
+  // min(), not an if-clamp: this line is what makes ESCALATION structurally
+  // incapable of granting anything, independent of the outcome check below.
+  uint8_t effective = (wanted < actual) ? wanted : actual;
+  AsOutcome outcome = (wanted > actual) ? AsOutcome::ESCALATION : AsOutcome::OK;
+  return {outcome, effective};
+}
+
 // ---- the refusal ---------------------------------------------------------
 
 // Builds the EAUTH message. `what` is a noun phrase naming what was refused —

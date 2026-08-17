@@ -755,6 +755,42 @@ bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, Json
     return false;
   }
 
+  // ---- optional "as" downgrade (see CmdAuth::resolveAs, cmdauth.h) --------
+  //
+  // {"as":"token"} / {"as":"none"} / {"as":"physical"} asks to be dispatched
+  // as though the caller held a LOWER level than it actually does.
+  // STRICTLY DOWNGRADE-ONLY: `resolveAs()` computes the effective level with
+  // a min(), so it can never exceed the caller's real level, and a request
+  // for MORE than that level is refused outright below (EARGS) rather than
+  // silently clamped — see cmdauth.h for why the escalation case is made
+  // impossible by construction, not merely checked for.
+  //
+  // Applied HERE, before CmdContext exists, which is what makes it apply to
+  // BOTH built-ins and module dispatch from a single place: `authLevel` is
+  // reassigned to the (possibly lower) effective level, and every use below —
+  // the built-in auth gate, `ctx.authLevel`, and therefore
+  // registry.dispatch()'s own gating — sees only the downgraded value. A
+  // downgraded caller is refused exactly as a real caller at that level would
+  // be (the whole point: it is what makes `storage.format as=token` safe to
+  // send — the format code is never reached), and `help`/`modules` echo the
+  // downgraded level back in `auth`/`auth_level` because they read
+  // ctx.authLevel, not the transport's real one.
+  const char *asName = req["as"] | (const char *)nullptr;
+  CmdAuth::AsResolution asRes = CmdAuth::resolveAs(asName, authLevel);
+  if (asRes.outcome == CmdAuth::AsOutcome::ESCALATION || asRes.outcome == CmdAuth::AsOutcome::UNPARSEABLE) {
+    resp["ok"] = false;
+    JsonObject e = resp["e"].to<JsonObject>();
+    e["code"] = "EARGS";
+    if (asRes.outcome == CmdAuth::AsOutcome::ESCALATION) {
+      e["msg"] = String("\"as\" cannot request a level above the caller's own (") + CmdAuth::levelName(authLevel) +
+                 ")";
+    } else {
+      e["msg"] = "\"as\" must be one of: none, token, physical";
+    }
+    return false;
+  }
+  authLevel = asRes.effective;  // never higher than it was — see resolveAs()
+
   // Who is asking. The transport decides; modules — not transports — decide
   // what a level buys (see mod_storage.cpp's requireAuth).
   CmdContext ctx;

@@ -1,9 +1,17 @@
 // usbdongle W1 — command console over USB CDC.
 //
 // Line-delimited JSON per ARCHITECTURE.md section 2:
-//   request:  {"id":7,"act":"info"}                (optional "mod", optional "p" params object)
+//   request:  {"id":7,"act":"info"}                (optional "mod", optional "p" params object,
+//                                                    optional "as" — see below)
 //   response: {"id":7,"ok":true,"d":{...}}          or {"id":7,"ok":false,"e":{"code":"...","msg":"..."},"d":{...}}
 //   event:    {"ev":"...","d":{...}}
+//
+// "as":"none"|"token"|"physical" asks execute() to dispatch as though the
+// caller held a LOWER auth level than it actually does — STRICTLY
+// downgrade-only (see CmdAuth::resolveAs in cmdauth.h); a request above the
+// caller's own level is refused with EARGS, never clamped. Exists so the one
+// privileged transport (this CDC console, AUTH_PHYSICAL) can produce a real
+// capture of what a lower-level client actually receives.
 //
 // `d` now survives an error response when it is non-empty: a partial result
 // (a truncated scan, a listing with unreadable entries, a self-test that ran
