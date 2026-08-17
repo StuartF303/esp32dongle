@@ -31,9 +31,9 @@
 //   nothing             AUTH_NONE
 //
 // ONE EXCEPTION, added with the OTA rollback work (S4): `ota` is a TOKEN row
-// whose two mutating parameters sit at OTA_MUTATE == PHYSICAL. See the block
-// above that constant for why, and for why it is the only per-parameter gate
-// among the built-ins.
+// whose three mutating parameters (confirm, rollback, boot) sit at
+// OTA_MUTATE == PHYSICAL. See the block above that constant for why, and for
+// why it is the only per-parameter gate among the built-ins.
 //
 // Note what is deliberately NOT here: `enable`/`disable` are AUTH_TOKEN even
 // for a bootTimeBinding module like `hid`, i.e. a network session may ARM the
@@ -107,9 +107,12 @@ constexpr size_t BUILTIN_COUNT = sizeof(BUILTINS) / sizeof(BUILTINS[0]);
 // ---- parameter-level elevation ------------------------------------------
 //
 // A COMMAND's row above is a FLOOR, not the whole story. `ota` reads at TOKEN
-// but its `confirm` and `rollback` parameters are terminal decisions about
-// which image this device boots — `rollback` restarts the chip into the other
-// slot — so they sit at PHYSICAL alongside `reboot`.
+// but its `confirm`, `rollback` and `boot` parameters are terminal decisions
+// about which image this device boots — `rollback` restarts the chip into the
+// other slot, and `boot` picks the slot the bootloader starts next — so they
+// sit at PHYSICAL alongside `reboot`. Three parameters, ONE gate: the check in
+// cmdOta() covers whichever was asked for, so a fourth cannot be added without
+// passing through it.
 //
 // This is the FIRST built-in to raise its own bar per-parameter, and it is
 // worth being blunt about the trade. S1's rule is "no built-in checks auth for

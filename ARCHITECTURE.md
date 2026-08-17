@@ -313,7 +313,23 @@ One trap this uncovered: under TinyUSB, esptool's DTR/RTS reset is implemented i
 (`scripts/touch_reset.py`, wired into the env) drops it into the ROM bootloader and restores a
 fully automated flash loop.
 
-#### OTA rollback — armed by the bootloader, confirmed by the app
+#
+**The Arduino core will confirm the image for you unless you stop it.** `initArduino()`
+(`cores/esp32/esp32-hal-misc.c:315`) runs before `setup()` and, under
+`CONFIG_APP_ROLLBACK_ENABLE`, calls `esp_ota_mark_app_valid_cancel_rollback()` itself via a
+**weak** `verifyOta()` that returns `true` unconditionally. Out of the box the rollback window
+therefore never exists: an image is confirmed before any application code runs, and a health
+check added later can only ever observe `VALID`.
+
+`otahealth.cpp` overrides the framework's own hook — `extern "C" bool verifyRollbackLater()`
+returning `true` — which tells the core to leave the image `PENDING_VERIFY` and let the
+application decide. Without that one function every other line of the health check is dead code.
+
+This was found on hardware, not in review: 194 host tests passed against logic that could never
+execute. The symptom was an image booting straight to `VALID` with `phase: idle` at 11 s uptime,
+long before the 30 s gate could have confirmed anything.
+
+### OTA rollback — armed by the bootloader, confirmed by the app
 
 **Corrected 2026-08-17.** Backlog S4 claimed `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` was not
 set. It is, and always has been:
@@ -371,12 +387,36 @@ scheduler task at 250 ms:
   footer renders `ota verify NN%` on both screens with no new region and no change to
   `mod_display.cpp`.
 
-**The `ota` built-in** exposes and overrides all of it. No params: running partition, state,
-whether confirmation is pending, each criterion, seconds left in the window, and the rollback
-target — reported as *two separate facts*, `has_app` (a valid image magic word is present) and
-`rollback_possible` (`otadata` actually blesses it as bootable). `p:{confirm:true}` and
-`p:{rollback:true}` force the two transitions and are **`AUTH_PHYSICAL`**; `rollback` refuses,
+**The `ota` built-in** exposes and overrides all of it. No params: running partition, the
+partition `otadata` will boot *next*, state, whether confirmation is pending, each criterion,
+seconds left in the window, and the rollback target — reported as *two separate facts*,
+`has_app` (a valid image magic word is present) and `rollback_possible` (`otadata` actually
+blesses it as bootable). `p:{confirm:true}`, `p:{rollback:true}` and `p:{boot:"<label>"}` are
+the three mutating parameters and all three are **`AUTH_PHYSICAL`**; `rollback` refuses,
 naming which of the two facts is missing, rather than rolling into an erased slot.
+
+`p:{boot:"app0"|"app1"}` (bare-word `ota boot app1`) is `esp_ota_set_boot_partition()` on a
+partition looked up **by label among app partitions only** — never an offset, because a
+hand-typed address turns a typo into a reflash. It **does not reboot**: selecting the next
+image and restarting into it are separate decisions, and `reboot` is the second one. It
+refuses, before `otadata` is touched, a malformed label, a label that names nothing, a label
+that names a *data* partition, and — the one that matters — an app partition with no valid
+image, using the same `esp_ota_get_partition_description()` check `rollback_target.has_app`
+reports. IDF then applies a stronger gate of its own (full `ESP_IMAGE_VERIFY`, so a truncated
+slot is refused too). The response carries previous and selected labels plus the selected
+image's build date and `idf_ver`, so the caller can see *which* image it just chose, and
+`ota.boot_set` goes on the bus with the old/new pair. The decision table
+(`OtaDecide::decideBootSet()`) is host-tested: every refusal branch ends on hardware in either
+"reboots into the other build" or "USB-recovery job", and only one of those is reachable safely
+on the bench.
+
+**This is the primitive S5's delivery path will use** to select the freshly written slot once
+it has finished writing it. It is also what makes the rollback machinery above testable today:
+`esp_ota_set_boot_partition()` writes the target's `otadata` entry with
+`ota_state = ESP_OTA_IMG_NEW` (verified in the disassembly of the prebuilt
+`libapp_update.a` — `movi a9, 0; s32i.n a9, a8, 24`, i.e. `ota_state = 0` on the inactive
+`otadata` sector), and with rollback armed in the bootloader that becomes a `PENDING_VERIFY`
+boot — the state a USB flash can never produce.
 
 `ota` is the first built-in whose *parameters* are gated above its row in `CmdAuth::BUILTINS`
 (reads at `TOKEN`, mutates at `CmdAuth::OTA_MUTATE == PHYSICAL`). The read stays at `TOKEN` on
@@ -384,8 +424,10 @@ purpose: once S5 lands, the client that pushed an update is the one that needs t
 was confirmed.
 
 **Still missing (backlog S5):** there is no OTA delivery path at all — nothing calls
-`esp_ota_begin`/`esp_ota_write`, and no transport accepts an image. Until then this machinery
-only ever runs if `otadata` is put into `PENDING_VERIFY` by hand.
+`esp_ota_begin`/`esp_ota_write`, and no transport accepts an image, so getting a build into the
+inactive slot is still a USB `esptool write-flash`. What is no longer missing is the last step
+of that path: `ota p:{boot:...}` selects the slot, so the confirmation machinery can be
+exercised end to end without hand-editing `otadata`.
 
 ### UI
 Phone web app (module cards, toggles, per-module panels, WS live data) · on-device LCD (mode,

@@ -238,4 +238,115 @@ inline uint8_t progressPct(const Inputs &in, const Config &cfg) {
   return (uint8_t)((uint64_t)in.uptimeMs * 100u / cfg.minUptimeMs);
 }
 
+// ---- selecting WHICH slot boots next -------------------------------------
+//
+// `ota p:{boot:"app1"}` — esp_ota_set_boot_partition() on a named app
+// partition. Separate from everything above: the state machine decides whether
+// THIS image proved itself, this decides which image runs NEXT. They share a
+// file only because they share a command.
+//
+// This is the primitive backlog S5's delivery path needs. An OTA writer ends
+// with "the image is in the other slot, now make the bootloader choose it", and
+// that is exactly this call. Having it as an operator command first means the
+// rollback machinery above can be exercised on real hardware before any
+// delivery code exists: set the boot partition to the other slot, restart, and
+// the bootloader hands the app a PENDING_VERIFY boot — which is otherwise
+// unreachable, because a USB flash never produces one (see the top of this
+// file).
+//
+// WHY THE PRECONDITIONS ARE HERE AND NOT INLINE IN THE HANDLER: the refusal
+// that matters — "that slot holds no app image" — is the difference between a
+// device that reboots into the other build and a device that is a USB-recovery
+// job. That decision is worth asserting on the host, where every branch can be
+// forced, rather than only on a board where reaching the bad branches means
+// deliberately breaking the device.
+
+// esp_partition_t::label is char[17], so 16 characters plus the NUL. A label
+// that cannot fit in the partition table cannot match anything in it, and is
+// rejected before any lookup rather than being silently truncated into a
+// match.
+constexpr size_t BOOTSET_LABEL_MAX = 16;
+
+enum BootSetVerdict : uint8_t {
+  BOOTSET_OK = 0,
+  BOOTSET_NO_LABEL,        // absent, empty, or not a string
+  BOOTSET_LABEL_TOO_LONG,  // > BOOTSET_LABEL_MAX characters
+  BOOTSET_LABEL_BAD_CHAR,  // space or non-printable ASCII
+  BOOTSET_NOT_FOUND,       // no partition of ANY type carries that label
+  BOOTSET_NOT_APP,         // the label exists, but it is data (nvs, littlefs, ...)
+  BOOTSET_NO_IMAGE,        // an app partition with no valid image in it
+};
+
+// What the caller looked up. Deliberately three separate booleans rather than
+// one "usable": each maps to a different refusal, and an operator who is told
+// "no" needs to know which of the three it was — "no such label" and "that slot
+// is erased" call for completely different next steps.
+struct BootSetFacts {
+  bool found;     // some partition, any type, carries this label
+  bool isApp;     // ... and its type is app
+  bool hasImage;  // ... and it holds an image with a readable app descriptor
+};
+
+inline BootSetVerdict validateBootLabel(const char *label) {
+  if (label == nullptr || label[0] == '\0') {
+    return BOOTSET_NO_LABEL;
+  }
+  for (size_t n = 0; label[n] != '\0'; n++) {
+    if (n >= BOOTSET_LABEL_MAX) {
+      return BOOTSET_LABEL_TOO_LONG;
+    }
+    const unsigned char c = (unsigned char)label[n];
+    // Printable, no spaces. The space rule is what makes the bare-word form
+    // safe: `ota boot app1 now` arrives as the single label "app1 now" and is
+    // refused, instead of being read as "app1" plus something ignored. A
+    // near miss must not select a boot partition.
+    if (c <= 0x20 || c >= 0x7f) {
+      return BOOTSET_LABEL_BAD_CHAR;
+    }
+  }
+  return BOOTSET_OK;
+}
+
+// Order is the whole content of this function: validate the string before
+// looking it up, distinguish "no such partition" from "not an app partition"
+// before asking about images, and check for an image LAST — because that is the
+// one that costs a flash read and the one that must not be skipped.
+inline BootSetVerdict decideBootSet(const char *label, const BootSetFacts &facts) {
+  const BootSetVerdict v = validateBootLabel(label);
+  if (v != BOOTSET_OK) {
+    return v;
+  }
+  if (!facts.found) {
+    return BOOTSET_NOT_FOUND;
+  }
+  if (!facts.isApp) {
+    return BOOTSET_NOT_APP;
+  }
+  if (!facts.hasImage) {
+    return BOOTSET_NO_IMAGE;
+  }
+  return BOOTSET_OK;
+}
+
+// The wire error code for a refusal, nullptr for BOOTSET_OK. Here rather than
+// in the handler so the codes a client switches on are host-asserted.
+inline const char *bootSetCode(BootSetVerdict v) {
+  switch (v) {
+    case BOOTSET_OK:
+      return nullptr;
+    case BOOTSET_NO_LABEL:
+    case BOOTSET_LABEL_TOO_LONG:
+    case BOOTSET_LABEL_BAD_CHAR:
+      return "EARGS";
+    case BOOTSET_NOT_FOUND:
+      return "ENOENT";
+    case BOOTSET_NOT_APP:
+      return "ENOTAPP";
+    case BOOTSET_NO_IMAGE:
+      return "ENOIMAGE";
+    default:
+      return "EOTA";
+  }
+}
+
 }  // namespace OtaDecide

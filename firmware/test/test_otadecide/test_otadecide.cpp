@@ -257,6 +257,117 @@ void test_shipped_timings_are_internally_consistent() {
   TEST_ASSERT_TRUE(CFG.windowMs >= 60000);
 }
 
+// ---- selecting the next boot partition -----------------------------------
+//
+// The refusals, which is the whole reason this is a decision table rather than
+// four ifs in the handler. Every branch below ends, on hardware, in either
+// "the device reboots into the other build" or "the device is a USB-recovery
+// job", and only one of them is reachable safely on the bench.
+
+namespace {
+
+OtaDecide::BootSetFacts facts(bool found, bool isApp, bool hasImage) {
+  OtaDecide::BootSetFacts f;
+  f.found = found;
+  f.isApp = isApp;
+  f.hasImage = hasImage;
+  return f;
+}
+
+// A real, flashed app slot.
+OtaDecide::BootSetFacts populatedApp() { return facts(true, true, true); }
+
+}  // namespace
+
+void test_boot_label_must_be_present_and_non_empty() {
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NO_LABEL, OtaDecide::validateBootLabel(nullptr));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NO_LABEL, OtaDecide::validateBootLabel(""));
+  // p:{boot:1} and a bare `ota boot` both arrive as one of the two above, so
+  // neither can reach a lookup.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NO_LABEL, OtaDecide::decideBootSet("", populatedApp()));
+}
+
+void test_boot_label_length_is_the_partition_table_limit() {
+  char maxLabel[OtaDecide::BOOTSET_LABEL_MAX + 1];
+  memset(maxLabel, 'a', sizeof(maxLabel));
+  maxLabel[OtaDecide::BOOTSET_LABEL_MAX] = '\0';
+  TEST_ASSERT_EQUAL_UINT32(16, (uint32_t)OtaDecide::BOOTSET_LABEL_MAX);  // esp_partition_t::label is char[17]
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_OK, OtaDecide::validateBootLabel(maxLabel));
+
+  // One over. Rejected rather than truncated: esp_partition_find_first()
+  // compares at most 16 bytes, so a 17-character string would otherwise match a
+  // partition it does not name.
+  char tooLong[OtaDecide::BOOTSET_LABEL_MAX + 2];
+  memset(tooLong, 'a', sizeof(tooLong));
+  tooLong[OtaDecide::BOOTSET_LABEL_MAX + 1] = '\0';
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_TOO_LONG, OtaDecide::validateBootLabel(tooLong));
+}
+
+void test_boot_label_rejects_spaces_and_control_characters() {
+  // THE bare-word case: `ota boot app1 now` arrives as the single label
+  // "app1 now". Refusing it is what stops a near miss selecting app1.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_BAD_CHAR, OtaDecide::validateBootLabel("app1 now"));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_BAD_CHAR, OtaDecide::validateBootLabel(" app1"));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_BAD_CHAR, OtaDecide::validateBootLabel("app1\t"));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_BAD_CHAR, OtaDecide::validateBootLabel("app\x7f"));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_BAD_CHAR, OtaDecide::validateBootLabel("app\xc3\xa9"));
+  // The labels that actually exist in partitions.csv, plus the punctuation a
+  // future one might use.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_OK, OtaDecide::validateBootLabel("app0"));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_OK, OtaDecide::validateBootLabel("app1"));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_OK, OtaDecide::validateBootLabel("ota_1-b.2"));
+}
+
+void test_boot_set_refuses_a_slot_with_no_image() {
+  // THE test. An app partition that is present, correctly named and erased.
+  // Pointing the bootloader at it is how a working device becomes a USB
+  // recovery job, and this command exists to make the rollback test safe.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NO_IMAGE, OtaDecide::decideBootSet("app1", facts(true, true, false)));
+  TEST_ASSERT_EQUAL_STRING("ENOIMAGE", OtaDecide::bootSetCode(OtaDecide::BOOTSET_NO_IMAGE));
+}
+
+void test_boot_set_distinguishes_missing_from_not_an_app() {
+  // Different problems, different fixes: one is a typo, the other is pointing
+  // the bootloader at littlefs.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NOT_FOUND, OtaDecide::decideBootSet("app2", facts(false, false, false)));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NOT_APP, OtaDecide::decideBootSet("littlefs", facts(true, false, false)));
+  // hasImage cannot rescue a non-app partition, whatever the caller passes.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NOT_APP, OtaDecide::decideBootSet("nvs", facts(true, false, true)));
+}
+
+void test_boot_set_accepts_a_populated_app_partition() {
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_OK, OtaDecide::decideBootSet("app1", populatedApp()));
+  TEST_ASSERT_NULL(OtaDecide::bootSetCode(OtaDecide::BOOTSET_OK));
+}
+
+void test_boot_set_validates_the_label_before_looking_it_up() {
+  // Order matters: a malformed label must never reach a partition lookup, and
+  // the facts are ignored when it does not.
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_LABEL_BAD_CHAR, OtaDecide::decideBootSet("app1 now", populatedApp()));
+  TEST_ASSERT_EQUAL_INT(OtaDecide::BOOTSET_NO_LABEL, OtaDecide::decideBootSet(nullptr, populatedApp()));
+}
+
+void test_every_refusal_has_a_distinct_wire_code() {
+  const OtaDecide::BootSetVerdict all[] = {
+      OtaDecide::BOOTSET_NO_LABEL,  OtaDecide::BOOTSET_LABEL_TOO_LONG, OtaDecide::BOOTSET_LABEL_BAD_CHAR,
+      OtaDecide::BOOTSET_NOT_FOUND, OtaDecide::BOOTSET_NOT_APP,        OtaDecide::BOOTSET_NO_IMAGE,
+  };
+  for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+    const char *code = OtaDecide::bootSetCode(all[i]);
+    TEST_ASSERT_NOT_NULL(code);
+    TEST_ASSERT_EQUAL_CHAR('E', code[0]);  // the project's wire-code shape
+  }
+  // The three malformed-label verdicts share EARGS deliberately (the caller
+  // typed something wrong); the three lookup verdicts must NOT, because a
+  // client automating an OTA has to tell "wrong label" from "erased slot".
+  TEST_ASSERT_EQUAL_STRING("EARGS", OtaDecide::bootSetCode(OtaDecide::BOOTSET_NO_LABEL));
+  TEST_ASSERT_EQUAL_STRING("EARGS", OtaDecide::bootSetCode(OtaDecide::BOOTSET_LABEL_TOO_LONG));
+  TEST_ASSERT_EQUAL_STRING("EARGS", OtaDecide::bootSetCode(OtaDecide::BOOTSET_LABEL_BAD_CHAR));
+  TEST_ASSERT_EQUAL_STRING("ENOENT", OtaDecide::bootSetCode(OtaDecide::BOOTSET_NOT_FOUND));
+  TEST_ASSERT_EQUAL_STRING("ENOTAPP", OtaDecide::bootSetCode(OtaDecide::BOOTSET_NOT_APP));
+  TEST_ASSERT_EQUAL_STRING("ENOIMAGE", OtaDecide::bootSetCode(OtaDecide::BOOTSET_NO_IMAGE));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_crit_all_is_exactly_the_five_bits);
@@ -275,5 +386,13 @@ int main(int, char **) {
   RUN_TEST(test_remaining_saturates_instead_of_wrapping);
   RUN_TEST(test_progress_is_clamped_and_monotonic);
   RUN_TEST(test_shipped_timings_are_internally_consistent);
+  RUN_TEST(test_boot_label_must_be_present_and_non_empty);
+  RUN_TEST(test_boot_label_length_is_the_partition_table_limit);
+  RUN_TEST(test_boot_label_rejects_spaces_and_control_characters);
+  RUN_TEST(test_boot_set_refuses_a_slot_with_no_image);
+  RUN_TEST(test_boot_set_distinguishes_missing_from_not_an_app);
+  RUN_TEST(test_boot_set_accepts_a_populated_app_partition);
+  RUN_TEST(test_boot_set_validates_the_label_before_looking_it_up);
+  RUN_TEST(test_every_refusal_has_a_distinct_wire_code);
   return UNITY_END();
 }

@@ -398,10 +398,10 @@ DispatchResult cmdReboot(const CmdContext &, JsonObjectConst, JsonObject d, Json
 
 // ---- ota (backlog S4) ----------------------------------------------------
 //
-// Read-only with no params. The two mutating params are gated at
-// CmdAuth::OTA_MUTATE (PHYSICAL) here in the handler rather than by the row in
-// CmdAuth::BUILTINS — the ONLY built-in that does this, and the reasoning is
-// written down beside that constant in cmdauth.h.
+// Read-only with no params. The three mutating params — confirm, rollback and
+// boot — are gated at CmdAuth::OTA_MUTATE (PHYSICAL) here in the handler rather
+// than by the row in CmdAuth::BUILTINS — the ONLY built-in that does this, and
+// the reasoning is written down beside that constant in cmdauth.h.
 //
 // The refusal goes through the same CmdAuth::denyMessage() the central gate
 // uses, so `ota p:{rollback:true}` from a phone is byte-for-byte
@@ -410,15 +410,35 @@ DispatchResult cmdOta(const CmdContext &ctx, JsonObjectConst p, JsonObject d, Js
   bool confirm = p["confirm"] | false;
   bool rollback = p["rollback"] | false;
 
-  // Bare-word shorthand, so `ota confirm` / `ota rollback` are typeable on the
-  // CDC console like every other built-in (handleBareWord() puts the rest of
-  // the line in p.arg). Only those two exact words; anything else is IGNORED
-  // rather than guessed at, exactly as `enable`'s optional "force" is — a
-  // destructive command must not be reachable by a near miss.
+  // p:{boot:"app1"} — which slot the bootloader starts next. Presence, not
+  // truthiness: p:{boot:1} is a mistake worth reporting, so it arrives here as
+  // "asked, with no usable label" rather than being silently ignored.
+  bool bootAsked = !p["boot"].isNull();
+  const char *bootLabel = bootAsked ? (p["boot"] | (const char *)nullptr) : nullptr;
+
+  // Bare-word shorthand, so `ota confirm` / `ota rollback` / `ota boot app1`
+  // are typeable on the CDC console like every other built-in
+  // (handleBareWord() puts the rest of the line in p.arg). Only these exact
+  // words; anything else is IGNORED rather than guessed at, exactly as
+  // `enable`'s optional "force" is — a destructive command must not be
+  // reachable by a near miss.
   const char *arg = p["arg"] | (const char *)nullptr;
   if (arg != nullptr) {
     confirm = confirm || strcmp(arg, "confirm") == 0;
     rollback = rollback || strcmp(arg, "rollback") == 0;
+    // "boot app1" arrives as one string because the shim is deliberately thin
+    // (one key, the whole remainder). Splitting it HERE rather than teaching
+    // handleBareWord() a third special case keeps that shim thin. A bare
+    // `ota boot` yields the empty label, which setBootNow() refuses with the
+    // usage line — better than printing status and looking like it worked.
+    if (strncmp(arg, "boot", 4) == 0 && (arg[4] == '\0' || arg[4] == ' ')) {
+      const char *rest = arg + 4;
+      while (*rest == ' ') {
+        rest++;
+      }
+      bootAsked = true;
+      bootLabel = rest;
+    }
   }
 
   // Status FIRST, on every path including the refusals below: a caller told
@@ -426,16 +446,17 @@ DispatchResult cmdOta(const CmdContext &ctx, JsonObjectConst p, JsonObject d, Js
   // an error response (ARCHITECTURE.md section 2).
   OtaHealth::fillStatus(d);
 
-  if (!confirm && !rollback) {
+  const uint8_t asked = (confirm ? 1 : 0) + (rollback ? 1 : 0) + (bootAsked ? 1 : 0);
+  if (asked == 0) {
     return DISPATCH_OK;
   }
-  if (confirm && rollback) {
-    cmdErrorf(err, "EARGS", "confirm and rollback are opposites; ask for one");
+  if (asked > 1) {
+    cmdErrorf(err, "EARGS", "confirm, rollback and boot are three different decisions; ask for one");
     return DISPATCH_FAIL;
   }
   if (!CmdAuth::permits(ctx.authLevel, CmdAuth::OTA_MUTATE)) {
     char what[48];
-    snprintf(what, sizeof(what), "'ota %s'", confirm ? "confirm" : "rollback");
+    snprintf(what, sizeof(what), "'ota %s'", bootAsked ? "boot" : (confirm ? "confirm" : "rollback"));
     char msg[sizeof(CmdError::msg)];
     CmdAuth::denyMessage(msg, sizeof(msg), what, CmdAuth::OTA_MUTATE, ctx.transport, ctx.authLevel);
     cmdErrorf(err, "EAUTH", "%s", msg);
@@ -445,18 +466,33 @@ DispatchResult cmdOta(const CmdContext &ctx, JsonObjectConst p, JsonObject d, Js
   const char *code = "EOTA";
   char msg[sizeof(CmdError::msg)];
   msg[0] = '\0';
-  // rollbackNow() does not return on success — the chip restarts into the other
-  // slot. That is why there is no "restarting" response to render: unlike
-  // `reboot`, this one cannot be deferred until after the reply, because the
-  // decision and the restart are a single IDF call.
-  bool ok = confirm ? OtaHealth::confirmNow(&code, msg, sizeof(msg)) : OtaHealth::rollbackNow(&code, msg, sizeof(msg));
+  OtaHealth::BootSetReport rep;
+  bool ok;
+  if (bootAsked) {
+    // Unlike the other two this one RETURNS. Selecting the next image and
+    // restarting into it are separate decisions on purpose — `reboot` is a
+    // second, equally PHYSICAL command.
+    ok = OtaHealth::setBootNow(bootLabel, rep, &code, msg, sizeof(msg));
+  } else if (confirm) {
+    ok = OtaHealth::confirmNow(&code, msg, sizeof(msg));
+  } else {
+    // rollbackNow() does not return on success — the chip restarts into the
+    // other slot. That is why there is no "restarting" response to render:
+    // unlike `reboot`, this one cannot be deferred until after the reply,
+    // because the decision and the restart are a single IDF call.
+    ok = OtaHealth::rollbackNow(&code, msg, sizeof(msg));
+  }
   if (!ok) {
     cmdErrorf(err, code, "%s", msg);
     return DISPATCH_FAIL;
   }
-  // Re-read: `d` was filled before the transition, so it still says "pending".
+  // Re-read: `d` was filled before the transition, so it still says "pending"
+  // (and, for boot, still names the OLD boot partition).
   d.clear();
   OtaHealth::fillStatus(d);
+  if (bootAsked) {
+    OtaHealth::fillBootSet(d["boot_set"].to<JsonObject>(), rep);
+  }
   d["msg"] = (const char *)msg;  // cast: char[] is stored by pointer, see renderActionResult()
   return DISPATCH_OK;
 }
@@ -483,8 +519,10 @@ constexpr Command COMMANDS[] = {
      CmdAuth::requiredFor("log")},
     {"bootprobe", "what the static-ctor NVS probe saw (hid arming depends on it)", cmdBootProbe,
      CmdAuth::requiredFor("bootprobe")},
-    {"ota", "rollback state + health criteria; p:{confirm:true} or p:{rollback:true} (auth >= physical)", cmdOta,
-     CmdAuth::requiredFor("ota")},
+    {"ota",
+     "rollback state + health criteria; p:{confirm:true} | p:{rollback:true} | p:{boot:\"app0|app1\"} — select "
+     "without rebooting (auth >= physical)",
+     cmdOta, CmdAuth::requiredFor("ota")},
     {"reboot", "esp_restart() — responds first (auth >= physical: the cable, not the network)", cmdReboot,
      CmdAuth::requiredFor("reboot")},
 };

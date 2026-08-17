@@ -10,6 +10,34 @@
 
 #include "activity.h"
 #include "bus.h"
+
+// ---------------------------------------------------------------------------
+// WITHOUT THIS OVERRIDE, EVERYTHING ELSE IN THIS FILE IS DEAD CODE.
+//
+// Arduino-ESP32's initArduino() (cores/esp32/esp32-hal-misc.c:315) runs BEFORE
+// setup() and does the rollback dance itself:
+//
+//     if (!verifyRollbackLater()) {
+//       if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+//         if (verifyOta()) esp_ota_mark_app_valid_cancel_rollback();
+//         else             esp_ota_mark_app_invalid_rollback_and_reboot();
+//
+// Both hooks are __attribute__((weak)) and the default verifyOta() returns true
+// unconditionally — so out of the box EVERY OTA image is confirmed at boot, the
+// rollback window never exists, and a health check running later can only ever
+// observe VALID. Caught on hardware 2026-08-17: after booting a deliberately
+// PENDING_VERIFY image, `ota` reported state VALID and phase idle at 11 s uptime,
+// long before our own 30 s gate could have confirmed anything.
+//
+// Returning true here tells the core to leave the image PENDING_VERIFY and let
+// the application decide — which is what OtaHealth::tick() then does, against
+// real criteria. This is the framework's sanctioned hook, not a workaround.
+//
+// C linkage: declared in a .c file, so the weak symbol has no C++ mangling.
+extern "C" bool verifyRollbackLater() {
+  return true;
+}
+// ---------------------------------------------------------------------------
 #include "console.h"
 #include "otadecide.h"
 #include "partition_info.h"
@@ -29,9 +57,12 @@ namespace {
 //     word-sized and naturally atomic on this core, so the worst case is one
 //     response reporting the phase from 250 ms ago. It calls
 //     registry.isEnabled(), which takes the registry's own lock.
-//   * confirmNow() and rollbackNow() WRITE, and could in principle collide with
-//     a tick — except both are AUTH_PHYSICAL (cmdauth.h OTA_MUTATE), i.e. CDC
-//     only, i.e. the loop task. A network session cannot reach them. If a
+//   * confirmNow(), rollbackNow() and setBootNow() WRITE, and could in
+//     principle collide with a tick — except all three are AUTH_PHYSICAL
+//     (cmdauth.h OTA_MUTATE), i.e. CDC only, i.e. the loop task. A network
+//     session cannot reach them. (setBootNow() writes otadata rather than this
+//     state, and does not touch phase_ at all: which slot boots next is a
+//     different question from whether THIS image has proved itself.) If a
 //     transport ever dispatches at PHYSICAL off-task, that changes and this
 //     note stops being true.
 //
@@ -157,6 +188,28 @@ void fillEvent(JsonObject d, void *ctx) {
 const char *runningLabel() {
   const esp_partition_t *p = esp_ota_get_running_partition();
   return (p != nullptr) ? p->label : "?";
+}
+
+// ota.boot_set carries a different shape from the four rollback events above —
+// there is no criteria mask and no "reason", just which partition otadata named
+// before and after — so it gets its own filler rather than being bent into
+// EventData.
+struct BootSetEventData {
+  const char *from;
+  const char *to;
+  bool changed;
+  bool rebootRequired;
+};
+
+void fillBootSetEvent(JsonObject d, void *ctx) {
+  const BootSetEventData *e = (const BootSetEventData *)ctx;
+  if (e == nullptr) {
+    return;
+  }
+  d["from"] = e->from;
+  d["to"] = e->to;
+  d["changed"] = e->changed;
+  d["reboot_required"] = e->rebootRequired;
 }
 
 // ---- the two transitions -------------------------------------------------
@@ -355,6 +408,13 @@ void fillStatus(JsonObject d) {
   if (running != nullptr) {
     d["running_offset"] = running->address;
   }
+  // What otadata says boots NEXT, which is only the same as `running` until
+  // somebody calls p:{boot:...}. Reported unconditionally because the pair is
+  // the only way to see a pending selection from a plain `ota`: after
+  // `ota boot app1` on an app0 device this reads running=app0, boot=app1, and
+  // after the reboot it reads app1/app1.
+  const esp_partition_t *boot = esp_ota_get_boot_partition();
+  d["boot"] = (boot != nullptr) ? boot->label : "?";
 
   // Re-read rather than reporting bootState_: after a confirm this must say
   // VALID, which is the whole point of asking.
@@ -466,6 +526,139 @@ bool confirmNow(const char **code, char *msg, size_t cap) {
     snprintf(msg, cap, "marked valid; rollback cancelled");
   }
   return true;
+}
+
+bool setBootNow(const char *label, BootSetReport &rep, const char **code, char *msg, size_t cap) {
+  memset(&rep, 0, sizeof(rep));
+
+  // ---- look the label up -------------------------------------------------
+  //
+  // APP PARTITIONS ONLY. The first search is the one that can succeed; the
+  // second exists purely so a refusal can distinguish "no such label" from
+  // "that is the littlefs partition". An offset is deliberately NOT accepted in
+  // its place: esp_ota_set_boot_partition() takes a partition from the live
+  // table, and a hand-typed address is exactly the kind of input that turns a
+  // typo into a bricked device.
+  //
+  // The lookup is skipped entirely for a malformed label — esp_partition_find*
+  // compares up to 16 bytes, so a 40-character string would silently match on
+  // its first 16.
+  OtaDecide::BootSetFacts facts = {false, false, false};
+  const esp_partition_t *target = nullptr;
+  const esp_partition_t *any = nullptr;
+  esp_app_desc_t desc;
+  memset(&desc, 0, sizeof(desc));
+
+  if (OtaDecide::validateBootLabel(label) == OtaDecide::BOOTSET_OK) {
+    target = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, label);
+    if (target != nullptr) {
+      facts.found = true;
+      facts.isApp = true;
+      facts.hasImage = esp_ota_get_partition_description(target, &desc) == ESP_OK;
+    } else {
+      any = esp_partition_find_first(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, label);
+      facts.found = any != nullptr;
+    }
+  }
+
+  const OtaDecide::BootSetVerdict v = OtaDecide::decideBootSet(label, facts);
+  if (v != OtaDecide::BOOTSET_OK) {
+    if (code != nullptr) {
+      *code = OtaDecide::bootSetCode(v);
+    }
+    if (msg != nullptr && cap > 0) {
+      // %.16s throughout: the label is caller-supplied and the refusals for
+      // TOO_LONG / BAD_CHAR are precisely the cases where it is not sane.
+      switch (v) {
+        case OtaDecide::BOOTSET_NO_LABEL:
+          snprintf(msg, cap, "boot needs an app partition label: `ota boot app1` or p:{boot:\"app1\"} (see `parts`)");
+          break;
+        case OtaDecide::BOOTSET_LABEL_TOO_LONG:
+          snprintf(msg, cap, "partition label '%.16s...' is longer than %u characters", label,
+                   (unsigned)OtaDecide::BOOTSET_LABEL_MAX);
+          break;
+        case OtaDecide::BOOTSET_LABEL_BAD_CHAR:
+          snprintf(msg, cap, "partition label must be 1-%u printable characters with no spaces",
+                   (unsigned)OtaDecide::BOOTSET_LABEL_MAX);
+          break;
+        case OtaDecide::BOOTSET_NOT_FOUND:
+          snprintf(msg, cap, "refused: no partition labelled '%.16s' in this table (see `parts`)", label);
+          break;
+        case OtaDecide::BOOTSET_NOT_APP:
+          snprintf(msg, cap, "refused: '%.16s' is a %s partition, not an app partition", label,
+                   any != nullptr ? partitionSubtypeName(any) : "data");
+          break;
+        case OtaDecide::BOOTSET_NO_IMAGE:
+        default:
+          // The one that saves the device. `ota` reports the same fact for the
+          // other slot as rollback_target.has_app.
+          snprintf(msg, cap, "refused: '%.16s' contains no valid app image — flash it before selecting it", label);
+          break;
+      }
+    }
+    return false;
+  }
+
+  // ---- write otadata -----------------------------------------------------
+  const esp_partition_t *prev = esp_ota_get_boot_partition();
+  const esp_partition_t *running = esp_ota_get_running_partition();
+
+  esp_err_t err = esp_ota_set_boot_partition(target);
+  if (err != ESP_OK) {
+    // IDF's own gate, which is stronger than ours: it verifies the whole image
+    // (ESP_ERR_OTA_VALIDATE_FAILED) and checks the subtype is a real OTA slot
+    // (ESP_ERR_INVALID_ARG) BEFORE writing anything, so otadata is untouched
+    // here.
+    if (code != nullptr) {
+      *code = "EOTA";
+    }
+    if (msg != nullptr && cap > 0) {
+      snprintf(msg, cap, "esp_ota_set_boot_partition('%s') failed: %s — otadata unchanged", target->label,
+               esp_err_to_name(err));
+    }
+    return false;
+  }
+
+  snprintf(rep.previous, sizeof(rep.previous), "%s", prev != nullptr ? prev->label : "?");
+  snprintf(rep.selected, sizeof(rep.selected), "%s", target->label);
+  snprintf(rep.build, sizeof(rep.build), "%s %s", desc.date, desc.time);
+  snprintf(rep.idfVersion, sizeof(rep.idfVersion), "%s", desc.idf_ver);
+  rep.offset = target->address;
+  rep.changed = (prev == nullptr) || (strcmp(prev->label, target->label) != 0);
+  // "Do I need to restart for this to mean anything?" — which is NOT the same
+  // question as "did otadata change". Selecting the partition that is already
+  // running is a legitimate way to cancel an earlier selection, and it needs no
+  // reboot.
+  rep.rebootRequired = (running == nullptr) || (strcmp(running->label, target->label) != 0);
+
+  BootSetEventData e = {rep.previous, rep.selected, rep.changed, rep.rebootRequired};
+  Bus::emit("ota.boot_set", fillBootSetEvent, &e);
+
+  if (msg != nullptr && cap > 0) {
+    if (!rep.rebootRequired) {
+      snprintf(msg, cap, "boot partition set to '%s', which is already running; no reboot needed", rep.selected);
+    } else {
+      snprintf(msg, cap, "boot partition set to '%s' (was '%s'); NOT rebooted — run `reboot` to start it",
+               rep.selected, rep.previous);
+    }
+  }
+  return true;
+}
+
+void fillBootSet(JsonObject d, const BootSetReport &rep) {
+  // Casts: every one of these is a char[] in the caller's frame, which
+  // ArduinoJson 7.4.3 would otherwise store BY POINTER as if it were a literal.
+  // See the note above renderActionResult() in console.cpp.
+  d["previous"] = (const char *)rep.previous;
+  d["selected"] = (const char *)rep.selected;
+  d["offset"] = rep.offset;
+  d["changed"] = rep.changed;
+  // WHICH image was selected, not just which slot. Two builds of this firmware
+  // differ only by these strings, and a caller that cannot see them cannot tell
+  // "I selected the new one" from "I selected the one already there".
+  d["build"] = (const char *)rep.build;
+  d["idf_version"] = (const char *)rep.idfVersion;
+  d["reboot_required"] = rep.rebootRequired;
 }
 
 bool rollbackNow(const char **code, char *msg, size_t cap) {

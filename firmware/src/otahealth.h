@@ -67,4 +67,60 @@ bool confirmNow(const char **code, char *msg, size_t cap);
 // so it is worth saying which of the two things is missing.
 bool rollbackNow(const char **code, char *msg, size_t cap);
 
+// ---- selecting the next boot partition ----------------------------------
+
+// What was selected, for the response and the bus event. Fixed buffers, no
+// pointers into IDF's partition list: the report outlives the lookup and is
+// rendered after `d` has been cleared and refilled.
+//
+// [17] is esp_partition_t::label's own size (16 characters + NUL);
+// [48]/[32] match the esp_app_desc_t fields they are built from
+// (date[16] + ' ' + time[16], idf_ver[32]).
+struct BootSetReport {
+  char previous[17];    // the boot partition otadata named BEFORE the write
+  char selected[17];    // the one it names now
+  char build[48];       // the selected image's "<date> <time>" — WHICH build was chosen
+  char idfVersion[32];  // ... and its idf_ver
+  uint32_t offset;      // the selected partition's flash offset
+  // false == otadata already named this partition. NOT "nothing was written":
+  // IDF rewrites the inactive otadata sector either way (same ota_seq,
+  // ota_state = NEW), so both sectors then carry the same sequence number and
+  // which one wins is a bootloader tie-break. Selecting the slot that is
+  // already selected is therefore pointless rather than harmful — worst case
+  // the next boot of that same image is a PENDING_VERIFY boot the health check
+  // confirms 30 s later.
+  bool changed;
+  bool rebootRequired;  // false == the selection is the partition already running
+};
+
+// esp_ota_set_boot_partition() on the app partition labelled `label`.
+//
+// DOES NOT REBOOT. Choosing the next image and restarting into it are two
+// decisions, and an operator who wants to look at the device between them must
+// be able to. Use `reboot` (also AUTH_PHYSICAL) when ready.
+//
+// Refuses, before touching otadata, when the label is malformed, names no
+// partition, names a partition that is not of type app, or names an app
+// partition with no readable app descriptor — the same
+// esp_ota_get_partition_description() check `rollback_target.has_app` reports.
+// That last one is the one that matters: pointing the bootloader at an erased
+// slot is how a working device becomes a USB-recovery job, and this command
+// exists to make the rollback test SAFE, so it must not be the thing that
+// breaks it.
+//
+// IDF then applies its own, stronger gate — esp_ota_set_boot_partition()
+// verifies the whole image (image_validate/ESP_IMAGE_VERIFY) and returns
+// ESP_ERR_OTA_VALIDATE_FAILED without writing otadata if the image is
+// truncated or corrupt. A half-written slot is refused by one of the two.
+//
+// On success the selected slot's otadata entry is written with
+// ota_state = ESP_OTA_IMG_NEW, so with rollback enabled in the bootloader the
+// next boot of that image is a PENDING_VERIFY boot and the machinery above
+// runs. That is the point of the command.
+bool setBootNow(const char *label, BootSetReport &rep, const char **code, char *msg, size_t cap);
+
+// Render a BootSetReport into the response. Separate from setBootNow() because
+// the caller clears and refills `d` from fillStatus() in between.
+void fillBootSet(JsonObject d, const BootSetReport &rep);
+
 }  // namespace OtaHealth
