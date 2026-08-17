@@ -133,6 +133,12 @@ and the native tests already cover the security-critical path sanitisation.
 
 ## Resolved, kept for the reasoning
 
+- **F5 — LittleFS unused.** Done 2026-08-17. Mounted as platform infrastructure (like NVS, not a
+  module) and exposed through `storage` as a second volume, so `/sd` and `/fs` share one chunked
+  transfer surface, one CRC path and one `PathSafe` funnel. Deliberately does NOT auto-format on
+  mount failure: an unformatted partition and a corrupt one are indistinguishable, and only one is
+  safely answered by erasing.
+
 - **F5 — LittleFS was mounted by nothing. Done 2026-08-17.**
   `src/fsmount.{h,cpp}` mounts it at boot as **platform infrastructure**, like NVS — not as a
   module, so nothing has to be enabled for the web assets to be readable and there is no enable
