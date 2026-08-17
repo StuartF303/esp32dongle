@@ -90,3 +90,42 @@ are transferred over the device's own AP. A framework is allowed if bundled and 
   something was deferred or decided. That is the part that is expensive to reconstruct.
 - **Say what is unproven.** Anything not exercised on the device gets labelled as such.
 - **Pin versions.** No floating dependencies anywhere.
+
+---
+
+## Appendix — text for the cowork project's "instructions" field
+
+Copy this verbatim into the project instructions. It is deliberately short: instructions are
+loaded into every turn, so detail belongs in this file and in `README.md`, not there.
+
+```
+This project is esp32dongle — custom firmware for a LilyGO T-Dongle-S3, a USB-stick ESP32-S3
+with a small colour LCD and a microSD slot. It is a USB keyboard, a file bridge, a Wi-Fi AP
+serving its own control UI, and a status display, all controlled from a phone.
+
+Repo: https://github.com/StuartF303/esp32dongle — read README.md and COWORK.md first.
+COWORK.md has the division of work and the constraints that trip people up.
+
+WHO DOES WHAT. Stuart owns the device and every irreversible, security-relevant or
+architectural decision — ask him, don't inform him. Design owns the interface and works in
+design/, delivering into design/out/. Firmware owns firmware/ and implements from design/out/.
+Neither side edits the other's tree.
+
+FOUR THINGS THAT SHAPE EVERYTHING:
+1. The UI is GENERATED FROM DEVICE DESCRIPTORS, not hardcoded per feature. Modules describe
+   themselves with typed parameters, and new ones must render with no front-end change. It is a
+   component system keyed to parameter types, not a set of screens.
+2. NO INTERNET. The phone joins the dongle's own AP, which routes nowhere. No CDN, no web fonts,
+   no icon libraries — everything ships on the device.
+3. SOME ACTIONS CAN NEVER BE DONE FROM A PHONE. AUTH_PHYSICAL means a USB cable and a serial
+   console. The UI must show them as present-but-unreachable without being a dead end.
+4. IT TYPES ON A REAL COMPUTER. Arming the keyboard should feel deliberate; its live state
+   should be obvious from anywhere.
+
+WORKING CONVENTIONS: verify on hardware, not just in the build — this project has twice shipped
+code that built clean, passed every host test, and could never run. Record why, not just what.
+Label anything unproven as unproven. Pin every dependency. Device error messages are shown
+verbatim; do not paraphrase them into friendlier copy.
+
+Questions do not block: write them into design/out/QUESTIONS.md, state an assumption, carry on.
+```
