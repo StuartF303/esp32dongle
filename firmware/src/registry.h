@@ -325,6 +325,21 @@ class Registry {
   // GET /api/modules will serve, so keep it clean and stable.
   void list(JsonArray out);
 
+  // Renders ONE module's status() into `out`. Returns false if there is no
+  // such module, it is disabled, or it has no status callback — the same
+  // "status() is only called while the module is enabled" invariant list()
+  // holds, under the same lock.
+  //
+  // EXISTS SO THAT MODULES CAN READ EACH OTHER WITHOUT INCLUDING EACH OTHER.
+  // `display` has to render whether the AP is up, its SSID, its IP and its
+  // client count. The alternatives were: include mod_http.h and read its
+  // file-scope state (a direct dependency between two W3 modules, and a second
+  // copy of the truth that can disagree with what the phone is shown), or call
+  // list() and throw away eleven twelfths of a ~4 KB document twice a second.
+  // This takes the same lock, honours the same invariant, and costs one
+  // module's worth of JSON.
+  bool statusOf(const char *id, JsonObject out);
+
   // Routes a command to a module. Answers ENOMOD (no such module), EDISABLED
   // (registered but off), EREBOOT (armed but not bound until the next boot),
   // ENOACT (no dispatch / no act) itself, all naming the module, before the

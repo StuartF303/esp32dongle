@@ -16,6 +16,7 @@
 #include "console.h"
 #include "led.h"
 #include "mod_cdc.h"
+#include "mod_display.h"
 #include "mod_hid.h"
 #include "mod_http.h"
 #include "mod_led.h"
@@ -178,6 +179,13 @@ void setup() {
   // consumer that runs on a task other than this one — see the threading note
   // at the top of mod_http.cpp and the one in registry.h.
   addModule(httpModuleDescriptor());
+  // `display` drives the ST7735 over SPI2_HOST and claims RES_LCD EXCLUSIVE.
+  // defaultEnabled — a device that boots to a dark screen looks broken, and
+  // the panel is where the pairing PIN has to appear. Registered AFTER `http`
+  // so that on a first boot the AP (if it were ever default-enabled) is up
+  // before the screen samples it; the display copes either way, since it reads
+  // `http`'s status through the registry on every sample rather than once.
+  addModule(displayModuleDescriptor());
 
   // Applies each descriptor's defaultEnabled on a virgin NVS, and SEALS the
   // registry — no module may register after this.

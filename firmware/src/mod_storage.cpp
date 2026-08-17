@@ -14,6 +14,7 @@
 #include "ff.h"
 #include "sdmmc_cmd.h"
 
+#include "activity.h"
 #include "b64.h"
 #include "bus.h"
 #include "crc32.h"
@@ -489,6 +490,7 @@ void finishVerify(const char *code, const char *msg) {
   verify.resultCode = code;
   verify.resultCrc = Crc32::finish(verify.crc);
   snprintf(verify.resultMsg, sizeof(verify.resultMsg), "%s", msg ? msg : "");
+  Activity::end(verify.resultOk);  // out-of-band progress; see activity.h
   Bus::emit("storage.verify.done", fillVerifyDone, nullptr);
 }
 
@@ -518,6 +520,13 @@ void storageTick() {
       break;  // time budget: never hold the cooperative scheduler
     }
   }
+
+  // Out-of-band progress (activity.h). Unrate-limited on purpose: it is a
+  // no-op unless something is rendering it, and it only moves its own change
+  // counter when the whole percentage actually changes — so the LCD animates
+  // smoothly without this module knowing an LCD exists, and without borrowing
+  // the event bus's VERIFY_PROGRESS_MS pacing, which is tuned for the wire.
+  Activity::progressBytes(verify.bytes, verify.size);
 
   uint32_t now = millis();
   if ((uint32_t)(now - verify.lastProgressMs) >= VERIFY_PROGRESS_MS) {
@@ -1302,6 +1311,7 @@ DispatchResult actVerify(const CmdContext &ctx, JsonObjectConst p, JsonObject d,
   verify.resultCode = nullptr;
   verify.resultMsg[0] = '\0';
   snprintf(verify.path, sizeof(verify.path), "%s", path);
+  Activity::begin("storage", "verify");  // out-of-band progress; see activity.h
 
   d["job"] = verify.id;
   d["path"] = path;

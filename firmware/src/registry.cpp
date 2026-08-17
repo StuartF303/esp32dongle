@@ -672,6 +672,20 @@ void Registry::list(JsonArray out) {
   }
 }
 
+bool Registry::statusOf(const char *id, JsonObject out) {
+  // Same Guard shape as list(): read-only, so no reentrancy flag. That is what
+  // makes this safe to call from inside a module's own tick, which already
+  // holds the (recursive) lock via tickAt().
+  Guard g(lock_, nullptr);
+
+  int8_t idx = indexOf(id);
+  if (idx < 0 || !enabled_[idx] || mods_[idx]->status == nullptr) {
+    return false;
+  }
+  mods_[idx]->status(out);
+  return true;
+}
+
 DispatchResult Registry::dispatch(const char *id, const char *act, const CmdContext &ctx, JsonObjectConst p,
                                   JsonObject d, CmdError *err) {
   Guard g(lock_, &inCall_);

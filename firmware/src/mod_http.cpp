@@ -23,6 +23,7 @@
 #include "bus.h"
 #include "console.h"
 #include "ct.h"
+#include "pairing.h"
 #include "protocol.h"
 #include "ratelimit.h"
 #include "registry.h"
@@ -1646,6 +1647,10 @@ void teardownNow() {
     memset(psk_, 0, sizeof(psk_));
     memset(pin_, 0, sizeof(pin_));
     pskSet_ = false;
+    // And out of the LCD's copy too. httpTick() stops being called the moment
+    // the module is disabled, so without this the PIN would stay on the panel
+    // indefinitely after the AP it belongs to had gone off the air.
+    Pairing::withdraw();
   }
   teardownPending_.store(false, std::memory_order_release);
   stopping_.store(false, std::memory_order_release);
@@ -1695,6 +1700,32 @@ void httpTick() {
   // nobody ever presents it again.
   Lock l(authLock_);
   reapLocked(now);
+
+  // ---- the pairing PIN's out-of-band channel (pairing.h) ----------------
+  //
+  // Evaluated here, every TICK_MS, because both inputs move on their own: a
+  // session can expire in reapLocked() immediately above, and the last one
+  // being revoked has to put the PIN back on the LCD without anyone asking.
+  //
+  // Counted inline rather than via liveSessionCount(): authLock_ is a PLAIN
+  // mutex (xSemaphoreCreateMutex, not recursive) and is already held here, so
+  // calling that function would deadlock the loop task on its first tick.
+  //
+  // This is also the only place pin_ leaves this file, and it goes to a buffer
+  // with no JSON representation and no transport — never into status(), which
+  // is wire-visible. publish() is itself a no-op unless `display` has
+  // subscribed, so with the LCD off the PIN never leaves this file at all.
+  uint8_t live = 0;
+  for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
+    if (sessions_[i].used) {
+      live++;
+    }
+  }
+  if (Pairing::shouldShow(apUp_, live)) {
+    Pairing::publish(pin_);
+  } else {
+    Pairing::withdraw();
+  }
 }
 
 // ===========================================================================
@@ -1725,7 +1756,19 @@ void fillApStatus(JsonObject d) {
     IPAddress ip = WiFi.softAPIP();
     char ipStr[16];
     snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3]);
-    d["ip"] = (const char *)ipStr;
+    // Either form is safe here; both copy. The real rule in ArduinoJson 7.4.3,
+    // read off Strings/Adapters/RamString.hpp rather than inferred:
+    //   const char *      -> StringAdapter<TChar*>          RamString(s, strlen)  COPIES
+    //   char[N]           -> StringAdapter<TChar[N]>        RamString(s, strlen)  COPIES
+    //   const char[N]     -> StringAdapter<const char(&)[N]> RamString(p, N-1, true)
+    //                                                       STORES A POINTER
+    // Only the third stores by reference, on the assumption it is a literal. It
+    // is the one that bites, and it bites through a const& parameter: `r.msg`
+    // where r is a `const Foo &` makes msg a const char[N] and the document ends
+    // up referencing a dead frame (this happened once already — see the note at
+    // renderActionResult in console.cpp).
+    // So a stack buffer assigned uncast, or cast to const char*, is fine.
+    d["ip"] = ipStr;
     d["clients"] = WiFi.softAPgetStationNum();
   }
   d["server_up"] = server_ != nullptr;
