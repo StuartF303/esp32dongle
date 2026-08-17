@@ -69,8 +69,12 @@ across two volumes, the Wi-Fi AP with PIN-paired sessions, the status LCD, and O
 Not yet: BLE transport, USB mass storage, radio survey tools, stored macros, and a designed web UI
 — see `docs/BACKLOG.md`, which also lists the known gaps and accepted trade-offs.
 
-## Credits
+## Licence
 
-The stock firmware backup and the board's pinout come from LilyGO's own
-[T-Dongle-S3 repository](https://github.com/Xinyuan-LilyGO/T-Dongle-S3). See
-`backup/factory_release/README.md` for attribution.
+MIT — see `LICENSE`.
+
+That covers the original work here (`firmware/`, `docs/`, `design/`). It explicitly does **not**
+cover the stock LilyGO firmware images in `backup/factory_release/` or their schematic in
+`hardware/`, which are LilyGO's and are redistributed as a recovery path because the board ships
+with no OTA slot. See `backup/factory_release/README.md` for attribution and
+[LilyGO's own repository](https://github.com/Xinyuan-LilyGO/T-Dongle-S3) for the originals.
