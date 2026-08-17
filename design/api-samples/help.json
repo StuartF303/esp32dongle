@@ -1,0 +1,99 @@
+{
+    "ok": true,
+    "d": {
+        "auth": "physical",
+        "auth_level": 2,
+        "commands": [
+            {
+                "act": "help",
+                "help": "list commands, each with the auth level it needs",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "info",
+                "help": "chip/build/partition identity",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "parts",
+                "help": "live partition table",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "mem",
+                "help": "heap free / min-free / largest block",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "uptime",
+                "help": "ms since boot",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "tasks",
+                "help": "scheduler task table (intervals, worst-case runtimes)",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "led",
+                "help": "alias for mod:\"led\" act:\"set\"; p:{rgb:\"rrggbb\"} or p:{rgb:\"off\"}",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "modules",
+                "help": "registered modules: id, name, category, enabled, claims, actions, blocked_by, status",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "enable",
+                "help": "enable a module; p:{id:\"led\"[,force:true]}",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "disable",
+                "help": "disable a module; p:{id:\"led\"}",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "selftest",
+                "help": "assert the claim arbitration rule against a synthetic case table",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "log",
+                "help": "get/set runtime log level; p:{level:\"error|warn|info|debug|trace\"}",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "bootprobe",
+                "help": "what the static-ctor NVS probe saw (hid arming depends on it)",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "ota",
+                "help": "rollback state, health criteria and the last/current OTA upload; p:{confirm:true} | p:{rollback:true} | p:{boot:\"app0|app1\"} \u2014 select without rebooting (auth >= physical)",
+                "min_auth": "token",
+                "allowed": true
+            },
+            {
+                "act": "reboot",
+                "help": "esp_restart() \u2014 responds first (auth >= physical: the cable, not the network)",
+                "min_auth": "physical",
+                "allowed": true
+            }
+        ]
+    }
+}

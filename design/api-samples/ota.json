@@ -1,0 +1,39 @@
+{
+    "ok": true,
+    "d": {
+        "running": "app0",
+        "running_offset": 131072,
+        "boot": "app0",
+        "ota_state": "UNDEFINED",
+        "boot_ota_state": "UNDEFINED",
+        "phase": "idle",
+        "pending": false,
+        "confirmed_this_boot": false,
+        "criteria": {
+            "ticks": true,
+            "registry": true,
+            "essential": true,
+            "console": true,
+            "uptime": true
+        },
+        "criteria_all_met": true,
+        "uptime_ms": 1377990,
+        "ticks": 5494,
+        "window_ms": 180000,
+        "window_remaining_s": 0,
+        "verdict": "idle",
+        "rollback_target": {
+            "label": "app1",
+            "offset": 4325376,
+            "ota_state": "UNDEFINED",
+            "has_app": true,
+            "build": "Jul 20 2026 10:51:03",
+            "idf_version": "v5.5.5"
+        },
+        "rollback_possible": true,
+        "upload": {
+            "phase": "idle",
+            "busy": false
+        }
+    }
+}

@@ -1,0 +1,589 @@
+{
+    "ok": true,
+    "d": {
+        "modules": [
+            {
+                "id": "cdc",
+                "name": "USB Serial Console",
+                "category": "transport",
+                "enabled": true,
+                "essential": true,
+                "boot_time_binding": true,
+                "armed": true,
+                "pending_restart": false,
+                "claims": {
+                    "usb": "shared"
+                },
+                "blocked_by": [],
+                "actions": [],
+                "status": {
+                    "transport": "cdc",
+                    "connected": true,
+                    "max_line": 4096,
+                    "event_sinks": 2,
+                    "usb_mode": "tinyusb"
+                }
+            },
+            {
+                "id": "led",
+                "name": "Status LED",
+                "category": "status",
+                "enabled": true,
+                "essential": false,
+                "boot_time_binding": false,
+                "armed": true,
+                "pending_restart": false,
+                "claims": {
+                    "led": "exclusive"
+                },
+                "blocked_by": [],
+                "actions": [
+                    {
+                        "act": "set",
+                        "help": "set a fixed colour",
+                        "params": [
+                            {
+                                "name": "rgb",
+                                "type": "string",
+                                "required": true,
+                                "help": "6 hex digits \u2014 \"ff0000\", or \"#ff0000\"; or \"off\". Case-insensitive."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "auto",
+                        "help": "return to the heartbeat blink",
+                        "params": []
+                    }
+                ],
+                "status": {
+                    "mode": "heartbeat",
+                    "rgb": "140c00"
+                }
+            },
+            {
+                "id": "hid",
+                "name": "USB Keyboard",
+                "category": "input",
+                "enabled": true,
+                "essential": false,
+                "boot_time_binding": true,
+                "armed": true,
+                "pending_restart": false,
+                "claims": {
+                    "usb": "shared"
+                },
+                "blocked_by": [],
+                "actions": [
+                    {
+                        "act": "type",
+                        "help": "type a string into the host (queued; completes with a hid.done event)",
+                        "params": [
+                            {
+                                "name": "text",
+                                "type": "string",
+                                "required": true,
+                                "help": "the string to type: 1..512 characters, printable ASCII plus tab and newline. Longer is rejected, never truncated; CR is ignored."
+                            },
+                            {
+                                "name": "wpm",
+                                "type": "int",
+                                "required": false,
+                                "help": "typing speed in words per minute (5 chars/word). Clamped to this range. Ignored if delay_ms is given.",
+                                "min": 1,
+                                "max": 2000
+                            },
+                            {
+                                "name": "delay_ms",
+                                "type": "int",
+                                "required": false,
+                                "help": "per-character delay in ms. Clamped to this range. Takes precedence over wpm; default 0.",
+                                "min": 0,
+                                "max": 60000
+                            }
+                        ]
+                    },
+                    {
+                        "act": "key",
+                        "help": "send one keystroke, optionally with modifiers",
+                        "params": [
+                            {
+                                "name": "key",
+                                "type": "string",
+                                "required": true,
+                                "help": "one printable ASCII character, or a named key: Enter/Return, Esc, Tab, Space, Backspace, Delete, Insert, Home, End, PageUp, PageDown, Up, Down, Left, Right, CapsLock, NumLock, ScrollLock, PrintScreen, Pause, Menu, F1..F24. Case-insensitive."
+                            },
+                            {
+                                "name": "mods",
+                                "type": "enum_list",
+                                "required": false,
+                                "help": "modifiers held while the key is pressed. \"win\" and \"cmd\" are accepted as aliases of gui.",
+                                "enum": [
+                                    "ctrl",
+                                    "shift",
+                                    "alt",
+                                    "gui"
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "act": "release",
+                        "help": "releaseAll() \u2014 panic stop for a stuck key or modifier",
+                        "params": []
+                    },
+                    {
+                        "act": "status",
+                        "help": "armed/bound/layout/queue depth/current job/chars sent",
+                        "params": []
+                    },
+                    {
+                        "act": "layout",
+                        "help": "get or set the HOST keyboard layout (en_GB default, en_US selectable)",
+                        "params": [
+                            {
+                                "name": "set",
+                                "type": "enum",
+                                "required": false,
+                                "help": "omit to READ the current layout. Setting it needs auth >= token and persists to NVS.",
+                                "enum": [
+                                    "en_GB",
+                                    "en_US"
+                                ]
+                            }
+                        ]
+                    }
+                ],
+                "status": {
+                    "armed": true,
+                    "bound": true,
+                    "pending_restart": false,
+                    "layout": "en_GB",
+                    "host_dependent": true,
+                    "job_active": false,
+                    "job": 0,
+                    "queue_depth": 0,
+                    "job_chars_sent": 0,
+                    "chars_sent_total": 0
+                }
+            },
+            {
+                "id": "storage",
+                "name": "Files (microSD + LittleFS)",
+                "category": "storage",
+                "enabled": true,
+                "essential": false,
+                "boot_time_binding": false,
+                "armed": true,
+                "pending_restart": false,
+                "claims": {
+                    "sd": "shared"
+                },
+                "blocked_by": [],
+                "actions": [
+                    {
+                        "act": "caps",
+                        "help": "transfer limits (max_chunk, max_path, crc32 format, listing/delete bounds) plus every volume, its mount state, its own limits and its free space",
+                        "params": []
+                    },
+                    {
+                        "act": "free",
+                        "help": "total/used/free per volume (walks the FAT for /sd if the FAT32 free count is stale)",
+                        "params": [
+                            {
+                                "name": "volume",
+                                "type": "string",
+                                "required": false,
+                                "help": "\"sd\" or \"fs\"; omit to report every volume. Names the volume, not a path."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "list",
+                        "help": "one PAGE of a directory; returns truncated + next_offset",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": true,
+                                "help": "volume-prefixed directory path; \"/sd\" and \"/fs\" are the two volume roots."
+                            },
+                            {
+                                "name": "offset",
+                                "type": "int",
+                                "required": false,
+                                "help": "entries to skip; default 0. readdir has no seek, so this is reached by skipping.",
+                                "min": 0,
+                                "max": 65535
+                            },
+                            {
+                                "name": "limit",
+                                "type": "int",
+                                "required": false,
+                                "help": "max entries in this page; default 32. Out-of-range values are CLAMPED, not rejected.",
+                                "min": 1,
+                                "max": 64
+                            }
+                        ]
+                    },
+                    {
+                        "act": "stat",
+                        "help": "exists / is_dir / size / mtime for one path (a missing path is ok:true with exists:false)",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": true,
+                                "help": "volume-prefixed path, e.g. \"/sd\", \"/sd/logs/run.txt\" or \"/fs/www/index.html.gz\". \"/sd\" and \"/fs\" are the volume roots; a trailing '/' is refused."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "read",
+                        "help": "read one chunk as base64 with a crc32; the caller drives offset, so it resumes by construction",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": true,
+                                "help": "volume-prefixed file path, e.g. \"/sd/logs/run.txt\" or \"/fs/macros/a.json\"."
+                            },
+                            {
+                                "name": "offset",
+                                "type": "int",
+                                "required": false,
+                                "help": "byte offset to read from; default 0. File offsets here are 32-bit.",
+                                "min": 0
+                            },
+                            {
+                                "name": "len",
+                                "type": "int",
+                                "required": false,
+                                "help": "raw bytes to read; default and maximum are max_chunk (see the caps action). Larger is rejected.",
+                                "min": 0,
+                                "max": 2048
+                            }
+                        ]
+                    },
+                    {
+                        "act": "write",
+                        "help": "write one base64 chunk at an offset; returns the crc32 of what was written",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": true,
+                                "help": "volume-prefixed file path, e.g. \"/sd/logs/run.txt\" or \"/fs/macros/a.json\"."
+                            },
+                            {
+                                "name": "data",
+                                "type": "string",
+                                "required": true,
+                                "help": "base64 of the bytes to write (padded, RFC 4648 \u00a74). \"\" writes nothing."
+                            },
+                            {
+                                "name": "offset",
+                                "type": "int",
+                                "required": false,
+                                "help": "byte offset to write at; default 0. Writes must be contiguous \u2014 past EOF is refused.",
+                                "min": 0
+                            },
+                            {
+                                "name": "truncate",
+                                "type": "bool",
+                                "required": false,
+                                "help": "replace the file rather than overwrite in place. Only valid at offset 0; refused elsewhere."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "mkdir",
+                        "help": "create one directory (not -p: intermediate directories are not invented)",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": true,
+                                "help": "volume-prefixed path, e.g. \"/sd\", \"/sd/logs/run.txt\" or \"/fs/www/index.html.gz\". \"/sd\" and \"/fs\" are the volume roots; a trailing '/' is refused."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "delete",
+                        "help": "delete a file, an EMPTY directory, or a bounded tree with recursive:true",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": true,
+                                "help": "volume-prefixed path. A volume root (\"/sd\", \"/fs\") is refused."
+                            },
+                            {
+                                "name": "recursive",
+                                "type": "bool",
+                                "required": false,
+                                "help": "delete a non-empty directory tree, bounded to 8 levels and 2000 entries. Without it, only a file or an EMPTY directory is removed."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "verify",
+                        "help": "crc32 a whole file (queued; progress + storage.verify.done events). cancel:true stops it",
+                        "params": [
+                            {
+                                "name": "path",
+                                "type": "string",
+                                "required": false,
+                                "help": "volume-prefixed file path to hash. Required unless cancel is true, which is handled first."
+                            },
+                            {
+                                "name": "cancel",
+                                "type": "bool",
+                                "required": false,
+                                "help": "cancel the RUNNING verify job instead of starting one; path is then ignored."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "format",
+                        "help": "ERASE the whole /fs volume and remount it empty. USB console only (auth >= physical) and needs confirm:true. The microSD is never formatted here",
+                        "params": [
+                            {
+                                "name": "volume",
+                                "type": "string",
+                                "required": true,
+                                "help": "\"fs\" \u2014 the LittleFS partition. \"sd\" is refused: the card must stay FAT32."
+                            },
+                            {
+                                "name": "confirm",
+                                "type": "bool",
+                                "required": true,
+                                "help": "required second word. Without it nothing is erased and ECONFIRM is returned."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "status",
+                        "help": "per-volume mount state, the failing bring-up stage for each, and the current verify job",
+                        "params": []
+                    }
+                ],
+                "status": {
+                    "volumes": [
+                        {
+                            "name": "sd",
+                            "prefix": "/sd",
+                            "mounted": true,
+                            "kind": "microsd",
+                            "fs": "fat32",
+                            "removable": true,
+                            "stage": "ok",
+                            "max_name": 200,
+                            "max_file_offset": 2147483647,
+                            "card_type": "SDHC",
+                            "card_size": 126437294080,
+                            "sector_size": 512
+                        },
+                        {
+                            "name": "fs",
+                            "prefix": "/fs",
+                            "mounted": true,
+                            "kind": "littlefs",
+                            "fs": "littlefs",
+                            "removable": false,
+                            "stage": "ok",
+                            "offset": 8519680,
+                            "partition_size": 8126464,
+                            "max_name": 64,
+                            "max_file_offset": 8126464
+                        }
+                    ],
+                    "sd_detail": "mounted at /sd, SDHC, fat32",
+                    "fs_detail": "mounted at /fs from partition 'littlefs' (0x820000, 7936 KB); 8192 of 8126464 bytes used",
+                    "verify_active": false,
+                    "verify_job": 0,
+                    "open_files_reserved": 5
+                }
+            },
+            {
+                "id": "http",
+                "name": "Wi-Fi AP + HTTP",
+                "category": "transport",
+                "enabled": true,
+                "essential": false,
+                "boot_time_binding": false,
+                "armed": true,
+                "pending_restart": false,
+                "claims": {
+                    "wifi": "shared"
+                },
+                "blocked_by": [],
+                "actions": [
+                    {
+                        "act": "status",
+                        "help": "AP and server state: ssid, ip, clients, sessions, WebSocket clients, event counters",
+                        "params": []
+                    },
+                    {
+                        "act": "psk",
+                        "help": "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping every session and client. USB console only (auth >= physical), both ways",
+                        "params": [
+                            {
+                                "name": "set",
+                                "type": "string",
+                                "required": false,
+                                "help": "omit to READ the current passphrase. 8..63 printable ASCII replaces it, restarts the AP and drops every session, client and WebSocket."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "pin",
+                        "help": "the pairing PIN. USB console only; regenerate:true issues a new one and revokes every session",
+                        "params": [
+                            {
+                                "name": "regenerate",
+                                "type": "bool",
+                                "required": false,
+                                "help": "issue a NEW pairing PIN and revoke every session. Omit to just read the current one."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "sessions",
+                        "help": "list live sessions (ids only, never tokens), or revoke one / all of them",
+                        "params": [
+                            {
+                                "name": "revoke",
+                                "type": "string",
+                                "required": false,
+                                "help": "\"all\" revokes every session. Omit to just list them. A single id must be sent as a JSON NUMBER (p:{\"revoke\":7}) \u2014 use the raw JSON box for that."
+                            }
+                        ]
+                    }
+                ],
+                "status": {
+                    "transport": "http",
+                    "ap_up": true,
+                    "ssid": "tdongle-a9d8",
+                    "channel": 6,
+                    "security": "wpa2-psk/ccmp",
+                    "max_clients": 4,
+                    "ip": "192.168.4.1",
+                    "clients": 0,
+                    "server_up": true,
+                    "credentials_new": false,
+                    "teardown_pending": false,
+                    "in_registry": 0,
+                    "sessions": 0,
+                    "max_sessions": 4,
+                    "ws_clients": 0,
+                    "max_ws_clients": 3,
+                    "max_line": 4096,
+                    "idle_timeout_s": 900,
+                    "lifetime_s": 14400,
+                    "sessions_issued": 0,
+                    "sessions_expired": 0,
+                    "sessions_evicted": 0,
+                    "ws_rejected": 0,
+                    "events_sent": 0,
+                    "events_dropped": 0,
+                    "pin_fails": 0,
+                    "pin_lockouts": 0,
+                    "pin_locked": false,
+                    "pin_attempts_remaining": 10
+                }
+            },
+            {
+                "id": "display",
+                "name": "Status LCD",
+                "category": "status",
+                "enabled": true,
+                "essential": false,
+                "boot_time_binding": false,
+                "armed": true,
+                "pending_restart": false,
+                "claims": {
+                    "lcd": "exclusive"
+                },
+                "blocked_by": [],
+                "actions": [
+                    {
+                        "act": "status",
+                        "help": "panel, backlight, current screen and redraw statistics",
+                        "params": []
+                    },
+                    {
+                        "act": "backlight",
+                        "help": "backlight on/off or 0..100% (auth >= token)",
+                        "params": [
+                            {
+                                "name": "pct",
+                                "type": "int",
+                                "required": false,
+                                "help": "brightness 0..100 (0 == off). Wins if `on` is sent too. One of pct/on is required.",
+                                "min": 0,
+                                "max": 100
+                            },
+                            {
+                                "name": "on",
+                                "type": "bool",
+                                "required": false,
+                                "help": "true == full brightness, false == off. Ignored when pct is given. One of pct/on is required."
+                            }
+                        ]
+                    },
+                    {
+                        "act": "screen",
+                        "help": "select a firmware-defined screen",
+                        "params": [
+                            {
+                                "name": "name",
+                                "type": "enum",
+                                "required": true,
+                                "help": "which firmware-defined screen to show. `diag` also HIDES the pairing PIN.",
+                                "enum": [
+                                    "status",
+                                    "diag"
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "act": "refresh",
+                        "help": "force a full repaint",
+                        "params": []
+                    }
+                ],
+                "status": {
+                    "panel": true,
+                    "screen": "status",
+                    "backlight_pct": 100,
+                    "frames": 34068,
+                    "region_writes": 1381,
+                    "worst_render_us": 10661,
+                    "pin_on_screen": true
+                }
+            }
+        ],
+        "boot": {
+            "nvs": "read",
+            "nvs_write_ok": true,
+            "known": "read",
+            "restored": [
+                "cdc",
+                "led",
+                "hid",
+                "storage",
+                "http",
+                "display"
+            ],
+            "skipped": [],
+            "unknown": [],
+            "armed": [
+                "cdc",
+                "hid"
+            ],
+            "defaulted": []
+        }
+    }
+}

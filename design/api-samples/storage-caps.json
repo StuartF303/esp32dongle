@@ -1,0 +1,55 @@
+{
+    "ok": true,
+    "d": {
+        "encoding": "base64",
+        "crc32": "hex8",
+        "max_chunk": 2048,
+        "max_chunk_encoded": 2732,
+        "max_path": 255,
+        "max_volume_prefix": 9,
+        "max_segment": 200,
+        "max_line": 4096,
+        "max_file_offset": 2147483647,
+        "list_default_limit": 32,
+        "list_max_limit": 64,
+        "list_max_offset": 65535,
+        "delete_max_depth": 8,
+        "delete_max_entries": 2000,
+        "max_open_files": 5,
+        "volumes": [
+            {
+                "name": "sd",
+                "prefix": "/sd",
+                "mounted": true,
+                "kind": "microsd",
+                "fs": "fat32",
+                "removable": true,
+                "stage": "ok",
+                "max_name": 200,
+                "max_file_offset": 2147483647,
+                "card_type": "SDHC",
+                "card_size": 126437294080,
+                "sector_size": 512,
+                "total": 126389583872,
+                "used": 32768,
+                "free": 126389551104
+            },
+            {
+                "name": "fs",
+                "prefix": "/fs",
+                "mounted": true,
+                "kind": "littlefs",
+                "fs": "littlefs",
+                "removable": false,
+                "stage": "ok",
+                "offset": 8519680,
+                "partition_size": 8126464,
+                "max_name": 64,
+                "max_file_offset": 8126464,
+                "total": 8126464,
+                "used": 8192,
+                "free": 8118272
+            }
+        ]
+    }
+}
