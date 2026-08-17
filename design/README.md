@@ -24,9 +24,24 @@ Captured over the USB serial console, which runs at the highest privilege level 
 **everything**, including actions a phone session cannot perform. That is deliberate: the design
 needs to know what exists in order to show it as unavailable.
 
-## Status of the data
+## Auth levels are in the data
 
-Auth levels are being added per-action as this is written. `help.json` already shows the shape
-(`min_auth`, `allowed`); `modules.json` will gain the same per action and per module shortly. Design
-against that shape — assume every action carries a required level and every module a minimum level
-to be visible at all.
+Every module carries `min_auth` (the level needed to know it exists) and every action carries both
+`min_auth` (absolute) and `allowed` (relative to whoever asked). A caller below a module's level
+does not see it in the listing at all.
+
+These captures were taken over USB, i.e. at `physical`, so every `allowed` reads `true`. **Use
+`min_auth`, not `allowed`, to design the states** — `allowed` is whatever the current session can
+do, `min_auth` is the fact about the action.
+
+Three actions cannot be performed from a phone at all, ever. They are §4 of the brief made
+concrete, and the design needs to show them as present-but-unreachable rather than hide them:
+
+| action | `min_auth` | why |
+|---|---|---|
+| `storage.format` | `physical` | erases the whole internal volume |
+| `http.psk` | `physical` | reveals/changes the Wi-Fi passphrase |
+| `http.pin` | `physical` | reveals/regenerates the pairing PIN |
+
+Plus, at device level (see `help.json`): `reboot` is `physical`, as are the OTA `confirm` /
+`rollback` / `boot` parameters. Everything else is `token`.

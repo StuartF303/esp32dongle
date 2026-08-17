@@ -6,8 +6,17 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "modauth.h"
 #include "modset.h"
 #include "scheduler.h"
+
+// modauth.h mirrors AuthLevel through cmdauth.h, which cannot include
+// registry.h without losing its host build. These are the only thing keeping
+// the two definitions the same value — the same three asserts console.cpp
+// carries for the built-in policy.
+static_assert(ModAuth::NONE == AUTH_NONE, "ModAuth::NONE has drifted from AuthLevel");
+static_assert(ModAuth::TOKEN == AUTH_TOKEN, "ModAuth::TOKEN has drifted from AuthLevel");
+static_assert(ModAuth::PHYSICAL == AUTH_PHYSICAL, "ModAuth::PHYSICAL has drifted from AuthLevel");
 
 Registry registry;
 
@@ -616,18 +625,34 @@ void Registry::disable(const char *id, ModuleActionResult &out) {
 
 // ---- listing / dispatch --------------------------------------------------
 
-void Registry::list(JsonArray out) {
+void Registry::list(JsonArray out, uint8_t authLevel) {
   Guard g(lock_, nullptr);
 
   const char *blockers[MAX_MODULES];
 
   for (uint8_t i = 0; i < count_; i++) {
     const ModuleDescriptor *m = mods_[i];
+
+    // BACKLOG S7. Below the module's own bar it is not rendered at all — not
+    // as a stub, not with "allowed": false. A listing that named the module and
+    // said "you may not use it" would answer exactly the question the bar
+    // exists to refuse: what is this device, and is it currently a keyboard.
+    // dispatch() answers the same caller with the same EAUTH it gives for a
+    // module that does not exist, so the two views agree.
+    uint8_t modMin = ModAuth::effective(m->minAuth);
+    if (!CmdAuth::permits(authLevel, modMin)) {
+      continue;
+    }
+
     JsonObject o = out.add<JsonObject>();
     o["id"] = m->id;
     o["name"] = m->name;
     o["category"] = m->category;
     o["enabled"] = enabled_[i];
+    // The level needed to see or touch this module at all. Everything rendered
+    // here is by definition within the caller's reach, so there is no per-module
+    // "allowed" — its actions carry that, and they are what a UI greys out.
+    o["min_auth"] = CmdAuth::levelName(modMin);
     o["essential"] = m->essential;
     o["boot_time_binding"] = m->bootTimeBinding;
     // Everything a UI needs to render "reboot to apply" without knowing why:
@@ -670,6 +695,15 @@ void Registry::list(JsonArray out) {
       JsonObject ao = actions.add<JsonObject>();
       ao["act"] = act.act;
       ao["help"] = act.help;
+      // The level this action needs, and whether THIS caller has it — so a UI
+      // greys out what the session cannot use instead of discovering it by
+      // failure. Same two keys, same names, as the built-ins' `help` output
+      // (console.cpp cmdHelp), because a phone UI renders both from one code
+      // path. `allowed` folds in the module's bar too, though a rendered module
+      // is always within reach: it is the single boolean a UI should read.
+      uint8_t actMin = ModAuth::effective(act.minAuth);
+      ao["min_auth"] = CmdAuth::levelName(actMin);
+      ao["allowed"] = ModAuth::actionAllowed(authLevel, m->minAuth, act.minAuth);
       JsonArray params = ao["params"].to<JsonArray>();
       uint8_t nParams = (act.params != nullptr) ? act.paramCount : 0;
       for (uint8_t q = 0; q < nParams; q++) {
@@ -737,6 +771,47 @@ bool Registry::statusOf(const char *id, JsonObject out) {
   return true;
 }
 
+// ---- the module-side auth gate (backlog S6/S7) ---------------------------
+
+namespace {
+
+// The EAUTH refusal, built through CmdAuth::denyMessage() and cmdErrorf() —
+// the SAME path console.cpp's authDenied() and the modules' own refusals took.
+// Code, wording, response shape and even the 96-byte truncation point are
+// therefore identical, which is the point: a caller must not be able to tell a
+// built-in's refusal from a module's from an action's, or it can map the device
+// by the shape of what it is refused.
+DispatchResult authDenied(CmdError *err, const char *what, uint8_t need, const CmdContext &ctx) {
+  // Formatted into a separate buffer first: cmdErrorf() vsnprintf()s into
+  // err->msg, and passing err->msg as its own argument would be an overlapping
+  // copy. Same size, so the truncation point is unchanged.
+  char msg[sizeof(CmdError::msg)];
+  CmdAuth::denyMessage(msg, sizeof(msg), what, need, ctx.transport, ctx.authLevel);
+  cmdErrorf(err, "EAUTH", "%s", msg);
+  return DISPATCH_FAIL;
+}
+
+// The level `act` was declared at in the module's own action table.
+//
+// An action the descriptor does not list gets UNLISTED == PHYSICAL, which is
+// fail-closed twice over: a real action that someone forgot to describe becomes
+// USB-console-only rather than silently open, and a typo or a probe from a
+// network client is refused without being told the action does not exist. The
+// module's own EUNKNOWN still answers the caller who clears the bar.
+uint8_t actionLevel(const ModuleDescriptor *m, const char *act) {
+  if (m->actions == nullptr || act == nullptr) {
+    return ModAuth::UNLISTED;
+  }
+  for (uint8_t i = 0; i < m->actionCount; i++) {
+    if (m->actions[i].act != nullptr && strcmp(m->actions[i].act, act) == 0) {
+      return ModAuth::effective(m->actions[i].minAuth);
+    }
+  }
+  return ModAuth::UNLISTED;
+}
+
+}  // namespace
+
 DispatchResult Registry::dispatch(const char *id, const char *act, const CmdContext &ctx, JsonObjectConst p,
                                   JsonObject d, CmdError *err) {
   Guard g(lock_, &inCall_);
@@ -745,13 +820,68 @@ DispatchResult Registry::dispatch(const char *id, const char *act, const CmdCont
     return DISPATCH_FAIL;
   }
 
-  int8_t idxSigned = indexOf(id);
-  if (idxSigned < 0) {
-    cmdErrorf(err, "ENOMOD", "no such module: '%s'", id ? id : "");
-    return DISPATCH_FAIL;
+  // ---- THE AUTH GATE (backlog S6/S7) ------------------------------------
+  //
+  // ONE check, before the module is consulted at all, rather than one per
+  // module that each module was free to skip — and BEFORE the
+  // ENOMOD/EDISABLED/EREBOOT branches, because all three are facts about the
+  // module map that S7 says a stranger is not entitled to.
+  //
+  // The rule itself is ModAuth::decide() (modauth.h) and is not restated here:
+  // the native env cannot compile this file, so a copy of the table would be
+  // tested there and enforced nowhere.
+  //
+  // `lowest` is the lowest level any REGISTERED module accepts, derived from
+  // the descriptors rather than read out of ModAuth::lowestModuleMinimum(), so
+  // a module registered without a policy row (effective() == PHYSICAL) cannot
+  // widen the gate and the two cannot drift.
+  uint8_t lowest = ModAuth::PHYSICAL;
+  for (uint8_t i = 0; i < count_; i++) {
+    uint8_t e = ModAuth::effective(mods_[i]->minAuth);
+    if (e < lowest) {
+      lowest = e;
+    }
   }
+
+  int8_t idxSigned = indexOf(id);
+  const ModuleDescriptor *m = (idxSigned >= 0) ? mods_[idxSigned] : nullptr;
+  uint8_t modMin = (m != nullptr) ? ModAuth::effective(m->minAuth) : ModAuth::PHYSICAL;
+  // An action name the descriptor does not list resolves to PHYSICAL — see
+  // actionLevel(). Two cases are scored as if the action were reachable, so
+  // that the ENOACT branch below answers them instead:
+  //   * no "act" in the request at all;
+  //   * a module with NO dispatch callback (`cdc`), which can only ever answer
+  //     ENOACT anyway. Refusing that with EAUTH would contradict list(), which
+  //     already shows such a module with an empty actions array to the same
+  //     caller — it would hide nothing and confuse a UI.
+  // A module that HAS a dispatch but no action table still resolves to
+  // PHYSICAL, so the gate cannot be opened by simply not describing an action.
+  uint8_t actMin =
+      (m != nullptr && act != nullptr && m->dispatch != nullptr) ? actionLevel(m, act) : ModAuth::TOKEN;
+
+  switch (ModAuth::decide(ctx.authLevel, lowest, m != nullptr, modMin, actMin)) {
+    case ModAuth::DECIDE_EAUTH_ANY:
+      // Deliberately does NOT name the module: this is the answer for a real
+      // module and for an invented one alike, which is the whole point.
+      return authDenied(err, "any module", lowest, ctx);
+    case ModAuth::DECIDE_ENOMOD:
+      cmdErrorf(err, "ENOMOD", "no such module: '%s'", id ? id : "");
+      return DISPATCH_FAIL;
+    case ModAuth::DECIDE_EAUTH_MODULE: {
+      char what[48];
+      snprintf(what, sizeof(what), "the module '%.16s'", m->id);
+      return authDenied(err, what, modMin, ctx);
+    }
+    case ModAuth::DECIDE_EAUTH_ACTION: {
+      char what[64];
+      snprintf(what, sizeof(what), "the action '%.16s.%.24s'", m->id, act);
+      return authDenied(err, what, actMin, ctx);
+    }
+    case ModAuth::DECIDE_ALLOW:
+      break;
+  }
+
   uint8_t idx = (uint8_t)idxSigned;
-  const ModuleDescriptor *m = mods_[idx];
 
   if (!enabled_[idx]) {
     if (m->bootTimeBinding && desired_[idx]) {

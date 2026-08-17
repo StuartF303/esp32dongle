@@ -18,6 +18,7 @@
 #include "bus.h"
 #include "claims_selftest.h"
 #include "cmdauth.h"
+#include "modauth.h"
 #include "partition_info.h"
 #include "protocol.h"
 #include "bootprobe.h"
@@ -305,8 +306,10 @@ DispatchResult renderActionResult(const char *id, const ModuleActionResult &r, J
 
 // The exact shape GET /api/modules serves — literally, since W2: mod_http.cpp
 // calls Console::fillModules() rather than re-rendering the registry itself.
-DispatchResult cmdModules(const CmdContext &, JsonObjectConst, JsonObject d, JsonObject, CmdError *) {
-  Console::fillModules(d);
+DispatchResult cmdModules(const CmdContext &ctx, JsonObjectConst, JsonObject d, JsonObject, CmdError *) {
+  // The caller's own level goes in, because the listing is FILTERED by it
+  // (backlog S7): a module this session may not see is not in the array at all.
+  Console::fillModules(d, ctx.authLevel);
   return DISPATCH_OK;
 }
 
@@ -551,6 +554,22 @@ static_assert(everyCommandHasAPolicy(),
               "default to AUTH_PHYSICAL");
 static_assert(COMMAND_COUNT == CmdAuth::BUILTIN_COUNT,
               "CmdAuth::BUILTINS names a command that no longer exists in COMMANDS, or vice versa");
+
+// ---- BACKLOG S8: the `led` built-in and the `led` module must agree -------
+//
+// `led` is a pure alias — cmdLed() calls registry.dispatch("led", "set", ...)
+// and does nothing else. Two tables therefore describe ONE capability, and
+// before this assert they disagreed: the built-in was TOKEN (S1) while the
+// module action was ungated. Whichever way that drifts, one of the two becomes
+// a way round the other, and the gate that is actually enforced is whichever
+// the caller happens to use.
+//
+// Tying them together at build time is the fix, rather than writing "keep these
+// in sync" in a comment: raising or lowering either one alone now fails the
+// build, and the person doing it has to decide about both.
+static_assert(CmdAuth::requiredFor("led") == ModAuth::requiredFor("led", "set"),
+              "the `led` built-in and the led.set module action have different auth levels — one is a way round the "
+              "other; change both (cmdauth.h and modauth.h) or neither");
 
 // Every command's level, and whether THIS caller has it — so a UI can grey out
 // what the session cannot use instead of discovering it by failure. `auth` is
@@ -831,8 +850,13 @@ bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, Json
   return res == DISPATCH_OK && mod == nullptr && strcmp(act, "reboot") == 0;
 }
 
-void fillModules(JsonObject d) {
-  registry.list(d["modules"].to<JsonArray>());
+void fillModules(JsonObject d, uint8_t authLevel) {
+  // The caller's own level, mirrored back the way `help` does it — otherwise a
+  // UI that renders `allowed` per action has no idea what level it is at, and
+  // cannot explain WHY half the buttons are grey.
+  d["auth"] = CmdAuth::levelName(authLevel);
+  d["auth_level"] = authLevel;
+  registry.list(d["modules"].to<JsonArray>(), authLevel);
 
   // What the persisted enable-set did at boot. A persisted combination that
   // is no longer satisfiable is skipped rather than fatal, so this is the

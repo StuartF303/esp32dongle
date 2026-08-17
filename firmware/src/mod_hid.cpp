@@ -10,6 +10,7 @@
 
 #include "bus.h"
 #include "keyboard_layout_en_gb.h"
+#include "modauth.h"
 
 namespace {
 
@@ -216,20 +217,18 @@ enum { MOD_CTRL = 1, MOD_SHIFT = 2, MOD_ALT = 4, MOD_GUI = 8 };
 // ===========================================================================
 // Auth
 // ===========================================================================
-
-// Injection is refused below AUTH_TOKEN. Policy lives here, in the module, not
-// in the transport: a fresh Wi-Fi/BLE client (AUTH_NONE) must not be able to
-// type into the host, and only the module knows that about itself.
-bool requireInjectAuth(const CmdContext &ctx, CmdError *err) {
-  if (ctx.authLevel < AUTH_TOKEN) {
-    cmdErrorf(err, "EAUTH",
-              "hid injection requires an authenticated session (auth >= token); transport '%s' is at level %u and is "
-              "refused.",
-              ctx.transport ? ctx.transport : "?", (unsigned)ctx.authLevel);
-    return false;
-  }
-  return true;
-}
+//
+// requireInjectAuth() USED TO LIVE HERE and is deliberately gone (backlog S6).
+// It refused `type`, `key` and a `layout` write below AUTH_TOKEN — the right
+// level, applied by the wrong body. Every action of this module is now declared
+// in modauth.h and enforced by Registry::dispatch() before any of the handlers
+// below run, which is what makes `status` (armed / bound / queue depth — i.e.
+// "is this dongle a keyboard right now?") gated too. It never was: the module
+// only checked the actions IT considered dangerous.
+//
+// Nothing is kept here. The declarative level expresses this module's policy
+// exactly: reading and writing sit at the same bar, so there is no
+// per-parameter rule left for a handler to enforce.
 
 // ===========================================================================
 // Status
@@ -302,9 +301,6 @@ bool hidDisable(const char **errMsg) {
 // ===========================================================================
 
 DispatchResult actType(const CmdContext &ctx, JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireInjectAuth(ctx, err)) {
-    return DISPATCH_FAIL;
-  }
   if (kbd == nullptr) {  // defensive: enable() would have refused, but never inject blind
     cmdErrorf(err, "EREBOOT", "hid interface is not bound this boot; reboot to use it");
     return DISPATCH_FAIL;
@@ -378,9 +374,8 @@ DispatchResult actType(const CmdContext &ctx, JsonObjectConst p, JsonObject d, C
 }
 
 DispatchResult actKey(const CmdContext &ctx, JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireInjectAuth(ctx, err)) {
-    return DISPATCH_FAIL;
-  }
+  (void)ctx;  // the auth gate is central now (modauth.h); nothing here reads the caller
+
   if (kbd == nullptr) {
     cmdErrorf(err, "EREBOOT", "hid interface is not bound this boot; reboot to use it");
     return DISPATCH_FAIL;
@@ -458,7 +453,11 @@ DispatchResult actKey(const CmdContext &ctx, JsonObjectConst p, JsonObject d, Cm
 }
 
 DispatchResult actRelease(const CmdContext &ctx, JsonObject d, CmdError *err) {
-  (void)ctx;  // panic stop: allowed at ANY auth level — it can only make the keyboard idle
+  // Was reachable at ANY auth level as a "panic stop". It is AUTH_TOKEN now
+  // (modauth.h): it cancels a running job, which is a state change, and the S6
+  // rule leaves nothing at AUTH_NONE. Every transport that can start a type job
+  // holds a session and can therefore still stop it.
+  (void)ctx;
   (void)err;
   bool cancelled = jobActive;
   jobActive = false;
@@ -471,14 +470,13 @@ DispatchResult actRelease(const CmdContext &ctx, JsonObject d, CmdError *err) {
 }
 
 DispatchResult actLayout(const CmdContext &ctx, JsonObjectConst p, JsonObject d, CmdError *err) {
+  (void)ctx;  // read and write sit at the same central level; see the Auth note above
+
   const char *set = p["set"] | (const char *)nullptr;
   if (set != nullptr) {
-    // Changing which host layout we assume is a configuration change; gate it
-    // like injection so an unauthenticated client cannot silently corrupt every
-    // future macro's output.
-    if (!requireInjectAuth(ctx, err)) {
-      return DISPATCH_FAIL;
-    }
+    // Changing which host layout we assume is a configuration change. It is
+    // gated at AUTH_TOKEN like every other action of this module, centrally
+    // (modauth.h) rather than here.
     LayoutId want;
     if (strcasecmp(set, "en_GB") == 0) want = LAYOUT_EN_GB;
     else if (strcasecmp(set, "en_US") == 0) want = LAYOUT_EN_US;
@@ -551,13 +549,24 @@ const ModuleParam LAYOUT_PARAMS[] = {
                      "en_GB,en_US"),
 };
 
-const ModuleAction HID_ACTIONS[] = {
-    {"type", "type a string into the host (queued; completes with a hid.done event)", MOD_PARAMS(TYPE_PARAMS)},
-    {"key", "send one keystroke, optionally with modifiers", MOD_PARAMS(KEY_PARAMS)},
-    {"release", "releaseAll() — panic stop for a stuck key or modifier", nullptr, 0},
-    {"status", "armed/bound/layout/queue depth/current job/chars sent", nullptr, 0},
-    {"layout", "get or set the HOST keyboard layout (en_GB default, en_US selectable)", MOD_PARAMS(LAYOUT_PARAMS)},
+// Levels from ModAuth::requiredFor() — never literals. All five are AUTH_TOKEN:
+// injection obviously, and `status`/`release` because "is this dongle a
+// keyboard, and is it typing" is not a question for a caller with no session.
+constexpr ModuleAction HID_ACTIONS[] = {
+    {"type", "type a string into the host (queued; completes with a hid.done event)", MOD_PARAMS(TYPE_PARAMS),
+     ModAuth::requiredFor("hid", "type")},
+    {"key", "send one keystroke, optionally with modifiers", MOD_PARAMS(KEY_PARAMS),
+     ModAuth::requiredFor("hid", "key")},
+    {"release", "releaseAll() — panic stop for a stuck key or modifier", nullptr, 0,
+     ModAuth::requiredFor("hid", "release")},
+    {"status", "armed/bound/layout/queue depth/current job/chars sent", nullptr, 0,
+     ModAuth::requiredFor("hid", "status")},
+    {"layout", "get or set the HOST keyboard layout (en_GB default, en_US selectable)", MOD_PARAMS(LAYOUT_PARAMS),
+     ModAuth::requiredFor("hid", "layout")},
 };
+static_assert(ModAuth::allGated(HID_ACTIONS, sizeof(HID_ACTIONS) / sizeof(HID_ACTIONS[0])),
+              "hid: an action has no declared auth level");
+static_assert(ModAuth::isModuleListed("hid"), "hid has no row in ModAuth::MODULES");
 
 const ModuleDescriptor HID_MODULE = {
     .id = "hid",
@@ -573,6 +582,12 @@ const ModuleDescriptor HID_MODULE = {
     // enable/disable records intent and reports pendingRestart.
     .bootTimeBinding = true,
     .essential = false,
+    // AUTH_TOKEN to see this module at all. Below it, dispatch() answers exactly
+    // as it would for a module that does not exist, and list() omits it — so
+    // "does this dongle have a keyboard, and is it armed?" needs a session.
+    // ARMING it is still `enable`, a TOKEN built-in: stuart's standing decision
+    // (cmdauth.h), unchanged here.
+    .minAuth = ModAuth::moduleMinimum("hid"),
     .enable = hidEnable,
     .disable = hidDisable,
     .dispatch = hidDispatch,

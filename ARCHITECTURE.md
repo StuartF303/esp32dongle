@@ -160,6 +160,34 @@ impossible combination with a clear error naming every blocker, instead of hangi
   at every boot regardless of NVS and cannot be disabled. Before that, a `force` enable could
   have reported `stopped: []` while taking away the only link to the device.
 
+### Auth is part of the descriptor (backlog S6/S7/S8, done 2026-08-17)
+
+The descriptor carries a `minAuth` and each `ModuleAction` carries its own, both initialised at
+compile time from **`firmware/src/modauth.h`** — the module-side twin of `cmdauth.h`, and
+dependency-free for the same reason: the native test env excludes `src/`, so a policy living in
+`mod_*.cpp` could never be asserted on the host. `Registry::dispatch()` enforces it centrally via
+`ModAuth::decide()`, and the modules' own hand-rolled checks (`hid`'s `requireInjectAuth`,
+`storage`'s `requireAuth`/`requirePhysical`, `http`'s `requirePhysical`, `display`'s backlight
+check) are gone.
+
+- **The module's bar is checked before ENOMOD / EDISABLED / EREBOOT.** Those three are facts
+  about the module map — including "armed, binds at boot", i.e. *the keyboard is coming back at
+  the next restart* — and a caller below the lowest module bar gets one refusal that names
+  nothing, so a real id and an invented one are indistinguishable. That is exactly what S1 did
+  for the built-ins with `CmdAuth::minimumLevel()`, and it is what lets BLE dispatch at
+  `AUTH_NONE`.
+- **`Registry::list()` filters by the caller's level** and emits `min_auth` per module plus
+  `min_auth` + `allowed` per action, so the phone UI greys out what the session cannot use
+  instead of discovering it by failure. A module below the caller's bar is absent entirely — not
+  rendered as forbidden, which would answer the question the bar exists to refuse.
+- **Levels:** everything is `AUTH_TOKEN` except `storage.format`, `http.psk` and `http.pin`,
+  which stay `AUTH_PHYSICAL`. Nothing is at `AUTH_NONE`, and there is no way to spell it: an
+  undeclared level is 0, which `ModAuth::effective()` reads as `AUTH_PHYSICAL`, `allGated()`
+  turns into a build failure, and a `static_assert` forbids in the table.
+- **One capability, one bar.** The `led` built-in is a pure alias for `led.set`, so console.cpp
+  carries a `static_assert` that `CmdAuth::requiredFor("led") == ModAuth::requiredFor("led",
+  "set")`. Changing either alone fails the build.
+
 ---
 
 ## 3. Partition plan (16 MB)

@@ -2,6 +2,7 @@
 
 #include "bus.h"
 #include "console.h"
+#include "modauth.h"
 #include "protocol.h"
 
 namespace {
@@ -26,6 +27,8 @@ void cdcStatus(JsonObject d) {
 #endif
 }
 
+static_assert(ModAuth::isModuleListed("cdc"), "cdc has no row in ModAuth::MODULES");
+
 const ModuleDescriptor CDC_MODULE = {
     .id = "cdc",
     .name = "USB Serial Console",
@@ -38,6 +41,10 @@ const ModuleDescriptor CDC_MODULE = {
     // disable through the arming path — it just tells a UI the truth.
     .bootTimeBinding = true,
     .essential = true,
+    // AUTH_TOKEN to see it in a listing at all, like every other module — even
+    // though it has no actions, `status` reports whether the console is
+    // connected and which USB mode this build is.
+    .minAuth = ModAuth::moduleMinimum("cdc"),
     .enable = cdcEnable,
     .disable = nullptr,  // never called: Registry::disable() refuses first
     .dispatch = nullptr,

@@ -73,7 +73,10 @@ inline const char *levelName(uint8_t level) {
 
 // The whole gate. Levels are ordered and cumulative — AUTH_PHYSICAL implies
 // AUTH_TOKEN — which is why this is >= and not ==.
-inline bool permits(uint8_t have, uint8_t need) { return have >= need; }
+// constexpr, so the module-side policy (modauth.h) can express its own
+// decisions in terms of THIS function rather than restating `>=`. Still inline
+// and still callable at runtime; nothing about the built-in gate changed.
+constexpr bool permits(uint8_t have, uint8_t need) { return have >= need; }
 
 // ---- the policy table ---------------------------------------------------
 

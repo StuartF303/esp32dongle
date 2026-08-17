@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "activity.h"
+#include "modauth.h"
 #include "pairing.h"
 #include "screenfmt.h"
 #include "scheduler.h"
@@ -861,6 +862,8 @@ bool displayDisable(const char **errMsg) {
 // No SPI is touched from a dispatch either — actions set flags, the tick draws.
 
 DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjectConst p, JsonObject d, CmdError *err) {
+  (void)ctx;  // every action of this module is gated centrally (modauth.h)
+
   if (strcmp(act, "status") == 0) {
     d["panel"] = up_;
     d["screen"] = SCREEN_NAME[screen_ < SCREEN_COUNT ? screen_ : 0];
@@ -897,16 +900,14 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
   }
 
   if (strcmp(act, "backlight") == 0) {
-    // AUTH_TOKEN, because turning the backlight off makes a working device
-    // look dead — and because a device whose screen an unauthenticated client
-    // can blank cannot be trusted as the out-of-band channel that shows the
-    // PIN. Stuart's call; `screen` and `refresh` are deliberately NOT gated,
-    // since neither can hide or fake anything the operator needs.
-    if (ctx.authLevel < AUTH_TOKEN) {
-      cmdErrorf(err, "EAUTH", "backlight needs auth >= token; '%s' is at level %u", ctx.transport ? ctx.transport : "?",
-                (unsigned)ctx.authLevel);
-      return DISPATCH_FAIL;
-    }
+    // The hand-rolled AUTH_TOKEN check that used to be here is gone (backlog
+    // S6): the level is declared in modauth.h and Registry::dispatch() applies
+    // it. Its reasoning still stands and is why the whole module is TOKEN — a
+    // device whose screen an unauthenticated client can blank cannot be trusted
+    // as the out-of-band channel that shows the PIN. What has CHANGED is that
+    // `screen` and `refresh` are now gated too (backlog C7): switching to
+    // `diag` hides the PIN, which is an unauthenticated state change to that
+    // same channel, and the old comment here claimed the opposite.
     if (!up_) {
       cmdErrorf(err, "ENOTUP", "the panel is not initialised");
       return DISPATCH_FAIL;
@@ -1000,12 +1001,21 @@ const ModuleParam SCREEN_PARAMS[] = {
                      "status,diag"),
 };
 
-const ModuleAction DISPLAY_ACTIONS[] = {
-    {"status", "panel, backlight, current screen and redraw statistics", nullptr, 0},
-    {"backlight", "backlight on/off or 0..100% (auth >= token)", MOD_PARAMS(BACKLIGHT_PARAMS)},
-    {"screen", "select a firmware-defined screen", MOD_PARAMS(SCREEN_PARAMS)},
-    {"refresh", "force a full repaint", nullptr, 0},
+constexpr ModuleAction DISPLAY_ACTIONS[] = {
+    {"status", "panel, backlight, current screen and redraw statistics", nullptr, 0,
+     ModAuth::requiredFor("display", "status")},
+    // The "(auth >= token)" that used to be in this help string is gone: the
+    // level is emitted as `min_auth` by Registry::list() now, so a UI reads it
+    // as data instead of parsing it out of English.
+    {"backlight", "backlight on/off or 0..100%", MOD_PARAMS(BACKLIGHT_PARAMS),
+     ModAuth::requiredFor("display", "backlight")},
+    {"screen", "select a firmware-defined screen", MOD_PARAMS(SCREEN_PARAMS),
+     ModAuth::requiredFor("display", "screen")},
+    {"refresh", "force a full repaint", nullptr, 0, ModAuth::requiredFor("display", "refresh")},
 };
+static_assert(ModAuth::allGated(DISPLAY_ACTIONS, sizeof(DISPLAY_ACTIONS) / sizeof(DISPLAY_ACTIONS[0])),
+              "display: an action has no declared auth level");
+static_assert(ModAuth::isModuleListed("display"), "display has no row in ModAuth::MODULES");
 
 const ModuleDescriptor DISPLAY_MODULE = {
     .id = "display",
@@ -1020,6 +1030,7 @@ const ModuleDescriptor DISPLAY_MODULE = {
     // frozen at boot the way a TinyUSB interface is.
     .bootTimeBinding = false,
     .essential = false,
+    .minAuth = ModAuth::moduleMinimum("display"),
     .enable = displayEnable,
     .disable = displayDisable,
     .dispatch = displayDispatch,

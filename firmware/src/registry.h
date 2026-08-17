@@ -146,25 +146,9 @@ typedef void (*ModuleStatusFn)(JsonObject d);
 // source of truth, and it is enabled_[i] in here.
 typedef void (*ModuleTaskFn)();
 
-// One action a module accepts. Static, .rodata, zero RAM. This is what makes
-// ARCHITECTURE.md section 2's "the web UI renders itself from GET
-// /api/modules, a new module needs zero front-end changes" true rather than
-// aspirational: without it the listing says a module exists but nothing about
-// what it DOES, so every module still needs a hand-written panel.
-//
-// `params` is a MACHINE-READABLE table (modparam.h), not a prose sketch. It
-// used to be one free-text string and the UI could do nothing with it but put
-// it in a placeholder over a raw-JSON box — see the defect described at the
-// top of modparam.h. The rule for filling it in: read the dispatch handler and
-// describe what it ACTUALLY accepts, including which parameters are genuinely
-// optional. The prose it replaced had already drifted from the code in six
-// places.
-struct ModuleAction {
-  const char *act;             // "set", "type", "scan"
-  const char *help;            // one line, imperative, for a tooltip or `help` output
-  const ModuleParam *params;   // static .rodata table; nullptr for an action with no params
-  uint8_t paramCount;
-};
+// struct ModuleAction now lives in modparam.h — next to ModuleParam, and
+// reachable by the dependency-free modauth.h that carries its auth levels. It
+// is unchanged apart from the minAuth field backlog S6 added.
 
 struct ModuleDescriptor {
   const char *id;           // short, stable, wire-visible ("led", "hid", "msc"); <= Registry::MAX_ID_LEN
@@ -193,6 +177,18 @@ struct ModuleDescriptor {
   // only control link the device has, and which a `force` enable would
   // otherwise be free to stop out from under the reply it is about to send.
   bool essential;
+
+  // The AuthLevel a caller must hold to LEARN THIS MODULE EXISTS or interact
+  // with it at all (backlog S7). Checked in dispatch() BEFORE the
+  // ENOMOD/EDISABLED/EREBOOT branches — otherwise the module map and each
+  // module's enabled state are readable at any level, and a stranger can ask
+  // whether this dongle is currently a keyboard — and in list(), which omits a
+  // module the caller is below entirely.
+  //
+  // Initialise from ModAuth::moduleMinimum(id), never from a literal. 0 means
+  // UNDECLARED and ModAuth::effective() maps it to AUTH_PHYSICAL; see the
+  // fail-closed note in modauth.h.
+  uint8_t minAuth;
 
   ModuleLifecycleFn enable;   // may be nullptr
   ModuleLifecycleFn disable;  // may be nullptr
@@ -355,9 +351,16 @@ class Registry {
   // Live state, not persisted intent. Non-const because it takes the lock.
   bool isEnabled(const char *id);
 
-  // Renders the full descriptor list into `out`. This is the exact shape
-  // GET /api/modules will serve, so keep it clean and stable.
-  void list(JsonArray out);
+  // Renders the descriptor list into `out`. This is the exact shape
+  // GET /api/modules serves, so keep it clean and stable.
+  //
+  // FILTERED BY `authLevel` (backlog S7): a module whose minAuth this caller
+  // does not hold is omitted ENTIRELY — not greyed out, not listed as
+  // forbidden — so a listing cannot be used to enumerate what the device is.
+  // Every module that IS rendered carries "min_auth", and every action carries
+  // "min_auth" + "allowed", so a UI can grey out what this session cannot use
+  // instead of discovering it by failure.
+  void list(JsonArray out, uint8_t authLevel);
 
   // Renders ONE module's status() into `out`. Returns false if there is no
   // such module, it is disabled, or it has no status callback — the same
@@ -374,10 +377,16 @@ class Registry {
   // module's worth of JSON.
   bool statusOf(const char *id, JsonObject out);
 
-  // Routes a command to a module. Answers ENOMOD (no such module), EDISABLED
+  // Routes a command to a module. Answers EAUTH (below the module's or the
+  // action's declared level — modauth.h), ENOMOD (no such module), EDISABLED
   // (registered but off), EREBOOT (armed but not bound until the next boot),
-  // ENOACT (no dispatch / no act) itself, all naming the module, before the
-  // module's own dispatch is ever reached.
+  // ENOACT (no dispatch / no act) itself, before the module's own dispatch is
+  // ever reached.
+  //
+  // THE AUTH CHECKS COME FIRST, and the module-existence one comes before
+  // ENOMOD (backlog S6/S7). A caller below the lowest level any module accepts
+  // is refused without being told whether the id it sent exists — the property
+  // S1 established for the built-ins, so a transport may dispatch at AUTH_NONE.
   DispatchResult dispatch(const char *id, const char *act, const CmdContext &ctx, JsonObjectConst p, JsonObject d,
                           CmdError *err);
 

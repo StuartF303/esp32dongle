@@ -10,21 +10,6 @@ for verified hardware facts.
 
 ## Security — do before this leaves your desk
 
-**S6. Module-side actions still have no auth check.**
-S1 gated the built-ins; several module actions remain open by their own choice: `led.set`,
-`led.auto`, `hid.status`, `storage.status`, `display.status`, `display.screen`, `display.refresh`.
-None are exposed today (HTTP still 401s pre-dispatch), but they are the same class as S1 and will
-matter the moment BLE dispatches at `AUTH_NONE`. `hid.status` in particular tells a stranger
-whether the dongle is currently a keyboard.
-
-**S7. `Registry::dispatch()` answers before the module's gate.**
-`ENOMOD` / `EDISABLED` / `EREBOOT` are returned prior to the module's own auth check, so the
-module map and each module's enabled state are readable at any auth level.
-
-**S8. `led` alias and `led` module now disagree.**
-The `led` built-in is `AUTH_TOKEN` after S1; `{"mod":"led","act":"set"}` is ungated. Same
-capability, two different bars. Reconcile in whichever direction you prefer.
-
 **S3. The AP passphrase is a public secret, by choice.**
 `pass-a9d8` is derivable from the broadcast SSID, and WPA2-PSK has no forward secrecy against a
 holder of the key — a captured 4-way handshake exposes the PIN and session token too. Stuart
@@ -54,7 +39,10 @@ for stuart to decide.
 **C2. `storage.caps` requires `AUTH_TOKEN`.**
 So an unauthenticated client cannot discover the limits it is required to negotiate against
 (`max_chunk`, `max_path`). Defensible, slightly awkward; `caps` is the one action worth
-considering at `AUTH_NONE`.
+considering at `AUTH_NONE`. Since S6 that would take TWO deliberate acts, by design: a new
+explicit sentinel in `modauth.h` (0 means "undeclared" and fails closed to PHYSICAL, so there is
+no way to spell AUTH_NONE by accident), and lowering `storage`'s own module bar, which currently
+hides the module from an unauthenticated caller before any action is considered.
 
 **C4. Deferred-teardown window in `disable http`.**
 In the contended case the module reports disabled and `RES_WIFI` is released up to 20 ms before
@@ -68,10 +56,6 @@ not unbounded, and `loopTask` has no WDT subscription by default.
 One producer at a time by convention; worst case is one frame showing a mixed label. A mutex
 would put FreeRTOS into a header the host tests compile, which is why it was skipped.
 
-**C7. `display`'s `screen` and `refresh` are ungated.**
-Switching to `diag` hides the PIN. Not an attack (hiding a secret is not disclosing it), but it
-is an unauthenticated state change.
-
 **C8. Storage is capped at 2 GiB per file.**
 `off_t` is 32-bit signed here, so a legal 4 GiB−1 FAT32 file is not fully addressable.
 Advertised honestly as `caps.max_file_offset`.
@@ -79,6 +63,8 @@ Advertised honestly as `caps.max_file_offset`.
 **C9. `Registry::list()` growth vs the WebSocket TX cap.**
 The full descriptor set is now ~6–7 KB against `MAX_WS_TX` 16384. Fine today, unmeasured on
 device, and every new module grows it. `/api/modules` over HTTP is chunk-streamed and unaffected.
+S6/S7 added ~40 bytes per action (`min_auth` + `allowed`) and ~26 per module — about 1 KB on the
+current 26-action surface, and it grows with the same multiplier every new module does.
 
 **C10. `Protocol::MAX_LINE` costs 3 KB of RAM per line-framing transport.**
 CDC and the WebSocket each carry a 4 KB line buffer; BLE will want a third. Worth revisiting if
@@ -168,6 +154,35 @@ and the native tests already cover the security-critical path sanitisation.
   uses, which is what puts the new image into `ESP_OTA_IMG_NEW` and therefore actually arms S4's
   confirmation machinery. See ARCHITECTURE.md §4 "OTA delivery". The security trade-off it
   carries is S9 above.
+
+- **S6 / S7 / S8 — the module side of the auth model. Done 2026-08-17.**
+  The same fix as S1, one layer down. `firmware/src/modauth.h` is now the single `.rodata` policy
+  table for every module and every action, dependency-free and host-tested (21 cases,
+  `test/test_modauth`) because the native env excludes `src/` — a level living in a `mod_*.cpp`
+  could never be asserted anywhere. `ModuleAction` and `ModuleDescriptor` carry a `minAuth`
+  initialised from that table at compile time, and `Registry::dispatch()` enforces it through the
+  pure `ModAuth::decide()` **before** the ENOMOD / EDISABLED / EREBOOT branches, so the module map
+  and each module's enabled state are no longer readable below the bar. `Registry::list()` applies
+  the same rule and additionally emits `min_auth` per module and `min_auth` + `allowed` per action,
+  which is what lets the phone UI grey out what a session cannot use.
+
+  **The levels:** everything `AUTH_TOKEN`; `storage.format`, `http.psk`, `http.pin` stay
+  `AUTH_PHYSICAL`; nothing at `AUTH_NONE`, and no way to spell it — an undeclared level is 0,
+  which `effective()` reads as PHYSICAL and `allGated()` turns into a build failure. Stuart's two
+  standing decisions are untouched: arming `hid` is `enable` (a TOKEN built-in), and OTA upload +
+  select stay TOKEN (S9).
+
+  **Deleted, not moved:** `mod_hid.cpp`'s `requireInjectAuth`, `mod_storage.cpp`'s `requireAuth`
+  and `requirePhysical`, `mod_http.cpp`'s `requirePhysical` and its two inline `status`/`sessions`
+  checks, and `mod_display.cpp`'s backlight check. Every one of them was fully expressed by an
+  action-level declaration; nothing was kept. Two behaviour changes fell out: `hid.release`, which
+  the module allowed at any level as a "panic stop", is TOKEN like everything else, and an action
+  name absent from a module's descriptor table now answers EAUTH rather than EUNKNOWN to a caller
+  below PHYSICAL (fail-closed, and it stops action enumeration).
+
+  S8 is closed by a `static_assert` in console.cpp tying `CmdAuth::requiredFor("led")` to
+  `ModAuth::requiredFor("led", "set")`: the built-in is a pure alias, so changing either alone now
+  fails the build. C7 (`display.screen` / `refresh` ungated) is closed by the same table.
 
 - **S1 — built-in commands had no auth check.** Done 2026-08-17. Gated centrally in
   `Console::execute` from a single `.rodata` policy table, enforced BEFORE `findCommand()` so an

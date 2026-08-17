@@ -173,6 +173,40 @@ constexpr ModuleParam choiceList(const char *name, bool required, const char *he
 
 }  // namespace ModParam
 
+// One action a module accepts. Static, .rodata, zero RAM. This is what makes
+// ARCHITECTURE.md section 2's "the web UI renders itself from GET
+// /api/modules, a new module needs zero front-end changes" true rather than
+// aspirational: without it the listing says a module exists but nothing about
+// what it DOES, so every module still needs a hand-written panel.
+//
+// `params` is a MACHINE-READABLE table (above), not a prose sketch. It used to
+// be one free-text string and the UI could do nothing with it but put it in a
+// placeholder over a raw-JSON box — see the defect described at the top of this
+// header. The rule for filling it in: read the dispatch handler and describe
+// what it ACTUALLY accepts, including which parameters are genuinely optional.
+// The prose it replaced had already drifted from the code in six places.
+//
+// IT LIVES HERE, not in registry.h, so that modauth.h — which is
+// dependency-free and therefore host-testable — can walk a real module's action
+// table in a static_assert and in `pio test -e native`. registry.h includes
+// this header, so nothing else moved.
+struct ModuleAction {
+  const char *act;            // "set", "type", "scan"
+  const char *help;           // one line, imperative, for a tooltip or `help` output
+  const ModuleParam *params;  // static .rodata table; nullptr for an action with no params
+  uint8_t paramCount;
+  // The AuthLevel a caller must hold for this action to run (backlog S6).
+  // Enforced CENTRALLY in Registry::dispatch(), before the module's own
+  // dispatch is called, so no module checks auth for itself and none of them
+  // can forget to. Initialise it from ModAuth::requiredFor(mod, act) — never
+  // from a literal — so modauth.h stays the single source of truth.
+  //
+  // 0 means UNDECLARED, not AUTH_NONE: ModAuth::effective() maps it to
+  // AUTH_PHYSICAL, and ModAuth::allGated() turns a forgotten field into a build
+  // failure. There is no way to spell "open to everyone" here, on purpose.
+  uint8_t minAuth;
+};
+
 // Fills a ModuleAction's `params` + `paramCount` pair from one table.
 //
 // A macro, deliberately, and the only one in this header: the two fields must

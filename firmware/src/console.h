@@ -81,7 +81,13 @@ bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, Json
 // Renders the module listing + boot restore report into `d` — the exact `d` of
 // the `modules` command, and the exact body of GET /api/modules. One
 // implementation so the two cannot disagree.
-void fillModules(JsonObject d);
+//
+// `authLevel` is the CALLER's AuthLevel and it FILTERS the result (backlog S7):
+// a module whose minAuth this level does not clear is omitted entirely, so a
+// listing cannot be used to enumerate a device the caller has no session on.
+// It also decides the per-action `allowed` flag, and is echoed back as
+// `auth`/`auth_level` so a UI knows why something is greyed out.
+void fillModules(JsonObject d, uint8_t authLevel);
 
 // Scheduler task: drains whatever's waiting on Serial, non-blocking, and
 // dispatches any complete line(s). Register with interval 0 (every pass) for

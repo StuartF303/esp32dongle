@@ -20,6 +20,7 @@
 #include "cmdauth.h"
 #include "crc32.h"
 #include "fsmount.h"
+#include "modauth.h"
 #include "pathsafe.h"
 #include "protocol.h"
 #include "volpath.h"
@@ -540,34 +541,18 @@ void failErrno(const char *what, const char *path, int e, uint8_t vol, CmdError 
 // Auth
 // ===========================================================================
 //
-// Enforced HERE, in the module, exactly as `hid` does it — never in a
-// transport. A transport knows what level a client reached; only the module
-// knows what that level buys, and the SD card holds whatever the user put on
-// it. Both tiers currently sit at AUTH_TOKEN: reading someone's card over an
-// open AP is not meaningfully less serious than writing to it.
-bool requireAuth(const CmdContext &ctx, bool mutating, CmdError *err) {
-  if (ctx.authLevel >= AUTH_TOKEN) {
-    return true;
-  }
-  cmdErrorf(err, "EAUTH", "storage %s require an authenticated session (auth >= token); transport '%s' is at level %u",
-            mutating ? "writes" : "reads", ctx.transport ? ctx.transport : "?", (unsigned)ctx.authLevel);
-  return false;
-}
-
-// `format` ERASES A WHOLE FILESYSTEM, so it sits at AUTH_PHYSICAL alongside the
-// AP passphrase and `reboot`: the cable, not the network. A session token buys
-// a great deal on this device — including, by stuart's decision, pushing and
-// selecting a firmware image — but not the ability to destroy the owner's web
-// assets and macros from across the room with one request.
-bool requirePhysical(const CmdContext &ctx, const char *what, CmdError *err) {
-  if (ctx.authLevel >= AUTH_PHYSICAL) {
-    return true;
-  }
-  char msg[sizeof(CmdError::msg)];
-  CmdAuth::denyMessage(msg, sizeof(msg), what, CmdAuth::PHYSICAL, ctx.transport, ctx.authLevel);
-  cmdErrorf(err, "EAUTH", "%s", msg);
-  return false;
-}
+// requireAuth() and requirePhysical() USED TO LIVE HERE and are gone (backlog
+// S6). Both are now declarations in modauth.h, applied by Registry::dispatch()
+// before this module is entered:
+//
+//   caps/free/list/stat/read/verify/write/mkdir/delete/status  AUTH_TOKEN
+//   format                                                     AUTH_PHYSICAL
+//
+// The levels are unchanged, including format's — reading someone's card over
+// an open AP is not meaningfully less serious than writing to it, so both tiers
+// were one bar anyway, and `format` erases a whole filesystem, which stays at
+// the cable rather than the network. What the module lost is the ABILITY to
+// disagree with the table, and `status`, which had no check at all.
 
 // ===========================================================================
 // verify — the only action that outlives its dispatch
@@ -1762,42 +1747,46 @@ void fillStatus(JsonObject d) {
 
 DispatchResult storageDispatch(const CmdContext &ctx, const char *act, JsonObjectConst p, JsonObject d,
                                CmdError *err) {
-  // Read-only tier. Everything here still needs AUTH_TOKEN: a directory listing
-  // of someone's card is not public information.
+  // Read-only tier. Everything here still needs AUTH_TOKEN — a directory
+  // listing of someone's card is not public information — but the check is
+  // Registry::dispatch()'s now, from the table in modauth.h. See the Auth note
+  // above.
   if (strcmp(act, "caps") == 0) {
-    return requireAuth(ctx, false, err) ? actCaps(d) : DISPATCH_FAIL;
+    return actCaps(d);
   }
   if (strcmp(act, "free") == 0) {
-    return requireAuth(ctx, false, err) ? actFree(p, d, err) : DISPATCH_FAIL;
+    return actFree(p, d, err);
   }
   if (strcmp(act, "list") == 0) {
-    return requireAuth(ctx, false, err) ? actList(p, d, err) : DISPATCH_FAIL;
+    return actList(p, d, err);
   }
   if (strcmp(act, "stat") == 0) {
-    return requireAuth(ctx, false, err) ? actStat(p, d, err) : DISPATCH_FAIL;
+    return actStat(p, d, err);
   }
   if (strcmp(act, "read") == 0) {
-    return requireAuth(ctx, false, err) ? actRead(p, d, err) : DISPATCH_FAIL;
+    return actRead(p, d, err);
   }
   if (strcmp(act, "verify") == 0) {
-    return requireAuth(ctx, false, err) ? actVerify(ctx, p, d, err) : DISPATCH_FAIL;
+    return actVerify(ctx, p, d, err);
   }
 
   // Mutating tier.
   if (strcmp(act, "write") == 0) {
-    return requireAuth(ctx, true, err) ? actWrite(p, d, err) : DISPATCH_FAIL;
+    return actWrite(p, d, err);
   }
   if (strcmp(act, "mkdir") == 0) {
-    return requireAuth(ctx, true, err) ? actMkdir(p, d, err) : DISPATCH_FAIL;
+    return actMkdir(p, d, err);
   }
   if (strcmp(act, "delete") == 0) {
-    return requireAuth(ctx, true, err) ? actDelete(p, d, err) : DISPATCH_FAIL;
+    return actDelete(p, d, err);
   }
 
   // Destructive tier — ONE action, and it is above the mutating tier rather
-  // than in it. See the note above requirePhysical().
+  // than in it: AUTH_PHYSICAL in modauth.h, enforced before this runs. The
+  // second gate it still applies for itself is p.confirm, which is a
+  // confirmation, not an authorisation.
   if (strcmp(act, "format") == 0) {
-    return requirePhysical(ctx, "'storage format'", err) ? actFormat(p, d, err) : DISPATCH_FAIL;
+    return actFormat(p, d, err);
   }
 
   if (strcmp(act, "status") == 0) {
@@ -1880,29 +1869,42 @@ const ModuleParam FORMAT_PARAMS[] = {
     ModParam::flag("confirm", true, "required second word. Without it nothing is erased and ECONFIRM is returned."),
 };
 
-const ModuleAction STORAGE_ACTIONS[] = {
+constexpr ModuleAction STORAGE_ACTIONS[] = {
     {"caps",
      "transfer limits (max_chunk, max_path, crc32 format, listing/delete bounds) plus every volume, its mount state, "
      "its own limits and its free space",
-     nullptr, 0},
+     nullptr, 0, ModAuth::requiredFor("storage", "caps")},
     {"free", "total/used/free per volume (walks the FAT for /sd if the FAT32 free count is stale)",
-     MOD_PARAMS(FREE_PARAMS)},
-    {"list", "one PAGE of a directory; returns truncated + next_offset", MOD_PARAMS(LIST_PARAMS)},
+     MOD_PARAMS(FREE_PARAMS), ModAuth::requiredFor("storage", "free")},
+    {"list", "one PAGE of a directory; returns truncated + next_offset", MOD_PARAMS(LIST_PARAMS),
+     ModAuth::requiredFor("storage", "list")},
     {"stat", "exists / is_dir / size / mtime for one path (a missing path is ok:true with exists:false)",
-     MOD_PARAMS(PATH_ONLY)},
+     MOD_PARAMS(PATH_ONLY), ModAuth::requiredFor("storage", "stat")},
     {"read", "read one chunk as base64 with a crc32; the caller drives offset, so it resumes by construction",
-     MOD_PARAMS(READ_PARAMS)},
-    {"write", "write one base64 chunk at an offset; returns the crc32 of what was written", MOD_PARAMS(WRITE_PARAMS)},
-    {"mkdir", "create one directory (not -p: intermediate directories are not invented)", MOD_PARAMS(PATH_ONLY)},
-    {"delete", "delete a file, an EMPTY directory, or a bounded tree with recursive:true", MOD_PARAMS(DELETE_PARAMS)},
+     MOD_PARAMS(READ_PARAMS), ModAuth::requiredFor("storage", "read")},
+    {"write", "write one base64 chunk at an offset; returns the crc32 of what was written", MOD_PARAMS(WRITE_PARAMS),
+     ModAuth::requiredFor("storage", "write")},
+    {"mkdir", "create one directory (not -p: intermediate directories are not invented)", MOD_PARAMS(PATH_ONLY),
+     ModAuth::requiredFor("storage", "mkdir")},
+    {"delete", "delete a file, an EMPTY directory, or a bounded tree with recursive:true", MOD_PARAMS(DELETE_PARAMS),
+     ModAuth::requiredFor("storage", "delete")},
     {"verify", "crc32 a whole file (queued; progress + storage.verify.done events). cancel:true stops it",
-     MOD_PARAMS(VERIFY_PARAMS)},
+     MOD_PARAMS(VERIFY_PARAMS), ModAuth::requiredFor("storage", "verify")},
+    // The one PHYSICAL row in this module, and it was PHYSICAL before the table
+    // existed. The help still says so in English because it is the one action
+    // whose refusal an operator has to be able to predict from the console.
     {"format",
      "ERASE the whole /fs volume and remount it empty. USB console only (auth >= physical) and needs confirm:true. "
      "The microSD is never formatted here",
-     MOD_PARAMS(FORMAT_PARAMS)},
-    {"status", "per-volume mount state, the failing bring-up stage for each, and the current verify job", nullptr, 0},
+     MOD_PARAMS(FORMAT_PARAMS), ModAuth::requiredFor("storage", "format")},
+    {"status", "per-volume mount state, the failing bring-up stage for each, and the current verify job", nullptr, 0,
+     ModAuth::requiredFor("storage", "status")},
 };
+static_assert(ModAuth::allGated(STORAGE_ACTIONS, sizeof(STORAGE_ACTIONS) / sizeof(STORAGE_ACTIONS[0])),
+              "storage: an action has no declared auth level");
+static_assert(ModAuth::isModuleListed("storage"), "storage has no row in ModAuth::MODULES");
+static_assert(ModAuth::requiredFor("storage", "format") == ModAuth::PHYSICAL,
+              "storage.format must stay AUTH_PHYSICAL — it erases a whole filesystem");
 
 const ModuleDescriptor STORAGE_MODULE = {
     .id = "storage",
@@ -1928,6 +1930,7 @@ const ModuleDescriptor STORAGE_MODULE = {
     // boot by Fs::begin() and is unaffected by either.
     .bootTimeBinding = false,
     .essential = false,
+    .minAuth = ModAuth::moduleMinimum("storage"),
     .enable = storageEnable,
     .disable = storageDisable,
     .dispatch = storageDispatch,

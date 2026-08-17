@@ -1,12 +1,15 @@
 {
     "ok": true,
     "d": {
+        "auth": "physical",
+        "auth_level": 2,
         "modules": [
             {
                 "id": "cdc",
                 "name": "USB Serial Console",
                 "category": "transport",
                 "enabled": true,
+                "min_auth": "token",
                 "essential": true,
                 "boot_time_binding": true,
                 "armed": true,
@@ -29,6 +32,7 @@
                 "name": "Status LED",
                 "category": "status",
                 "enabled": true,
+                "min_auth": "token",
                 "essential": false,
                 "boot_time_binding": false,
                 "armed": true,
@@ -41,6 +45,8 @@
                     {
                         "act": "set",
                         "help": "set a fixed colour",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "rgb",
@@ -53,6 +59,8 @@
                     {
                         "act": "auto",
                         "help": "return to the heartbeat blink",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     }
                 ],
@@ -66,6 +74,7 @@
                 "name": "USB Keyboard",
                 "category": "input",
                 "enabled": true,
+                "min_auth": "token",
                 "essential": false,
                 "boot_time_binding": true,
                 "armed": true,
@@ -78,6 +87,8 @@
                     {
                         "act": "type",
                         "help": "type a string into the host (queued; completes with a hid.done event)",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "text",
@@ -106,6 +117,8 @@
                     {
                         "act": "key",
                         "help": "send one keystroke, optionally with modifiers",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "key",
@@ -130,16 +143,22 @@
                     {
                         "act": "release",
                         "help": "releaseAll() \u2014 panic stop for a stuck key or modifier",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     },
                     {
                         "act": "status",
                         "help": "armed/bound/layout/queue depth/current job/chars sent",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     },
                     {
                         "act": "layout",
                         "help": "get or set the HOST keyboard layout (en_GB default, en_US selectable)",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "set",
@@ -172,6 +191,7 @@
                 "name": "Files (microSD + LittleFS)",
                 "category": "storage",
                 "enabled": true,
+                "min_auth": "token",
                 "essential": false,
                 "boot_time_binding": false,
                 "armed": true,
@@ -184,11 +204,15 @@
                     {
                         "act": "caps",
                         "help": "transfer limits (max_chunk, max_path, crc32 format, listing/delete bounds) plus every volume, its mount state, its own limits and its free space",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     },
                     {
                         "act": "free",
                         "help": "total/used/free per volume (walks the FAT for /sd if the FAT32 free count is stale)",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "volume",
@@ -201,6 +225,8 @@
                     {
                         "act": "list",
                         "help": "one PAGE of a directory; returns truncated + next_offset",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -229,6 +255,8 @@
                     {
                         "act": "stat",
                         "help": "exists / is_dir / size / mtime for one path (a missing path is ok:true with exists:false)",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -241,6 +269,8 @@
                     {
                         "act": "read",
                         "help": "read one chunk as base64 with a crc32; the caller drives offset, so it resumes by construction",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -268,6 +298,8 @@
                     {
                         "act": "write",
                         "help": "write one base64 chunk at an offset; returns the crc32 of what was written",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -299,6 +331,8 @@
                     {
                         "act": "mkdir",
                         "help": "create one directory (not -p: intermediate directories are not invented)",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -311,6 +345,8 @@
                     {
                         "act": "delete",
                         "help": "delete a file, an EMPTY directory, or a bounded tree with recursive:true",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -329,6 +365,8 @@
                     {
                         "act": "verify",
                         "help": "crc32 a whole file (queued; progress + storage.verify.done events). cancel:true stops it",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "path",
@@ -347,6 +385,8 @@
                     {
                         "act": "format",
                         "help": "ERASE the whole /fs volume and remount it empty. USB console only (auth >= physical) and needs confirm:true. The microSD is never formatted here",
+                        "min_auth": "physical",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "volume",
@@ -365,6 +405,8 @@
                     {
                         "act": "status",
                         "help": "per-volume mount state, the failing bring-up stage for each, and the current verify job",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     }
                 ],
@@ -410,6 +452,7 @@
                 "name": "Wi-Fi AP + HTTP",
                 "category": "transport",
                 "enabled": true,
+                "min_auth": "token",
                 "essential": false,
                 "boot_time_binding": false,
                 "armed": true,
@@ -422,11 +465,15 @@
                     {
                         "act": "status",
                         "help": "AP and server state: ssid, ip, clients, sessions, WebSocket clients, event counters",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     },
                     {
                         "act": "psk",
                         "help": "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping every session and client. USB console only (auth >= physical), both ways",
+                        "min_auth": "physical",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "set",
@@ -439,6 +486,8 @@
                     {
                         "act": "pin",
                         "help": "the pairing PIN. USB console only; regenerate:true issues a new one and revokes every session",
+                        "min_auth": "physical",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "regenerate",
@@ -451,6 +500,8 @@
                     {
                         "act": "sessions",
                         "help": "list live sessions (ids only, never tokens), or revoke one / all of them",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "revoke",
@@ -498,6 +549,7 @@
                 "name": "Status LCD",
                 "category": "status",
                 "enabled": true,
+                "min_auth": "token",
                 "essential": false,
                 "boot_time_binding": false,
                 "armed": true,
@@ -510,11 +562,15 @@
                     {
                         "act": "status",
                         "help": "panel, backlight, current screen and redraw statistics",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     },
                     {
                         "act": "backlight",
-                        "help": "backlight on/off or 0..100% (auth >= token)",
+                        "help": "backlight on/off or 0..100%",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "pct",
@@ -535,6 +591,8 @@
                     {
                         "act": "screen",
                         "help": "select a firmware-defined screen",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": [
                             {
                                 "name": "name",
@@ -551,6 +609,8 @@
                     {
                         "act": "refresh",
                         "help": "force a full repaint",
+                        "min_auth": "token",
+                        "allowed": true,
                         "params": []
                     }
                 ],
@@ -558,9 +618,9 @@
                     "panel": true,
                     "screen": "status",
                     "backlight_pct": 100,
-                    "frames": 34068,
-                    "region_writes": 1381,
-                    "worst_render_us": 10661,
+                    "frames": 547,
+                    "region_writes": 28,
+                    "worst_render_us": 10586,
                     "pin_on_screen": true
                 }
             }

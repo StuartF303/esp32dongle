@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "led.h"
+#include "modauth.h"
 
 namespace {
 
@@ -57,7 +58,14 @@ bool ledDisable(const char **errMsg) {
 }
 
 DispatchResult ledDispatch(const CmdContext &ctx, const char *act, JsonObjectConst p, JsonObject d, CmdError *err) {
-  (void)ctx;  // the LED is harmless from any transport at any auth level
+  // No auth check here, and no "harmless at any level" claim either. Both
+  // actions are declared AUTH_TOKEN in modauth.h and Registry::dispatch()
+  // enforces that before this function is reached (backlog S6). The old comment
+  // — "the LED is harmless from any transport at any auth level" — was the
+  // module choosing its own policy, which is exactly what S6 removed: driving
+  // the status LED is a device state change, and the `led` BUILT-IN was already
+  // AUTH_TOKEN, so the alias and the action disagreed (backlog S8).
+  (void)ctx;
 
   if (strcmp(act, "set") == 0) {
     const char *rgb = p["rgb"] | (const char *)nullptr;
@@ -111,10 +119,17 @@ const ModuleParam SET_PARAMS[] = {
     ModParam::str("rgb", true, "6 hex digits — \"ff0000\", or \"#ff0000\"; or \"off\". Case-insensitive."),
 };
 
-const ModuleAction LED_ACTIONS[] = {
-    {"set", "set a fixed colour", MOD_PARAMS(SET_PARAMS)},
-    {"auto", "return to the heartbeat blink", nullptr, 0},
+// Levels come from ModAuth::requiredFor() — never a literal — so the policy is
+// written down once, in modauth.h, where the host tests can walk it.
+constexpr ModuleAction LED_ACTIONS[] = {
+    {"set", "set a fixed colour", MOD_PARAMS(SET_PARAMS), ModAuth::requiredFor("led", "set")},
+    {"auto", "return to the heartbeat blink", nullptr, 0, ModAuth::requiredFor("led", "auto")},
 };
+// A forgotten level is 0, which effective() reads as AUTH_PHYSICAL — this turns
+// that into a build failure instead. One per module, by design.
+static_assert(ModAuth::allGated(LED_ACTIONS, sizeof(LED_ACTIONS) / sizeof(LED_ACTIONS[0])),
+              "led: an action has no declared auth level");
+static_assert(ModAuth::isModuleListed("led"), "led has no row in ModAuth::MODULES");
 
 void ledTick() { Led::heartbeatTask(); }
 
@@ -129,6 +144,7 @@ const ModuleDescriptor LED_MODULE = {
     .defaultEnabled = true,
     .bootTimeBinding = false,
     .essential = false,
+    .minAuth = ModAuth::moduleMinimum("led"),
     .enable = ledEnable,
     .disable = ledDisable,
     .dispatch = ledDispatch,

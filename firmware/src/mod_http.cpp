@@ -23,6 +23,7 @@
 #include "bus.h"
 #include "console.h"
 #include "ct.h"
+#include "modauth.h"
 #include "otaupload.h"
 #include "pairing.h"
 #include "protocol.h"
@@ -1210,7 +1211,11 @@ esp_err_t handleModules(httpd_req_t *req) {
   // `modules` command (console.h). The registry takes and releases its own lock
   // inside this call; the response is fully built before a byte is sent, so no
   // registry lock is ever held across a network write.
-  Console::fillModules(doc["d"].to<JsonObject>());
+  // AUTH_TOKEN, matching handleCmd(): authenticate() above proves a session and
+  // nothing more. Never AUTH_PHYSICAL — that level means "is holding the
+  // cable", which no network client ever is. It is what filters the listing
+  // (backlog S7) and sets each action's `allowed`.
+  Console::fillModules(doc["d"].to<JsonObject>(), AUTH_TOKEN);
   exitRegistry();
   return sendJsonDoc(req, "200 OK", doc);
 }
@@ -2015,18 +2020,16 @@ void httpTick() {
 // Actions
 // ===========================================================================
 
-bool requirePhysical(const CmdContext &ctx, const char *what, CmdError *err) {
-  if (ctx.authLevel >= AUTH_PHYSICAL) {
-    return true;
-  }
-  // The point of the whole exercise: the AP's own passphrase and PIN are
-  // readable ONLY by someone holding the cable. A network client — even a fully
-  // authenticated one — never gets them, so a stolen session token cannot be
-  // escalated into permanent access to the AP.
-  cmdErrorf(err, "EAUTH", "the %s is readable over the USB console only (auth >= physical); '%s' is at level %u", what,
-            ctx.transport ? ctx.transport : "?", (unsigned)ctx.authLevel);
-  return false;
-}
+// requirePhysical() USED TO LIVE HERE and is gone (backlog S6). `psk` and `pin`
+// are declared AUTH_PHYSICAL in modauth.h and Registry::dispatch() refuses
+// below it, with the same message every other refusal on this device carries.
+//
+// The point of the whole exercise is unchanged and is why those two rows are
+// PHYSICAL: the AP's own passphrase and the pairing PIN are readable ONLY by
+// someone holding the cable, so a stolen session token cannot be escalated into
+// permanent access to the radio. `status` and `sessions`, which had their own
+// hand-rolled AUTH_TOKEN checks, are declared TOKEN for the same reason they
+// always were.
 
 void fillApStatus(JsonObject d) {
   d["transport"] = "http";
@@ -2413,30 +2416,24 @@ DispatchResult actSessions(JsonObjectConst p, JsonObject d, CmdError *err) {
 }
 
 DispatchResult httpDispatch(const CmdContext &ctx, const char *act, JsonObjectConst p, JsonObject d, CmdError *err) {
+  (void)ctx;  // every action of this module is gated centrally (modauth.h)
+
   if (strcmp(act, "status") == 0) {
-    if (ctx.authLevel < AUTH_TOKEN) {
-      cmdErrorf(err, "EAUTH", "http status requires an authenticated session (auth >= token)");
-      return DISPATCH_FAIL;
-    }
     fillApStatus(d);
     return DISPATCH_OK;
   }
 
   if (strcmp(act, "psk") == 0) {
-    // The SAME gate for reading and for writing, and deliberately so: a network
-    // client holding a valid session token must not be able to change the AP's
-    // passphrase. If it could, one stolen token would become permanent access
-    // to the radio — and would lock the owner out of their own device.
-    if (!requirePhysical(ctx, "AP passphrase", err)) {
-      return DISPATCH_FAIL;
-    }
+    // AUTH_PHYSICAL, and the SAME level for reading and for writing —
+    // deliberately so: a network client holding a valid session token must not
+    // be able to read OR change the AP's passphrase. If it could, one stolen
+    // token would become permanent access to the radio, and would lock the
+    // owner out of their own device. Declared in modauth.h; a read and a write
+    // are one action here, so the level covers both without a parameter gate.
     return actPsk(p, d, err);
   }
 
   if (strcmp(act, "pin") == 0) {
-    if (!requirePhysical(ctx, "pairing PIN", err)) {
-      return DISPATCH_FAIL;
-    }
     if (p["regenerate"] | false) {
       char rerr[128];
       uint8_t killed = liveSessionCount();
@@ -2458,10 +2455,6 @@ DispatchResult httpDispatch(const CmdContext &ctx, const char *act, JsonObjectCo
   }
 
   if (strcmp(act, "sessions") == 0) {
-    if (ctx.authLevel < AUTH_TOKEN) {
-      cmdErrorf(err, "EAUTH", "session management requires an authenticated session (auth >= token)");
-      return DISPATCH_FAIL;
-    }
     return actSessions(p, d, err);
   }
 
@@ -2496,17 +2489,25 @@ const ModuleParam SESSIONS_PARAMS[] = {
                   "NUMBER (p:{\"revoke\":7}) — use the raw JSON box for that."),
 };
 
-const ModuleAction HTTP_ACTIONS[] = {
-    {"status", "AP and server state: ssid, ip, clients, sessions, WebSocket clients, event counters", nullptr, 0},
+constexpr ModuleAction HTTP_ACTIONS[] = {
+    {"status", "AP and server state: ssid, ip, clients, sessions, WebSocket clients, event counters", nullptr, 0,
+     ModAuth::requiredFor("http", "status")},
     {"psk",
      "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping "
      "every session and client. USB console only (auth >= physical), both ways",
-     MOD_PARAMS(PSK_PARAMS)},
+     MOD_PARAMS(PSK_PARAMS), ModAuth::requiredFor("http", "psk")},
     {"pin", "the pairing PIN. USB console only; regenerate:true issues a new one and revokes every session",
-     MOD_PARAMS(PIN_PARAMS)},
+     MOD_PARAMS(PIN_PARAMS), ModAuth::requiredFor("http", "pin")},
     {"sessions", "list live sessions (ids only, never tokens), or revoke one / all of them",
-     MOD_PARAMS(SESSIONS_PARAMS)},
+     MOD_PARAMS(SESSIONS_PARAMS), ModAuth::requiredFor("http", "sessions")},
 };
+static_assert(ModAuth::allGated(HTTP_ACTIONS, sizeof(HTTP_ACTIONS) / sizeof(HTTP_ACTIONS[0])),
+              "http: an action has no declared auth level");
+static_assert(ModAuth::isModuleListed("http"), "http has no row in ModAuth::MODULES");
+// The two secrets in the image. Asserted next to the table as well as in
+// modauth.h, because this is the file a reader looking for them will open.
+static_assert(ModAuth::requiredFor("http", "psk") == ModAuth::PHYSICAL, "http.psk must stay AUTH_PHYSICAL");
+static_assert(ModAuth::requiredFor("http", "pin") == ModAuth::PHYSICAL, "http.pin must stay AUTH_PHYSICAL");
 
 const ModuleDescriptor HTTP_MODULE = {
     .id = "http",
@@ -2523,6 +2524,7 @@ const ModuleDescriptor HTTP_MODULE = {
     // and enable()/disable() really do start and stop them.
     .bootTimeBinding = false,
     .essential = false,
+    .minAuth = ModAuth::moduleMinimum("http"),
     .enable = httpEnable,
     .disable = httpDisable,
     .dispatch = httpDispatch,
