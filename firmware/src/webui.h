@@ -38,6 +38,55 @@
 // cannot express (a session id that must be an unquoted number, say) — but it
 // is no longer the only way to send a parameter, which is the whole point.
 //
+// ---- THE FIRMWARE UPLOAD CARD (POST /api/ota) ----------------------------
+//
+// The endpoint (mod_http.cpp handleOta, otaupload.cpp) had no client at all: a
+// phone browser cannot POST a binary body without something to drive it, and
+// this machine has no Wi-Fi adapter to POST from. This card IS the test rig.
+//
+// TWO things about it are not obvious and are the reason it looks the way it
+// does:
+//
+//   1. crypto.subtle DOES NOT EXIST HERE. The page is served over plain HTTP at
+//      192.168.4.1, and every browser gates SubtleCrypto on a SECURE CONTEXT
+//      (HTTPS or localhost). So window.crypto.subtle is undefined on the only
+//      device that matters, and a design that hashed the image client-side
+//      would fail as "undefined is not an object" at the moment of use. It is
+//      therefore FEATURE-DETECTED: present -> the digest is computed and sent
+//      as ?sha256 (which is optional in the API); absent -> the parameter is
+//      OMITTED ENTIRELY rather than sent empty or wrong, and the page says so.
+//      Either way the DEVICE's own digest of what it received is displayed in a
+//      readonly, tap-to-select field, because that is the actual verification
+//      path: compare it with `sha256sum firmware.bin` on the host. No SHA-256
+//      is hand-rolled in JS — this file is .rodata and that is not worth 2 KB.
+//
+//   2. XMLHttpRequest, not fetch. fetch() cannot report UPLOAD progress at all
+//      (no request stream progress event, and ReadableStream request bodies are
+//      HTTP/2-only in Chrome and absent in Safari). ~1.25 MB over the SoftAP
+//      takes several seconds during which the HTTP task is blocked, so with no
+//      progress the page looks hung. xhr.upload.onprogress is the only API that
+//      reports it. An XHR to /api/ota is same-origin, so `connect-src 'self'`
+//      in the CSP covers it exactly as it covers fetch and the WebSocket.
+//
+// Every documented failure code from handleOta is rendered as `e.code: e.msg`
+// VERBATIM, with a short separate note on what to do about it. EPENDING is the
+// one that will be met in practice — the first ~30 s after an OTA boot the
+// running image is still PENDING_VERIFY and IDF refuses to begin another OTA —
+// so the card also warns about it BEFORE the upload, from `ota`'s own state.
+//
+// A rejection may arrive as NO RESPONSE AT ALL. handleOta answers and then
+// returns ESP_FAIL on every failure path, deliberately, so esp_http_server
+// closes the socket instead of draining a rejected 1.25 MB body on its own
+// task — and a browser that is still uploading when that happens can surface
+// it as a bare network error with status 0. So xhr.onerror does not guess: it
+// asks `ota`, whose d.upload carries the last upload's own code and msg, and
+// distinguishes "the device recorded a failure" from "the device has no record
+// of an upload this boot", which means the request was rejected before its body
+// was read (auth, ?len vs Content-Length, a bad query).
+//
+// The card never offers a reboot button: `reboot` is AUTH_PHYSICAL and a
+// button that can only ever produce EAUTH is worse than no button.
+//
 // Deliberately NOT here, because this is a bring-up console and not the product:
 // no framework, no offline caching, no styling beyond what makes it legible on
 // a phone, no per-module panels. W4 replaces it wholesale.
@@ -83,6 +132,8 @@ button.p{background:#2563eb;color:#fff;border-color:#2563eb}
 .raw{width:100%;box-sizing:border-box;font-family:ui-monospace,monospace}
 button.lnk{background:transparent;border:0;text-decoration:underline;padding:8px 4px;opacity:.8}
 pre{background:#8881;padding:8px;border-radius:6px;max-height:11rem;overflow:auto;white-space:pre-wrap;word-break:break-all}
+progress{width:100%;height:12px}
+#ores div{margin:4px 0}
 #msg{min-height:1.2em}
 .err{color:#dc2626}
 </style></head><body>
@@ -95,6 +146,17 @@ pre{background:#8881;padding:8px;border-radius:6px;max-height:11rem;overflow:aut
 </div>
 <div id="app" hidden>
 <div class="row"><button id="rf">Refresh</button><button id="lo">Log out</button><span class="mut" id="st"></span></div>
+<div class="card" id="ota">
+<div class="row"><strong>Firmware update</strong><code class="mut">POST /api/ota</code></div>
+<div class="mut" id="ost">reading OTA state...</div>
+<div class="mut" id="ocry"></div>
+<div class="row"><input id="ofile" type="file" accept=".bin,application/octet-stream"></div>
+<div class="mut" id="oinf"></div>
+<div class="fld"><label><input id="osel" type="checkbox"><span>select this image to boot next &mdash; the device runs it after the NEXT reboot. Leave off to park it in the slot.</span></label></div>
+<div class="row"><button class="p" id="oup">Upload</button><span class="mut" id="opct"></span></div>
+<progress id="obar" value="0" max="100" hidden></progress>
+<div id="ores"></div>
+</div>
 <div id="mods"></div>
 <h2>Events</h2><pre id="log"></pre>
 </div>
@@ -213,6 +275,161 @@ function actionRow(mid,a){
     cmd({id:Date.now()%100000,mod:mid,act:a.act,p:p}).then(function(j){
       log(mid+"."+a.act+" -> "+JSON.stringify(j.ok?(j.d||{}):j.e))}).catch(function(e){log(e.message)})};
   return w}
+// ---- firmware upload (POST /api/ota) ------------------------------------
+// See the crypto.subtle / XMLHttpRequest note at the top of this file before
+// changing anything here.
+var SUB=!!(window.crypto&&window.crypto.subtle&&window.crypto.subtle.digest);
+var oSlot=0,oTgt="",oBusy=false,MINB=4096,MAXB=4194304;
+// Not paraphrases of e.msg -- that is printed verbatim above these. This is
+// what to DO about each code.
+var HINT={
+EPENDING:"the running image is still PENDING_VERIFY, so IDF refuses to begin another OTA. Run `ota confirm` on the USB console, or wait for the health check (~30s after an OTA boot), then upload again",
+EARGS:"the query string was rejected before anything was erased",
+ELENGTH:"the body needs a Content-Length equal to ?len; chunked encoding is refused",
+ETOOSMALL:"far too small to be an ESP32-S3 app image",
+ETOOBIG:"bigger than the target slot",
+EBUSY:"another upload is already running; wait for it to finish",
+ETIMEOUT:"the transfer stalled or ran past the deadline; the slot was aborted and nothing was selected",
+ECONN:"the link failed mid-transfer; the slot was aborted",
+ESHORT:"the body ended before ?len bytes arrived; the slot was aborted",
+ESHA256:"what arrived does not match the digest that was sent; the slot was aborted. Retry",
+EIMAGE:"esp_ota_end() rejected it: not a bootable image. Check you picked firmware.bin, not the .elf and not a merged/factory image",
+EMAGIC:"the first byte is not 0xE9, so this is not an app image at all",
+EAUTH:"the session token was rejected; unlock again",
+ENOSLOT:"this partition table has no second app slot",
+ECONFLICT:"the target slot is the one currently running",
+ENOMEM:"not enough heap to start an OTA; disable a module and retry",
+EOTADATA:"the otadata partition holds invalid data",
+EOTABEGIN:"esp_ota_begin() refused",
+EOTAWRITE:"a flash write failed; the slot was aborted",
+EOTAEND:"finalising the image failed; nothing was selected",
+ESELECT:"the image was written and validated but could NOT be selected; the device still boots the old one",
+ESTOPPING:"the Wi-Fi transport is shutting down"};
+function fmtB(n){return n>=1048576?(n/1048576).toFixed(2)+" MiB":(n/1024).toFixed(1)+" KiB"}
+function oRes(){var r=$("ores");r.textContent="";return r}
+function oLine(r,c,t){r.appendChild(el("div",c,t));return r}
+function oBad(t){oLine(oRes(),"err",t)}
+function oLock(on){oBusy=on;$("oup").disabled=on}
+function oPct(p,t){var b=$("obar");b.hidden=false;b.value=p;$("opct").textContent=t}
+function oHex(buf){var v=new Uint8Array(buf),s="",i;for(i=0;i<v.length;i++)s+=(v[i]<16?"0":"")+v[i].toString(16);return s}
+// Readonly input, not text: the only comfortable way to select 64 hex
+// characters on a phone.
+function oSha(r,hex){
+  var i=el("input");i.className="raw";i.readOnly=true;i.value=hex;
+  i.onclick=function(){this.select()};
+  r.appendChild(i);return r}
+// `ota` (read-only, AUTH_TOKEN) names the target slot and says whether this
+// image is still PENDING_VERIFY -- i.e. EPENDING, before it happens. `parts`
+// then gives that slot's size, once per session.
+function oState(){
+  cmd({act:"ota"}).then(function(j){
+    if(!j.ok)return;
+    var d=j.d||{},t=d.rollback_target||{},e=$("ost");
+    oTgt=t.label||"";
+    var s="running "+d.running+" · next boot "+d.boot+" · "+d.ota_state;
+    if(oTgt)s+=" · target "+oTgt+(oSlot?" ("+fmtB(oSlot)+")":"");
+    if(d.pending)s+=" — still PENDING_VERIFY: an upload now is refused with EPENDING for up to "+d.window_remaining_s+"s. `ota confirm` over USB, or wait.";
+    e.textContent=s;e.className=d.pending?"err":"mut";
+    if(oTgt&&!oSlot)oParts()}).catch(function(){})}
+function oParts(){
+  cmd({act:"parts"}).then(function(j){
+    if(!j.ok)return;
+    (j.d.partitions||[]).forEach(function(p){if(p.label===oTgt)oSlot=p.size});
+    if(oSlot)oState()}).catch(function(){})}
+// otaupload.cpp's own bounds, checked here so a doomed image does not cost a
+// multi-second upload first.
+function oCheck(f){
+  if(f.size<MINB)return "only "+f.size+" B: anything under "+MINB+" is refused (ETOOSMALL)";
+  if(oSlot&&f.size>oSlot)return f.size+" B will not fit slot "+oTgt+" ("+oSlot+" B): ETOOBIG";
+  if(!oSlot&&f.size>MAXB)return f.size+" B is over the "+fmtB(MAXB)+" bound this page applies while the slot size is unknown";
+  return ""}
+function oPick(){
+  var f=this.files&&this.files[0],i=$("oinf");
+  $("obar").hidden=true;$("opct").textContent="";oRes();
+  if(!f){i.textContent="";i.className="mut";return}
+  var bad=oCheck(f);
+  i.textContent=f.name+" · "+f.size+" B ("+fmtB(f.size)+")"+
+    (bad?" — "+bad:(/\.bin$/i.test(f.name)?"":" — not a .bin; only a raw firmware.bin is a valid image"));
+  i.className=bad?"err":"mut"}
+function oGo(){
+  if(oBusy)return;
+  var f=$("ofile").files&&$("ofile").files[0];
+  oRes();
+  if(!f){oBad("choose a firmware .bin first");return}
+  var bad=oCheck(f);
+  if(bad){oBad(bad);return}
+  oLock(true);
+  if(!SUB){oSend(f,"");return}
+  $("opct").textContent="hashing locally (crypto.subtle)...";
+  var fr=new FileReader();
+  fr.onerror=function(){oLock(false);$("opct").textContent="";oBad("the browser could not read the file")};
+  fr.onload=function(){
+    window.crypto.subtle.digest("SHA-256",fr.result).then(function(h){oSend(f,oHex(h))})
+    .catch(function(e){oLock(false);$("opct").textContent="";
+      oBad("crypto.subtle.digest failed: "+e.message+" -- not retrying without a digest")})};
+  fr.readAsArrayBuffer(f)}
+function oSend(f,sha){
+  var sel=$("osel").checked;
+  // ?sha256 is OMITTED, not blanked, when there is no digest to send.
+  var q="/api/ota?len="+f.size+(sha?"&sha256="+sha:"")+(sel?"&select=1":"");
+  var x=new XMLHttpRequest();
+  x.open("POST",q,true);
+  x.setRequestHeader("Authorization","Bearer "+T);
+  x.setRequestHeader("Content-Type","application/octet-stream");
+  x.upload.onprogress=function(e){
+    if(e.lengthComputable)oPct(Math.floor(e.loaded*100/e.total),e.loaded+" / "+e.total+" B")};
+  // The device validates AFTER the last byte, with its HTTP task blocked --
+  // without this the bar sits at 100% looking stuck.
+  x.upload.onload=function(){oPct(100,"all "+f.size+" B sent — the device is validating the image")};
+  x.onload=function(){oLock(false);oDone(x)};
+  x.onerror=function(){oLock(false);oLost("the connection dropped")};
+  x.onabort=function(){oLock(false);oLost("the upload was cancelled")};
+  oPct(0,"uploading...");
+  log("ota upload "+f.size+" B"+(sha?" sha256="+sha.slice(0,12)+"...":" (no client digest)")+(sel?" select=1":""));
+  x.send(f)}
+function oDone(x){
+  var j=null;try{j=JSON.parse(x.responseText)}catch(e){}
+  if(x.status===401){logout("session expired or rejected");return}
+  var r=oRes();
+  if(!j){oLine(r,"err","HTTP "+x.status+" and the body was not JSON: "+(x.responseText||"").slice(0,120));oState();return}
+  log("ota -> HTTP "+x.status+" "+(j.ok?"ok":JSON.stringify(j.e||{})));
+  if(j.ok)oOk(r,j.d||{});else oFail(r,j.e||{},j.d||{});
+  oState()}
+function oOk(r,d){
+  oLine(r,"on","wrote "+d.written+" of "+d.len+" B to "+d.target+" in "+((d.elapsed_ms||0)/1000).toFixed(1)+"s");
+  if(d.build)oLine(r,"mut","now in that slot: "+(d.project||"?")+" "+(d.app_version||"?")+" · built "+d.build+" · IDF "+(d.idf_version||"?"));
+  oLine(r,"mut","sha256 the DEVICE computed over what it received — compare with: sha256sum firmware.bin");
+  oSha(r,d.sha256||"");
+  oLine(r,d.sha256_checked?(d.sha256_ok?"mut":"err"):"err",
+    d.sha256_checked?(d.sha256_ok?"digest was sent with the request and verified on the device before install"
+                                :"digest MISMATCH reported by the device")
+                    :"no digest was sent with the request: integrity NOT verified in transit — compare the digest above by hand");
+  if(d.selected)oLine(r,"err","selected: otadata now boots "+d.boot+". A REBOOT IS STILL REQUIRED and this page cannot do it — `reboot` is AUTH_PHYSICAL, i.e. the USB cable: run it on the serial console, or unplug and replug.");
+  else oLine(r,"mut","not selected: otadata still boots "+d.boot+", so this image will not run. Upload again with the box ticked, or `ota boot "+d.target+"` over USB.");
+  if(d.msg)oLine(r,"mut",d.msg)}
+function oFail(r,e,d){
+  oLine(r,"err",(e.code||"?")+": "+(e.msg||""));
+  if(HINT[e.code])oLine(r,"mut",HINT[e.code]);
+  if(d.written!==undefined)
+    oLine(r,"mut","got "+d.written+" of "+d.len+" B into "+(d.target||"?")+" in "+((d.elapsed_ms||0)/1000).toFixed(1)+
+      "s · otadata still boots "+(d.boot||"?")+" · selected="+(d.selected?"yes":"no"));
+  if(d.sha256){oLine(r,"mut","sha256 of what did arrive:");oSha(r,d.sha256)}}
+// A rejection can reach us as a bare network error: handleOta closes the socket
+// rather than draining a rejected body. `ota` recorded the code -- ask it.
+function oLost(why){
+  var r=oRes();
+  oLine(r,"err",why+" — no HTTP response reached the browser. Asking the device what it recorded...");
+  cmd({act:"ota"}).then(function(j){
+    var u=(j&&j.ok&&j.d&&j.d.upload)||{};
+    if(u.phase==="running"){oLine(r,"mut","the device still reports an upload in flight ("+u.written+" of "+u.len+" B); wait, then press Refresh");return}
+    if(u.phase==="ok"||u.phase==="failed"){
+      oLine(r,u.phase==="ok"?"on":"err","the device recorded: "+u.phase+(u.code?" "+u.code:"")+(u.msg?" — "+u.msg:""));
+      oLine(r,"mut",u.written+" of "+u.len+" B, "+u.finished_ms_ago+" ms ago");
+      if(HINT[u.code])oLine(r,"mut",HINT[u.code]);
+      return}
+    oLine(r,"mut","the device has no record of an upload this boot: the request was rejected before the body was read (auth, ?len vs Content-Length, or a bad query) and the socket closed. The reply is in the USB console log.")})
+  .catch(function(e){oLine(r,"err","and /api/cmd failed too: "+e.message)});
+  oState()}
 function toggle(id,on,force){
   cmd({act:on?"disable":"enable",p:force?{id:id,force:true}:{id:id}}).then(function(j){
     log((on?"disable ":"enable ")+id+" -> "+(j.ok?(j.d&&j.d.msg||"ok"):errText(j)));load()})
@@ -258,10 +475,15 @@ function openWs(){
     if(j.ev)log("ev "+j.ev+" "+JSON.stringify(j.d||{}));else log("ws "+ev.data)};
   ws.onclose=function(){log("ws closed");ws=null};
   ws.onerror=function(){log("ws error")}}
-function start(){$("login").hidden=true;$("app").hidden=false;load();openWs()}
+function start(){$("login").hidden=true;$("app").hidden=false;load();oState();openWs()}
 $("go").onclick=unlock;
 $("pin").addEventListener("keydown",function(e){if(e.key==="Enter")unlock()});
-$("rf").onclick=load;
+$("rf").onclick=function(){load();oState()};
+$("ofile").onchange=oPick;
+$("oup").onclick=oGo;
+$("ocry").textContent=SUB
+ ?"crypto.subtle is available: a SHA-256 is computed here and sent as ?sha256 for the device to verify before it installs the image."
+ :"crypto.subtle is NOT available — a plain-HTTP page is not a secure context — so ?sha256 is omitted: integrity is not verified in transit. Compare the digest the device reports below with `sha256sum firmware.bin`.";
 $("lo").onclick=function(){api("/api/session",{method:"DELETE"}).catch(function(){}).then(function(){logout("logged out")})};
 fetch("/api/status").then(function(r){return r.json()}).then(function(j){
   if(j.ok){$("hd").textContent=j.d.name;$("who").textContent=j.d.fw+" · built "+j.d.build}})
