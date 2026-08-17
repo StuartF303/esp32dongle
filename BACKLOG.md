@@ -32,12 +32,14 @@ chose this knowingly for typeability (2026-08-16); recorded here so it is revisi
 not rediscovered. Mitigation if wanted: a typeable-but-private passphrase, or moving the PIN
 exchange to something the air link cannot reveal.
 
-**S5. No OTA update path exists at all.**
-Dual slots and 7.75 MB of LittleFS, and updates still require USB. This is the payoff the whole
-16 MB repartition was for. Note that S4's confirmation machinery is now in place and **cannot be
-exercised without this** — nothing in the image writes the inactive slot or moves `otadata`, so
-`PENDING_VERIFY` can only be reached by hand today (esptool, or an `esp_ota_set_boot_partition()`
-call that does not exist yet).
+**S9. A session token is now equivalent to arbitrary code execution.**
+Stuart's decision, taken knowingly on 2026-08-17 with S5: `POST /api/ota` accepts an image AND
+selects it at `AUTH_TOKEN`, so whoever holds a session can replace the firmware with anything that
+passes `esp_ota_end()`'s validation and wait for the next restart. Everything else the auth model
+protects is downstream of code that endpoint can replace. Combined with S3's public AP
+passphrase, **the security boundary of this device is radio range.** Recorded here so it is
+revisited on purpose, not rediscovered. The mitigations that remain: the PIN rate limiter,
+session lifetimes, the AP never being default-enabled, and the fact that an upload never reboots.
 
 ---
 
@@ -102,9 +104,6 @@ only link.
 **F4. Wi-Fi STA mode.** Currently SoftAP only. Needed for the dongle to reach a real network, and
 for MQTT later.
 
-**F5. LittleFS is mounted by nothing.** 7.75 MB sitting unused. Needed for web assets, macro
-storage, and OTA staging.
-
 **F6. Real web UI (W4), served from LittleFS.** The current page is bring-up quality in PROGMEM.
 Now that action params are machine-readable, a proper UI can render itself from the descriptors.
 
@@ -133,6 +132,36 @@ and the native tests already cover the security-critical path sanitisation.
 ---
 
 ## Resolved, kept for the reasoning
+
+- **F5 — LittleFS was mounted by nothing. Done 2026-08-17.**
+  `src/fsmount.{h,cpp}` mounts it at boot as **platform infrastructure**, like NVS — not as a
+  module, so nothing has to be enabled for the web assets to be readable and there is no enable
+  ordering between it and `http`. It can never prevent boot, and it **never auto-formats**: an
+  unformatted partition and a corrupt one both come back `ESP_FAIL` from
+  `esp_vfs_littlefs_register()`, so answering that by erasing would mean the first boot after a
+  bad power cut silently destroys the owner's assets with a successful mount as the only
+  evidence. `storage format p:{volume:"fs",confirm:true}` at **AUTH_PHYSICAL** is the explicit
+  remedy and the only thing in the image that erases the partition.
+
+  `storage` reaches both filesystems through **one** surface with a volume prefix (`/sd/...`,
+  `/fs/...`), parsed by `src/volpath.h` — dependency-free, host-tested (14 cases), and strictly
+  IN FRONT of `PathSafe`, which is unchanged and still the only path checker in the image. The
+  volume root is spelled `/sd`, never `/sd/`. Unknown volume is `EVOLUME`, unmounted is
+  `ENOTMOUNTED` naming which one and why; `caps` reports both volumes with per-volume limits and
+  free space. `enable storage` now succeeds on **either** volume — an absent card no longer takes
+  LittleFS with it — while still claiming `RES_SD` shared, because claims are static in this
+  registry (see the note above `storageEnable()`).
+
+- **F5's sibling: S5 — no OTA delivery path. Done 2026-08-17.**
+  `src/otaupload.{h,cpp}` + `POST /api/ota` in `mod_http.cpp`. Streams straight into the inactive
+  slot; nothing is staged in LittleFS. Size declared up front and enforced against both
+  `Content-Length` and the bytes received, optional SHA-256 verified before `esp_ota_end()`, 4 KB
+  buffer, hard cap at the slot size, 15 s stall / 300 s total deadlines, `esp_ota_abort()` on
+  every failure path and `otadata` untouched unless the write succeeded AND `?select=1` was
+  asked for. Never reboots. Selection goes through the same `OtaHealth::setBootNow()` `ota boot`
+  uses, which is what puts the new image into `ESP_OTA_IMG_NEW` and therefore actually arms S4's
+  confirmation machinery. See ARCHITECTURE.md §4 "OTA delivery". The security trade-off it
+  carries is S9 above.
 
 - **S1 — built-in commands had no auth check.** Done 2026-08-17. Gated centrally in
   `Console::execute` from a single `.rodata` policy table, enforced BEFORE `findCommand()` so an

@@ -200,10 +200,16 @@ cycles and the card is 128 GB and replaceable. §4 routes `wifiscan`/`blescan` o
 accordingly.
 
 Dual OTA is the point of the exercise: after the first flash, every iteration should go over the
-air from the phone, and a bad build should roll back instead of bricking. **Half of that is
-built.** The rollback *confirmation* is implemented and described below; the *delivery* path —
-anything that writes an image into the inactive slot — does not exist yet (backlog S5), so
-updates are still a USB flash today.
+air from the phone, and a bad build should roll back instead of bricking. **Both halves are now
+built** — the rollback *confirmation* (S4) and the *delivery* path (S5, `POST /api/ota`), both
+described below.
+
+`littlefs` is mounted at boot by `firmware/src/fsmount.{h,cpp}` as platform infrastructure, in
+the same class as NVS rather than as a module — so nothing has to be enabled for the web assets
+to be readable. It is **never auto-formatted**: an unformatted partition and a corrupt one are
+indistinguishable at the mount call, so a failure is reported and `storage format` (AUTH_PHYSICAL)
+is the explicit remedy. `storage` reaches both filesystems through one surface with a volume
+prefix — `/sd/...` and `/fs/...` — see §4.
 
 **Guard rail — done, and re-proven after the fact.** `restore.sh --yes` was first run on
 2026-08-15 while the device was still factory-fresh. It was then run again as a full round-trip
@@ -262,7 +268,7 @@ here — it gives us an out-of-band channel most IoT devices lack.
 | `cdc` | usb: shared | The serial console itself, `essential` — always on, cannot be disabled. |
 | `hid` | usb: shared | Keyboard + mouse injection, macro playback from LittleFS/SD. Composite with CDC so the serial console survives. **`bootTimeBinding`** — arming it requires a reboot. Never default-enabled. |
 | `msc` | usb: shared, sd: **exclusive** | Expose the SD card to the host PC as a drive. Locks out `storage` by claim; exclusion with `hid` is module policy, not a claim. Also `bootTimeBinding`. |
-| `storage` | sd: shared | Browse / upload / download the card from the phone. **Card must stay FAT32** (see CLAUDE.md). |
+| `storage` | sd: shared | Browse / upload / download **both** filesystems from the phone: `/sd/...` (microSD, **must stay FAT32** — see CLAUDE.md) and `/fs/...` (LittleFS). One chunked read/write/CRC/list/stat/mkdir/delete/verify surface, one `PathSafe` funnel. Enables on **either** volume, so an absent card does not take LittleFS with it; it still claims `sd` shared either way, because claims are static. `format` (`/fs` only) is **AUTH_PHYSICAL**. |
 | `wifiscan` | wifi: shared (**exclusive** in monitor mode) | AP survey, RSSI, channel occupancy, log to SD. |
 | `blescan` | ble: shared | Device scan, beacon advertise, presence logging. Unaffected by Wi-Fi monitor mode. |
 | `display` | lcd: exclusive | Push text/images to the 160×80 ST7735 from the phone. |
@@ -423,11 +429,48 @@ boot — the state a USB flash can never produce.
 purpose: once S5 lands, the client that pushed an update is the one that needs to see whether it
 was confirmed.
 
-**Still missing (backlog S5):** there is no OTA delivery path at all — nothing calls
-`esp_ota_begin`/`esp_ota_write`, and no transport accepts an image, so getting a build into the
-inactive slot is still a USB `esptool write-flash`. What is no longer missing is the last step
-of that path: `ota p:{boot:...}` selects the slot, so the confirmation machinery can be
-exercised end to end without hand-editing `otadata`.
+### OTA delivery — `POST /api/ota` (backlog S5, done 2026-08-17)
+
+`firmware/src/otaupload.{h,cpp}` streams an image body straight into the inactive slot with
+`esp_ota_begin` / `esp_ota_write` / `esp_ota_end`. **Nothing is staged in LittleFS first**: that
+would need 1.25 MB of the 7.75 MB partition, write every byte to NOR flash twice, and add a
+failure mode between "received" and "installed". The inactive app slot already *is* the safe
+place for an unverified image, and `esp_ota_end()` validates it before anything can select it.
+
+The transport half is `handleOta()` in `mod_http.cpp`:
+`POST /api/ota?len=<bytes>[&sha256=<64 hex>][&select=1]`, **`AUTH_TOKEN`**.
+
+- **The size is declared up front and enforced twice** — against `Content-Length` before a
+  sector is erased, and against the bytes actually received. A short body is `ESHORT`, not a
+  truncated image. Chunked transfer-encoding is refused (`ELENGTH`) rather than read until it
+  stops.
+- **Optional SHA-256, checked before `esp_ota_end()`**, because a corrupt-but-well-formed image
+  passes IDF's validation. The digest of what was actually received is reported either way, so
+  an upload is verifiable against `sha256sum firmware.bin` after the fact.
+- **Bounded everywhere**: a 4 KB transfer buffer (malloc'd per upload, freed on every path), a
+  hard cap at the slot size, a 15 s stall timeout and a 300 s total deadline. Every failure path
+  runs `esp_ota_abort()`, and **nothing on any failure path touches `otadata`** — so a partial
+  upload leaves the running image selected and the half-written slot inert.
+- **It never reboots.** `?select=1` calls the same `OtaHealth::setBootNow()` that `ota boot`
+  uses — which is what writes `ota_state = ESP_OTA_IMG_NEW` and therefore **arms the rollback
+  machinery above**: the next boot of that image is `PENDING_VERIFY`, `verifyRollbackLater()`
+  keeps it there, and the five criteria decide. Restarting is a separate, `AUTH_PHYSICAL`
+  decision (`reboot`).
+- Progress goes to the LCD through `activity.h` (`ota upload NN%`, reusing what `otahealth`
+  already does) and to the bus as `ota.upload.begin` / `.progress` / `.done`. `ota` reports an
+  upload in flight or the last result under `d.upload`.
+- Distinct codes throughout: `EBUSY` `EARGS` `ELENGTH` `ETOOSMALL` `ETOOBIG` `ENOSLOT`
+  `EPENDING` `ECONFLICT` `ENOMEM` `EMAGIC` `ESHORT` `ECONN` `ETIMEOUT` `ESHA256` `EIMAGE`
+  `EOTABEGIN` `EOTAWRITE` `EOTAEND` `ESELECT` `ESTOPPING`. `EPENDING` is the one that will be
+  met in practice: IDF refuses `esp_ota_begin()` while the running image is still
+  `PENDING_VERIFY`, which is exactly the first ~30 s after an OTA boot.
+
+**The security consequence, decided by stuart on 2026-08-17 and recorded in full above
+`handleOta()`:** upload *and* activation at `AUTH_TOKEN` make a session token equivalent to
+arbitrary code execution on this device, and combined with the deliberately public AP passphrase
+(backlog S3) that puts the security boundary at radio range. He was told this plainly and chose
+it, for true over-the-air updates from a phone. `ota confirm` / `rollback` / `boot` stay
+`AUTH_PHYSICAL`; this is a new path, not a widening of those.
 
 ### UI
 Phone web app (module cards, toggles, per-module panels, WS live data) · on-device LCD (mode,

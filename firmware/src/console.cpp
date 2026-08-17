@@ -22,6 +22,7 @@
 #include "protocol.h"
 #include "bootprobe.h"
 #include "otahealth.h"
+#include "otaupload.h"
 #include "registry.h"
 #include "scheduler.h"
 
@@ -445,6 +446,11 @@ DispatchResult cmdOta(const CmdContext &ctx, JsonObjectConst p, JsonObject d, Js
   // "no" still needs to see the state it was reasoning about, and `d` survives
   // an error response (ARCHITECTURE.md section 2).
   OtaHealth::fillStatus(d);
+  // ...and the DELIVERY half (backlog S5), which is a different question from
+  // "has this image proved itself": an upload in flight, or the last one's
+  // outcome, target slot, digest and build string. Added here rather than
+  // inside OtaHealth::fillStatus() so the two halves stay independent files.
+  OtaUpload::fillStatus(d["upload"].to<JsonObject>());
 
   const uint8_t asked = (confirm ? 1 : 0) + (rollback ? 1 : 0) + (bootAsked ? 1 : 0);
   if (asked == 0) {
@@ -490,6 +496,7 @@ DispatchResult cmdOta(const CmdContext &ctx, JsonObjectConst p, JsonObject d, Js
   // (and, for boot, still names the OLD boot partition).
   d.clear();
   OtaHealth::fillStatus(d);
+  OtaUpload::fillStatus(d["upload"].to<JsonObject>());
   if (bootAsked) {
     OtaHealth::fillBootSet(d["boot_set"].to<JsonObject>(), rep);
   }
@@ -520,8 +527,8 @@ constexpr Command COMMANDS[] = {
     {"bootprobe", "what the static-ctor NVS probe saw (hid arming depends on it)", cmdBootProbe,
      CmdAuth::requiredFor("bootprobe")},
     {"ota",
-     "rollback state + health criteria; p:{confirm:true} | p:{rollback:true} | p:{boot:\"app0|app1\"} — select "
-     "without rebooting (auth >= physical)",
+     "rollback state, health criteria and the last/current OTA upload; p:{confirm:true} | p:{rollback:true} | "
+     "p:{boot:\"app0|app1\"} — select without rebooting (auth >= physical)",
      cmdOta, CmdAuth::requiredFor("ota")},
     {"reboot", "esp_restart() — responds first (auth >= physical: the cable, not the network)", cmdReboot,
      CmdAuth::requiredFor("reboot")},

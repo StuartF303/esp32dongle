@@ -23,6 +23,7 @@
 #include "bus.h"
 #include "console.h"
 #include "ct.h"
+#include "otaupload.h"
 #include "pairing.h"
 #include "protocol.h"
 #include "ratelimit.h"
@@ -1452,6 +1453,247 @@ esp_err_t handleWs(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// ===========================================================================
+// POST /api/ota — the OTA DELIVERY path (backlog S5)
+// ===========================================================================
+//
+// ---- THE TRADE-OFF, RECORDED ONCE, HERE -----------------------------------
+//
+// This endpoint is AUTH_TOKEN. A phone session may push a firmware image into
+// the inactive slot AND select it as the next boot partition. Stuart chose this
+// deliberately on 2026-08-17, having been told plainly what follows:
+//
+//   * A SESSION TOKEN IS NOW EQUIVALENT TO ARBITRARY CODE EXECUTION ON THIS
+//     DEVICE. Whoever holds one can replace the firmware with anything that
+//     passes esp_ota_end()'s image validation, select it, and wait for the next
+//     restart. Everything else the auth model protects — the AP passphrase at
+//     AUTH_PHYSICAL, `reboot` at AUTH_PHYSICAL, the PIN on the LCD — is
+//     downstream of code that this endpoint can replace.
+//   * COMBINED WITH THE PUBLIC AP PASSPHRASE (backlog S3, `pass-a9d8`,
+//     derivable from the broadcast SSID), THE SECURITY BOUNDARY OF THIS DEVICE
+//     IS RADIO RANGE. WPA2-PSK has no forward secrecy against a holder of the
+//     key, so a captured handshake yields the PIN and the token too.
+//
+// That is the decision, it was informed, and it is not to be re-argued in code:
+// no extra gate, no runtime nagging. `ota confirm` / `rollback` / `boot` remain
+// AUTH_PHYSICAL — this is a NEW path, not a widening of those.
+//
+// The mitigations that do remain, unchanged: the PIN rate limiter, the session
+// lifetimes, the AP never being default-enabled, and the fact that this never
+// reboots — the new image does not run until someone restarts the device.
+//
+// ---- WHAT IS BOUNDED AND WHERE --------------------------------------------
+//
+// The size cap, the slot cap, the buffer, the stall and total timeouts and the
+// abort discipline are all in otaupload.cpp. This handler owns only the parsing
+// of the request and the shape of the response.
+//
+// ---- WHY IT PARTICIPATES IN THE SHUTDOWN HANDSHAKE ------------------------
+//
+// enterRegistry() has nothing to do with the registry here, and everything to
+// do with what its counter actually means: "a handler is in flight on the HTTP
+// task that httpd_stop() would have to wait for". A transfer can run for
+// minutes. Without the increment, `disable http` would find inRegistry_ == 0,
+// call httpd_stop() INLINE with the registry lock held, and join a task that is
+// busy uploading — freezing the loop task for the rest of the transfer. With
+// it, the teardown defers to httpTransportPoll(), and the reader below returns
+// READ_ERROR the moment `stopping_` is set, so the upload aborts cleanly within
+// one recv timeout (5 s).
+constexpr size_t MAX_OTA_QUERY = 160;
+
+struct OtaReadCtx {
+  httpd_req_t *req;
+};
+
+OtaUpload::ReadStatus otaRead(void *ctx, uint8_t *buf, size_t cap, size_t *got) {
+  *got = 0;
+  OtaReadCtx *c = (OtaReadCtx *)ctx;
+  if (stopping_.load(std::memory_order_acquire)) {
+    // The transport is going down. Give up now rather than holding the teardown
+    // for the rest of the transfer; otaupload.cpp aborts the slot.
+    return OtaUpload::READ_ERROR;
+  }
+  int n = httpd_req_recv(c->req, (char *)buf, cap);
+  if (n > 0) {
+    *got = (size_t)n;
+    return OtaUpload::READ_DATA;
+  }
+  if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+    return OtaUpload::READ_TIMEOUT;
+  }
+  if (n == 0) {
+    return OtaUpload::READ_EOF;
+  }
+  return OtaUpload::READ_ERROR;
+}
+
+// 64 hex characters -> 32 bytes. Rejects anything else, including the uppercase
+// form's mixed cousins — sha256sum(1) emits lowercase and so does this device's
+// own response, so accepting both cases would give a digest two spellings.
+bool parseSha256(const char *s, uint8_t *out) {
+  if (s == nullptr || strlen(s) != 64) {
+    return false;
+  }
+  for (uint8_t i = 0; i < 32; i++) {
+    uint8_t v = 0;
+    for (uint8_t half = 0; half < 2; half++) {
+      char c = s[i * 2 + half];
+      uint8_t nib;
+      if (c >= '0' && c <= '9') {
+        nib = (uint8_t)(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        nib = (uint8_t)(c - 'a' + 10);
+      } else {
+        return false;
+      }
+      v = (uint8_t)((v << 4) | nib);
+    }
+    out[i] = v;
+  }
+  return true;
+}
+
+// Sends an error and then makes esp_http_server CLOSE the socket.
+//
+// Not decoration. When a handler returns ESP_OK with request body still
+// unread, httpd_req_delete() drains it — for a rejected 1.25 MB upload that is
+// megabytes read and thrown away on the server task, after we have already
+// answered. Returning ESP_FAIL after the response is on the wire closes the
+// connection instead. The client still gets its status and error object.
+esp_err_t otaReject(httpd_req_t *req, const char *status, const char *code, const char *msg) {
+  sendErr(req, status, code, msg);
+  return ESP_FAIL;
+}
+
+esp_err_t handleOta(httpd_req_t *req) {
+  if (authenticate(req) == 0) {
+    // No body has been read, and a stranger's is not going to be drained on our
+    // task either.
+    send401(req);
+    return ESP_FAIL;
+  }
+
+  // ---- the query -------------------------------------------------------
+  //
+  // len is REQUIRED and is the caller's declaration of the image size. It is
+  // checked against Content-Length as well, so a mismatch between what the
+  // client says and what its HTTP stack says is caught before a slot is erased.
+  char query[MAX_OTA_QUERY];
+  size_t qlen = httpd_req_get_url_query_len(req);
+  if (qlen == 0) {
+    return otaReject(req, "400 Bad Request", "EARGS",
+                     "POST /api/ota?len=<bytes>[&sha256=<64 hex>][&select=1] — the image size must be declared");
+  }
+  if (qlen >= sizeof(query)) {
+    return otaReject(req, "400 Bad Request", "EARGS", "the query string is too long");
+  }
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+    return otaReject(req, "400 Bad Request", "EARGS", "the query string could not be read");
+  }
+
+  OtaUpload::Params params;
+  char val[72];
+  if (httpd_query_key_value(query, "len", val, sizeof(val)) != ESP_OK) {
+    return otaReject(req, "400 Bad Request", "EARGS",
+                     "missing ?len=<bytes>: the image size must be declared up front");
+  }
+  char *end = nullptr;
+  unsigned long declared = strtoul(val, &end, 10);
+  if (end == val || *end != '\0' || declared == 0) {
+    return otaReject(req, "400 Bad Request", "EARGS", "?len must be a positive decimal byte count");
+  }
+  params.declaredLen = (uint32_t)declared;
+
+  if (httpd_query_key_value(query, "sha256", val, sizeof(val)) == ESP_OK) {
+    if (!parseSha256(val, params.sha)) {
+      return otaReject(req, "400 Bad Request", "EARGS",
+                       "?sha256 must be exactly 64 lowercase hex characters (the output of sha256sum firmware.bin)");
+    }
+    params.haveSha = true;
+  }
+  if (httpd_query_key_value(query, "select", val, sizeof(val)) == ESP_OK) {
+    // EXPLICIT, and only these spellings. "Select the image I just uploaded" is
+    // the one irreversible-ish half of this endpoint, so it is never inferred
+    // from the presence of the parameter alone.
+    if (strcmp(val, "1") == 0 || strcmp(val, "true") == 0) {
+      params.select = true;
+    } else if (strcmp(val, "0") == 0 || strcmp(val, "false") == 0) {
+      params.select = false;
+    } else {
+      return otaReject(req, "400 Bad Request", "EARGS", "?select must be 1/true or 0/false");
+    }
+  }
+
+  // ---- the body's length, before anything is erased --------------------
+  if (req->content_len == 0) {
+    // Includes chunked transfer-encoding, which esp_http_server reports as a
+    // zero content_len. Refused by name rather than read until it stops.
+    return otaReject(req, "411 Length Required", "ELENGTH",
+                     "a Content-Length is required (chunked transfer-encoding is not accepted here)");
+  }
+  if (req->content_len != params.declaredLen) {
+    char msg[144];
+    snprintf(msg, sizeof(msg), "?len is %u but Content-Length is %u; they must agree", (unsigned)params.declaredLen,
+             (unsigned)req->content_len);
+    return otaReject(req, "400 Bad Request", "ELENGTH", msg);
+  }
+
+  if (!enterRegistry()) {
+    return otaReject(req, "503 Service Unavailable", "ESTOPPING", "the Wi-Fi transport is shutting down");
+  }
+
+  OtaReadCtx rctx = {req};
+  OtaUpload::Report rep;
+  OtaUpload::run(params, otaRead, &rctx, rep);
+  exitRegistry();
+
+  JsonDocument doc;
+  doc["ok"] = rep.ok;
+  if (!rep.ok) {
+    JsonObject e = doc["e"].to<JsonObject>();
+    e["code"] = rep.code != nullptr ? rep.code : "EFAIL";
+    e["msg"] = (const char *)rep.msg;
+  }
+  // `d` on BOTH paths (ARCHITECTURE.md section 2): a failed upload still has to
+  // say how far it got, which slot it touched and what the device will boot.
+  OtaUpload::fillReport(doc["d"].to<JsonObject>(), rep);
+
+  const char *status = "200 OK";
+  switch (rep.httpStatus) {
+    case 400:
+      status = "400 Bad Request";
+      break;
+    case 408:
+      status = "408 Request Timeout";
+      break;
+    case 409:
+      status = "409 Conflict";
+      break;
+    case 411:
+      status = "411 Length Required";
+      break;
+    case 413:
+      status = "413 Payload Too Large";
+      break;
+    case 500:
+      status = "500 Internal Server Error";
+      break;
+    case 503:
+      status = "503 Service Unavailable";
+      break;
+    default:
+      break;
+  }
+  esp_err_t sent = sendJsonDoc(req, status, doc);
+  if (!rep.ok) {
+    // Same reason as otaReject(): on ESHORT / ECONN / ETIMEOUT there may still
+    // be megabytes of body queued, and draining it after we have answered would
+    // occupy the server task for as long again as the failed upload did.
+    return ESP_FAIL;
+  }
+  return sent;
+}
+
 // Called by esp_http_server for EVERY socket it closes, WebSocket or not, on
 // its own task. Overriding it means we own the close(), which the default
 // implementation would otherwise do.
@@ -1519,6 +1761,11 @@ bool startServer(char *err, size_t errCap) {
       {.uri = "/api/modules", .method = HTTP_GET, .handler = handleModules, .user_ctx = nullptr,
        .is_websocket = false, .handle_ws_control_frames = false, .supported_subprotocol = nullptr},
       {.uri = "/api/cmd", .method = HTTP_POST, .handler = handleCmd, .user_ctx = nullptr,
+       .is_websocket = false, .handle_ws_control_frames = false, .supported_subprotocol = nullptr},
+      // The OTA delivery path (backlog S5). NOT a command-bus action: it
+      // streams a 1.25 MB body straight into flash, which no JSON envelope
+      // should ever carry. See the block above handleOta().
+      {.uri = "/api/ota", .method = HTTP_POST, .handler = handleOta, .user_ctx = nullptr,
        .is_websocket = false, .handle_ws_control_frames = false, .supported_subprotocol = nullptr},
       // handle_ws_control_frames stays false: esp_http_server answers a client
       // PING with a PONG itself, on the same task, so no send can interleave.

@@ -14,6 +14,7 @@
 
 #include "bus.h"
 #include "console.h"
+#include "fsmount.h"
 #include "led.h"
 #include "mod_cdc.h"
 #include "mod_display.h"
@@ -154,6 +155,20 @@ void setup() {
   printRunningPartitionAndOtaState();
 
   Console::begin();
+
+  // LittleFS, as PLATFORM INFRASTRUCTURE — like NVS, not like a module (backlog
+  // F5, fsmount.h). Ordering, both halves load-bearing:
+  //   * AFTER Console::begin(), which registers the CDC sink, so the "fs.mount"
+  //     event lands in the boot log — the same reason OtaHealth::begin() runs
+  //     where it does;
+  //   * BEFORE registry.restoreFromNvs(), because `storage` reads the mount
+  //     state in its enable() to decide whether it has any volume to serve.
+  // It NEVER prevents boot and it NEVER formats: an unformatted partition and a
+  // corrupt one are indistinguishable here, so a failure is reported and left
+  // alone. `storage format` is the explicit remedy.
+  if (!Fs::begin()) {
+    Serial.printf("\n!! littlefs: NOT mounted (%s). %s\n", Fs::stageName(), Fs::detail());
+  }
 
   // The lock must exist before the first add(). Everything after this point is
   // guarded; see the threading note in registry.h.

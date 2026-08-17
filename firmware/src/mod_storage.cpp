@@ -17,9 +17,12 @@
 #include "activity.h"
 #include "b64.h"
 #include "bus.h"
+#include "cmdauth.h"
 #include "crc32.h"
+#include "fsmount.h"
 #include "pathsafe.h"
 #include "protocol.h"
+#include "volpath.h"
 
 namespace {
 
@@ -43,12 +46,55 @@ constexpr int PIN_D1 = 17;
 constexpr int PIN_D2 = 21;
 constexpr int PIN_D3 = 18;
 
-// VFS mountpoint. Every caller-visible path is relative to the card root and
-// gets this prefixed after PathSafe has accepted it — never before, and never
-// by string surgery anywhere else in this file.
-constexpr const char *MOUNT = "/sd";
-constexpr size_t MOUNT_LEN = 3;
-static_assert(sizeof("/sd") - 1 == MOUNT_LEN, "MOUNT_LEN must match MOUNT");
+// ===========================================================================
+// TWO VOLUMES, ONE SURFACE (backlog F5)
+// ===========================================================================
+//
+// This module addresses BOTH filesystems through one chunked read/write/CRC/
+// list/stat/mkdir/delete/verify surface:
+//
+//   /sd/...   the microSD card, mounted and unmounted by THIS module's
+//             enable()/disable() (SDMMC 4-bit, see the pinout above).
+//   /fs/...   the LittleFS partition at 0x820000, mounted at BOOT by
+//             Fs::begin() and NOT owned by this module at all (fsmount.h).
+//             Disabling `storage` does not unmount it; it only takes away the
+//             command surface that reaches it.
+//
+// WHAT THE PREFIX DOES TO PathSafe: nothing. It sits strictly in front of it.
+// VolPath::split() peels "/sd" or "/fs" off and hands back the path WITHIN the
+// volume, which always begins with '/', and PathSafe::check() then runs on that
+// exactly as it always has. There is ONE path checker in this image, it is the
+// one with the adversarial test suite behind it, and this file did not gain a
+// second one — see the block at the top of volpath.h.
+//
+// THE PREFIX AND THE VFS MOUNTPOINT ARE THE SAME STRING, deliberately, so a
+// path has one spelling from the phone all the way to the syscall. That makes
+// the composition below look like a no-op, and it is NOT one: the full path is
+// always rebuilt from the volume's own mountpoint constant plus the REST that
+// PathSafe accepted. Passing the caller's buffer to a syscall because it
+// happens to be byte-identical is how a checker gets bypassed by an edit that
+// looks harmless.
+enum VolId : uint8_t { VOL_SD = 0, VOL_FS = 1, VOL_COUNT = 2 };
+
+struct VolumeDef {
+  const char *name;    // wire-visible volume name, no slash
+  const char *mount;   // VFS mountpoint == caller-visible prefix
+  uint8_t mountLen;
+  const char *fsName;  // filesystem family, for caps/status
+};
+
+constexpr VolumeDef VOLUMES[VOL_COUNT] = {
+    {"sd", "/sd", 3, "fat"},
+    {"fs", "/fs", 3, "littlefs"},
+};
+static_assert(sizeof("/sd") - 1 == 3, "VOL_SD mountLen must match its mountpoint");
+static_assert(sizeof("/fs") - 1 == 3, "VOL_FS mountLen must match its mountpoint");
+// fsmount.h owns the LittleFS mountpoint; if the two ever disagree, paths would
+// resolve to a directory that is not the one anybody mounted.
+static_assert(CmdAuth::streq("/fs", Fs::MOUNT), "VOL_FS mountpoint must match Fs::MOUNT");
+
+// Longest mountpoint, for the path buffer below.
+constexpr size_t MAX_MOUNT_LEN = 3;
 
 // FatFs file descriptors the mount reserves. `verify` holds one open across
 // ticks; everything else opens and closes inside a single dispatch.
@@ -67,11 +113,12 @@ constexpr uint8_t MAX_OPEN_FILES = 5;
 constexpr size_t MAX_CHUNK = 2048;
 constexpr size_t B64_CHUNK_LEN = B64::encodedLen(MAX_CHUNK);  // 2732
 // The guard has to budget for the WHOLE worst-case response, not just the
-// payload: a read echoes p.path back, and that can be MAX_PATH_LEN bytes on its
-// own. 2732 + 255 + 200 (id/ok/d/offset/len/size/bytes/crc32/eof and the
-// punctuation) = 3187, inside 4096. Raising MAX_CHUNK without raising MAX_LINE
-// now fails the build instead of producing a response no transport can frame.
-static_assert(B64_CHUNK_LEN + PathSafe::MAX_PATH_LEN + 200 < Protocol::MAX_LINE,
+// payload: a read echoes p.path back, and that can be a volume prefix plus
+// MAX_PATH_LEN bytes on its own. 2732 + 9 + 255 + 200 (id/ok/d/offset/len/size/
+// bytes/crc32/eof and the punctuation) = 3196, inside 4096. Raising MAX_CHUNK
+// without raising MAX_LINE now fails the build instead of producing a response
+// no transport can frame.
+static_assert(B64_CHUNK_LEN + VolPath::MAX_PREFIX_LEN + PathSafe::MAX_PATH_LEN + 200 < Protocol::MAX_LINE,
               "a full max_chunk read response would not fit inside Protocol::MAX_LINE");
 
 // Directory listing. BOTH bounds are enforced: `limit` caps the entry count,
@@ -145,7 +192,8 @@ enum MountStage : uint8_t {
   STAGE_UNKNOWN,  // the probe itself could not run, so we will not guess
 };
 
-bool mounted = false;
+// SD ONLY. LittleFS keeps its own state in fsmount.cpp and is not owned here.
+bool sdMounted = false;
 MountStage lastStage = STAGE_OK;
 int32_t lastStageErr = 0;
 // Short form, handed to the registry as the enable() failure reason. It is
@@ -273,39 +321,145 @@ const char *cardTypeName() {
 }
 
 // ===========================================================================
-// Path handling — PathSafe is the ONLY check, and it runs before every syscall
+// Path handling — VolPath then PathSafe, and NOTHING else touches a path
 // ===========================================================================
 
-// Full VFS path buffer: "/sd" + the longest path PathSafe will accept + NUL.
-constexpr size_t FULL_PATH_MAX = MOUNT_LEN + PathSafe::MAX_PATH_LEN + 1;
+// Full VFS path buffer: the longest mountpoint + the longest path PathSafe will
+// accept + NUL.
+constexpr size_t FULL_PATH_MAX = MAX_MOUNT_LEN + PathSafe::MAX_PATH_LEN + 1;
 
-// Validates a caller-supplied path and builds the VFS path for it.
+// One resolved path. Everything a handler needs to act, and nothing it has to
+// re-derive: re-deriving "is this the volume root" from the string is exactly
+// the kind of second parse this file is meant not to have.
+struct Resolved {
+  uint8_t vol = VOL_COUNT;
+  bool isRoot = false;
+  char full[FULL_PATH_MAX] = {0};
+};
+
+bool volumeMounted(uint8_t v) {
+  switch (v) {
+    case VOL_SD:
+      return sdMounted;
+    case VOL_FS:
+      return Fs::mounted();
+    default:
+      return false;
+  }
+}
+
+// Human noun for a volume, used in the errno advice so "the card is full" does
+// not appear when it is the 7.75 MB flash partition that filled up.
+const char *volNoun(uint8_t v) { return v == VOL_FS ? "the LittleFS partition" : "the card"; }
+
+// Lists the volumes into `d` so a rejection tells the caller what IS valid,
+// rather than only what is not.
+void listVolumes(JsonObject d) {
+  JsonArray a = d["volumes"].to<JsonArray>();
+  for (uint8_t i = 0; i < VOL_COUNT; i++) {
+    JsonObject o = a.add<JsonObject>();
+    o["name"] = VOLUMES[i].name;
+    o["prefix"] = VOLUMES[i].mount;
+    o["mounted"] = volumeMounted(i);
+  }
+}
+
+// Why a known volume is not mounted, in one actionable sentence. The two
+// volumes fail for completely different reasons and a shared "not mounted"
+// would hide both.
+void volumeDownDetail(uint8_t v, JsonObject d, CmdError *err) {
+  if (v == VOL_FS) {
+    d["mount_stage"] = Fs::stageName();
+    d["detail"] = Fs::detail();
+    cmdErrorf(err, "ENOTMOUNTED",
+              "volume \"/fs\" is not mounted (LittleFS stage: %s); it is unformatted or corrupt — see storage.status",
+              Fs::stageName());
+    return;
+  }
+  d["mount_stage"] = stageName(lastStage);
+  d["detail"] = (const char *)mountDetail;
+  cmdErrorf(err, "ENOTMOUNTED",
+            "volume \"/sd\" is not mounted (last bring-up stage: %s); disable and re-enable storage",
+            stageName(lastStage));
+}
+
+// Validates a caller-supplied path and builds the VFS path for it. THE funnel:
+// every syscall in this file is reached through here and through nothing else.
+//
+// Three refusals, three distinct codes:
+//   EPATH        the shape is wrong (either half of the check said so)
+//   EVOLUME      well-formed, but names a volume this firmware does not have
+//   ENOTMOUNTED  a real volume that is not currently mounted
 //
 // On rejection this fills `d` with BOTH the machine-readable token and the full
 // human sentence, and sets err's message to the same sentence. `d` survives an
 // error response (ARCHITECTURE.md section 2), which matters because
-// CmdError::msg is 96 bytes and several PathSafe messages are longer — the
+// CmdError::msg is 96 bytes and several of these messages are longer — the
 // truncated one goes in `e.msg`, the whole one in `d.path_message`.
 //
-// The offending path is deliberately NOT echoed back: check() tolerates a
+// The offending path is deliberately NOT echoed back: the checks tolerate a
 // buffer with no NUL inside the limit, and echoing it would then read past it.
-bool resolvePath(const char *path, char *full, size_t fullCap, JsonObject d, CmdError *err) {
-  PathSafe::Result r = PathSafe::check(path);
+bool resolvePath(const char *path, Resolved *out, JsonObject d, CmdError *err) {
+  VolPath::Split sp;
+  VolPath::Result vr = VolPath::split(path, &sp);
+  if (vr != VolPath::VOLPATH_OK) {
+    d["path_error"] = VolPath::resultName(vr);
+    d["path_message"] = VolPath::resultMessage(vr);
+    listVolumes(d);
+    cmdErrorf(err, "EPATH", "%s", VolPath::resultMessage(vr));
+    return false;
+  }
+
+  // Name -> index. A linear walk over two entries; a map would be a data
+  // structure standing in for an if.
+  uint8_t v = VOL_COUNT;
+  for (uint8_t i = 0; i < VOL_COUNT; i++) {
+    if (strcmp(sp.volume, VOLUMES[i].name) == 0) {
+      v = i;
+      break;
+    }
+  }
+  if (v == VOL_COUNT) {
+    // DISTINCT from EPATH: "/nope/x" is a perfectly well-formed path naming a
+    // volume that does not exist, and telling a caller their path is malformed
+    // when it is not sends them looking in the wrong place.
+    d["volume"] = (const char *)sp.volume;
+    listVolumes(d);
+    cmdErrorf(err, "EVOLUME", "no volume named \"%.8s\"; this device has /sd (microSD) and /fs (LittleFS)", sp.volume);
+    return false;
+  }
+
+  // THE path check, unchanged and unduplicated. It sees the path WITHIN the
+  // volume, which is exactly the string whose shape it was written to police.
+  PathSafe::Result r = PathSafe::check(sp.rest);
   if (r != PathSafe::PATH_OK) {
     d["path_error"] = PathSafe::resultName(r);
     d["path_message"] = PathSafe::resultMessage(r);
+    d["volume"] = VOLUMES[v].name;
     cmdErrorf(err, "EPATH", "%s", PathSafe::resultMessage(r));
     return false;
   }
-  // "/" is the card root: "/sd" + "/" would be "/sd/", a second spelling of the
-  // same directory. One spelling only.
-  int n = (path[1] == '\0') ? snprintf(full, fullCap, "%s", MOUNT) : snprintf(full, fullCap, "%s%s", MOUNT, path);
-  if (n <= 0 || (size_t)n >= fullCap) {
-    // Unreachable given MAX_PATH_LEN and FULL_PATH_MAX, but a silent truncation
-    // here would be a path-confusion bug, so it is a hard failure.
-    cmdErrorf(err, "EPATH", "resolved path did not fit the %u-byte buffer", (unsigned)fullCap);
+
+  if (!volumeMounted(v)) {
+    d["volume"] = VOLUMES[v].name;
+    volumeDownDetail(v, d, err);
     return false;
   }
+
+  // Composed from the VOLUME'S OWN mountpoint plus the accepted remainder —
+  // never from the caller's buffer, even though the two are byte-identical
+  // here. The root is the mountpoint alone: "/sd" + "/" would be "/sd/", a
+  // second spelling of the same directory.
+  int n = sp.isRoot ? snprintf(out->full, sizeof(out->full), "%s", VOLUMES[v].mount)
+                    : snprintf(out->full, sizeof(out->full), "%s%s", VOLUMES[v].mount, sp.rest);
+  if (n <= 0 || (size_t)n >= sizeof(out->full)) {
+    // Unreachable given MAX_PATH_LEN and FULL_PATH_MAX, but a silent truncation
+    // here would be a path-confusion bug, so it is a hard failure.
+    cmdErrorf(err, "EPATH", "resolved path did not fit the %u-byte buffer", (unsigned)sizeof(out->full));
+    return false;
+  }
+  out->vol = v;
+  out->isRoot = sp.isRoot;
   return true;
 }
 
@@ -343,10 +497,15 @@ const char *errnoCode(int e) {
   }
 }
 
-const char *errnoAdvice(int e) {
+// Volume-aware, because the two filesystems fail for different reasons and the
+// remedy differs: "the card is full" and "the 7.75 MB flash partition is full"
+// send someone to two different places, and ENAMETOOLONG means 255 bytes on
+// FatFs but 64 on this LittleFS build (CONFIG_LITTLEFS_OBJ_NAME_LEN).
+const char *errnoAdvice(int e, uint8_t vol) {
+  bool fs = (vol == VOL_FS);
   switch (e) {
     case ENOENT:
-      return "no such file or directory on the card";
+      return fs ? "no such file or directory on the LittleFS partition" : "no such file or directory on the card";
     case EISDIR:
       return "that path is a directory, not a file";
     case ENOTDIR:
@@ -356,23 +515,25 @@ const char *errnoAdvice(int e) {
     case EEXIST:
       return "it already exists";
     case EACCES:
-      return "the filesystem refused access (a read-only or hidden/system FAT attribute)";
+      return fs ? "the filesystem refused access"
+                : "the filesystem refused access (a read-only or hidden/system FAT attribute)";
     case EROFS:
       return "the volume is mounted read-only";
     case ENOSPC:
-      return "the card is full";
+      return fs ? "the LittleFS partition is full (7.75 MB total — bulk data belongs on /sd)" : "the card is full";
     case EMFILE:
     case ENFILE:
       return "too many files are open; a verify job may be holding one";
     case ENAMETOOLONG:
-      return "the name is longer than FatFs allows";
+      return fs ? "the name is longer than this LittleFS build allows (64 bytes per component)"
+                : "the name is longer than FatFs allows";
     default:
-      return "the card reported an I/O error";
+      return fs ? "LittleFS reported an I/O error" : "the card reported an I/O error";
   }
 }
 
-void failErrno(const char *what, const char *path, int e, CmdError *err) {
-  cmdErrorf(err, errnoCode(e), "%s \"%.64s\": %s (errno %d)", what, path, errnoAdvice(e), e);
+void failErrno(const char *what, const char *path, int e, uint8_t vol, CmdError *err) {
+  cmdErrorf(err, errnoCode(e), "%s \"%.64s\": %s (errno %d)", what, path, errnoAdvice(e, vol), e);
 }
 
 // ===========================================================================
@@ -393,13 +554,18 @@ bool requireAuth(const CmdContext &ctx, bool mutating, CmdError *err) {
   return false;
 }
 
-bool requireMounted(JsonObject d, CmdError *err) {
-  if (mounted) {
+// `format` ERASES A WHOLE FILESYSTEM, so it sits at AUTH_PHYSICAL alongside the
+// AP passphrase and `reboot`: the cable, not the network. A session token buys
+// a great deal on this device — including, by stuart's decision, pushing and
+// selecting a firmware image — but not the ability to destroy the owner's web
+// assets and macros from across the room with one request.
+bool requirePhysical(const CmdContext &ctx, const char *what, CmdError *err) {
+  if (ctx.authLevel >= AUTH_PHYSICAL) {
     return true;
   }
-  d["mount_stage"] = stageName(lastStage);
-  cmdErrorf(err, "ENOTMOUNTED", "the card is not mounted (last bring-up stage: %s); disable and re-enable storage",
-            stageName(lastStage));
+  char msg[sizeof(CmdError::msg)];
+  CmdAuth::denyMessage(msg, sizeof(msg), what, CmdAuth::PHYSICAL, ctx.transport, ctx.authLevel);
+  cmdErrorf(err, "EAUTH", "%s", msg);
   return false;
 }
 
@@ -429,7 +595,10 @@ struct VerifyJob {
   uint32_t bytes = 0;
   uint32_t size = 0;
   uint32_t lastProgressMs = 0;
-  char path[PathSafe::MAX_PATH_LEN + 1] = {0};
+  uint8_t vol = VOL_COUNT;
+  // The CALLER'S path, volume prefix and all, so the progress and done events
+  // name the same string the request did. Sized for the prefixed form.
+  char path[VolPath::MAX_TOTAL_LEN + 1] = {0};
 
   // Outcome of the most recent job; kept after active goes false so the done
   // event and status() can both read it.
@@ -451,6 +620,7 @@ void fillVerifyProgress(JsonObject d, void *ctx) {
     d["id"] = verify.reqId;  // correlate with the ACCEPTED response
   }
   d["path"] = (const char *)verify.path;
+  d["volume"] = verify.vol < VOL_COUNT ? VOLUMES[verify.vol].name : "?";
   d["bytes"] = verify.bytes;
   d["size"] = verify.size;
   d["pct"] = verify.size ? (uint32_t)((uint64_t)verify.bytes * 100u / verify.size) : 100u;
@@ -464,6 +634,7 @@ void fillVerifyDone(JsonObject d, void *ctx) {
     d["id"] = verify.reqId;
   }
   d["path"] = (const char *)verify.path;
+  d["volume"] = verify.vol < VOL_COUNT ? VOLUMES[verify.vol].name : "?";
   d["bytes"] = verify.bytes;
   d["size"] = verify.size;
   d["ok"] = verify.resultOk;
@@ -539,8 +710,13 @@ void storageTick() {
 // Lifecycle
 // ===========================================================================
 
-bool storageEnable(const char **errMsg) {
-  if (mounted) {
+// ---- the SD half of enable() ---------------------------------------------
+//
+// Split out because enable() is now allowed to succeed WITHOUT it. Returns
+// true if the card is mounted when it returns; fills lastStage/enableErr/
+// mountDetail either way.
+bool mountSd() {
+  if (sdMounted) {
     return true;
   }
   lastStage = STAGE_OK;
@@ -555,14 +731,13 @@ bool storageEnable(const char **errMsg) {
     snprintf(mountDetail, sizeof(mountDetail),
              "SD_MMC.setPins() must be called before SD_MMC.begin(); it refuses once a card is mounted. Something "
              "else in this image has already begun the SDMMC bus.");
-    *errMsg = enableErr;
     return false;
   }
 
   // format_if_mount_failed is FALSE and must stay false. Passing true would let
   // an unreadable card be silently reformatted — destroying the user's data as
   // a side effect of enabling a module.
-  if (!SD_MMC.begin(MOUNT, /*mode1bit=*/false, /*format_if_mount_failed=*/false, BOARD_MAX_SDMMC_FREQ,
+  if (!SD_MMC.begin(VOLUMES[VOL_SD].mount, /*mode1bit=*/false, /*format_if_mount_failed=*/false, BOARD_MAX_SDMMC_FREQ,
                     MAX_OPEN_FILES)) {
     lastStage = probeFailedStage(&lastStageErr);
     switch (lastStage) {
@@ -592,14 +767,75 @@ bool storageEnable(const char **errMsg) {
                  (unsigned)lastStageErr);
         break;
     }
-    *errMsg = enableErr;
     return false;
   }
 
-  mounted = true;
+  sdMounted = true;
   lastStage = STAGE_OK;
   fsTypeCached = readFsType();
-  snprintf(mountDetail, sizeof(mountDetail), "mounted at %s, %s, %s", MOUNT, cardTypeName(), fsTypeCached);
+  snprintf(mountDetail, sizeof(mountDetail), "mounted at %s, %s, %s", VOLUMES[VOL_SD].mount, cardTypeName(),
+           fsTypeCached);
+  return true;
+}
+
+// Fires on every enable, success or not, so the SD diagnosis is visible on
+// every transport rather than only to whoever typed `enable storage`.
+struct MountEvent {
+  bool sd;
+  bool fs;
+  const char *stage;
+};
+
+void fillMountEvent(JsonObject d, void *ctx) {
+  const MountEvent *e = (const MountEvent *)ctx;
+  if (e == nullptr) {
+    return;
+  }
+  d["sd"] = e->sd;
+  d["fs"] = e->fs;
+  d["sd_stage"] = e->stage;
+  if (!e->sd) {
+    d["sd_detail"] = (const char *)mountDetail;
+  }
+}
+
+// ---- enable / disable ----------------------------------------------------
+//
+// SUCCEEDS ON EITHER VOLUME, and that is the point of the change: an absent
+// microSD card must not take the LittleFS partition away with it, and a
+// LittleFS that will not mount must not stop someone reading their card.
+//
+// It fails only when NEITHER is usable, because at that point the module has
+// no filesystem to offer and reporting "enabled" would be a lie the UI would
+// happily render.
+//
+// WHAT THIS DOES NOT CHANGE: the RES_SD claim. Claims are static in this
+// registry (registry.h), so `storage` holds RES_SD SHARED whenever it is
+// enabled, card or no card. The cost, stated rather than discovered: `msc`
+// (backlog F2, RES_SD EXCLUSIVE) will be blocked by an enabled `storage` even
+// when there is no card in the slot, and the remedy is `disable storage` or
+// `enable msc force`. The alternative — dropping the claim when the mount
+// fails — needs dynamic claims AND would race a card inserted a second later,
+// which is a worse trade for a device with no card-detect pin.
+bool storageEnable(const char **errMsg) {
+  bool sd = mountSd();
+  // NOT mounted here. Fs::begin() ran at boot as platform infrastructure
+  // (fsmount.h); this module only reads its state. Enabling `storage` must not
+  // be able to mount, format or otherwise touch the LittleFS volume.
+  bool fs = Fs::mounted();
+
+  MountEvent ev = {sd, fs, stageName(lastStage)};
+  Bus::emit("storage.mount", fillMountEvent, &ev);
+
+  if (!sd && !fs) {
+    // Both halves in one message, because "no card" alone would send someone
+    // looking for a card when the LittleFS partition is the thing that broke.
+    snprintf(enableErr, sizeof(enableErr),
+             "no volume is usable: /sd stage=%s, /fs stage=%s — storage.status carries the full diagnosis for both",
+             stageName(lastStage), Fs::stageName());
+    *errMsg = enableErr;
+    return false;
+  }
   return true;
 }
 
@@ -607,17 +843,22 @@ bool storageDisable(const char **errMsg) {
   (void)errMsg;
   // Close the one long-lived handle BEFORE unmounting: esp_vfs_fat_sdcard_unmount
   // with a file still open leaks the FatFs descriptor for the life of the image,
-  // and the next enable() would start one short of MAX_OPEN_FILES.
+  // and the next enable() would start one short of MAX_OPEN_FILES. The handle
+  // may belong to EITHER volume — a verify running on /fs has to be closed too,
+  // even though nothing here unmounts /fs.
   if (verify.active) {
     finishVerify("ECANCELLED", "storage was disabled while this verify job was running");
   }
-  if (mounted) {
+  if (sdMounted) {
     SD_MMC.end();  // unmounts and releases the pins, so `msc` can claim RES_SD
-    mounted = false;
+    sdMounted = false;
   }
   fsTypeCached = "?";  // the next mount may be a different card entirely
   lastStage = STAGE_OK;
-  snprintf(mountDetail, sizeof(mountDetail), "unmounted cleanly; the SDMMC bus is free");
+  // LittleFS is DELIBERATELY left mounted: it is platform infrastructure
+  // (fsmount.h), other code may be reading web assets out of it, and this
+  // module never mounted it in the first place.
+  snprintf(mountDetail, sizeof(mountDetail), "unmounted cleanly; the SDMMC bus is free. /fs is unaffected.");
   return true;
 }
 
@@ -625,15 +866,74 @@ bool storageDisable(const char **errMsg) {
 // Actions
 // ===========================================================================
 
+// One volume's row, for `caps` and `free`. `withUsage` is the expensive half:
+// on /sd it is SD_MMC.totalBytes()/usedBytes(), i.e. f_getfree(), which walks
+// the whole FAT when the FAT32 FSInfo free-cluster count is stale — seconds on
+// a 128 GB card. Both callers are explicit actions, so they pay it; status()
+// must never ask for it.
+void fillVolume(JsonObject o, uint8_t v, bool withUsage) {
+  o["name"] = VOLUMES[v].name;
+  o["prefix"] = VOLUMES[v].mount;
+  bool up = volumeMounted(v);
+  o["mounted"] = up;
+
+  if (v == VOL_SD) {
+    o["kind"] = "microsd";
+    o["fs"] = up ? fsTypeCached : "?";
+    o["removable"] = true;
+    o["stage"] = stageName(lastStage);
+    // FatFs LFN, and off_t is 32-bit signed on this target — a legal 4 GiB-1
+    // FAT32 file is not fully addressable through this API (backlog C8).
+    o["max_name"] = (uint32_t)PathSafe::MAX_SEGMENT_LEN;
+    o["max_file_offset"] = MAX_FILE_OFFSET;
+    if (up) {
+      o["card_type"] = cardTypeName();
+      o["card_size"] = SD_MMC.cardSize();
+      o["sector_size"] = SD_MMC.sectorSize();
+      if (withUsage) {
+        uint64_t total = SD_MMC.totalBytes();
+        uint64_t used = SD_MMC.usedBytes();
+        o["total"] = total;
+        o["used"] = used;
+        o["free"] = (total >= used) ? (total - used) : 0;
+      }
+    }
+    return;
+  }
+
+  o["kind"] = "littlefs";
+  o["fs"] = VOLUMES[v].fsName;
+  o["removable"] = false;
+  o["stage"] = Fs::stageName();
+  o["offset"] = Fs::partitionOffset();
+  o["partition_size"] = Fs::partitionSize();
+  // CONFIG_LITTLEFS_OBJ_NAME_LEN in this framework's sdkconfig. Lower than
+  // PathSafe::MAX_SEGMENT_LEN, so a name legal on /sd can be ENAMETOOLONG here
+  // — advertised rather than discovered halfway through an upload.
+  o["max_name"] = 64u;
+  // The partition is 7.75 MB, so the 2 GiB off_t ceiling is never the binding
+  // limit on this volume; the partition size is.
+  o["max_file_offset"] = Fs::partitionSize();
+  if (up && withUsage) {
+    uint64_t total = 0, used = 0;
+    if (Fs::info(&total, &used)) {
+      o["total"] = total;
+      o["used"] = used;
+      o["free"] = (total >= used) ? (total - used) : 0;
+    }
+  }
+}
+
 DispatchResult actCaps(JsonObject d) {
-  d["mountpoint"] = MOUNT;
-  d["mounted"] = mounted;
-  d["fs"] = fsTypeCached;
   d["encoding"] = "base64";  // RFC 4648 section 4, always padded; see b64.h
   d["crc32"] = "hex8";       // 8 lowercase hex digits, CRC-32/ISO-HDLC
   d["max_chunk"] = (uint32_t)MAX_CHUNK;
   d["max_chunk_encoded"] = (uint32_t)B64_CHUNK_LEN;
+  // max_path is the path WITHIN a volume, excluding the "/sd" or "/fs" prefix,
+  // because that is the string PathSafe measures. max_volume_prefix is what a
+  // caller has to add to it to get the string it actually sends.
   d["max_path"] = (uint32_t)PathSafe::MAX_PATH_LEN;
+  d["max_volume_prefix"] = (uint32_t)VolPath::MAX_PREFIX_LEN;
   d["max_segment"] = (uint32_t)PathSafe::MAX_SEGMENT_LEN;
   d["max_line"] = (uint32_t)Protocol::MAX_LINE;
   d["max_file_offset"] = MAX_FILE_OFFSET;
@@ -643,34 +943,52 @@ DispatchResult actCaps(JsonObject d) {
   d["delete_max_depth"] = DELETE_MAX_DEPTH;
   d["delete_max_entries"] = DELETE_MAX_ENTRIES;
   d["max_open_files"] = MAX_OPEN_FILES;
+  // Every volume, its mount state, its own limits and its free space — so a
+  // client negotiates once instead of discovering each of them by failing.
+  JsonArray vols = d["volumes"].to<JsonArray>();
+  for (uint8_t v = 0; v < VOL_COUNT; v++) {
+    fillVolume(vols.add<JsonObject>(), v, /*withUsage=*/true);
+  }
   return DISPATCH_OK;
 }
 
-DispatchResult actFree(JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
+// Optional p.volume ("sd"/"fs") narrows it to one; with no params it reports
+// every volume. One shape either way — an array — because two shapes is how a
+// client ends up with two parsers.
+DispatchResult actFree(JsonObjectConst p, JsonObject d, CmdError *err) {
+  const char *want = p["volume"] | (const char *)nullptr;
+  uint8_t only = VOL_COUNT;
+  if (want != nullptr) {
+    for (uint8_t v = 0; v < VOL_COUNT; v++) {
+      if (strcmp(want, VOLUMES[v].name) == 0) {
+        only = v;
+        break;
+      }
+    }
+    if (only == VOL_COUNT) {
+      listVolumes(d);
+      cmdErrorf(err, "EVOLUME", "no volume named \"%.8s\"; this device has \"sd\" (microSD) and \"fs\" (LittleFS)",
+                want);
+      return DISPATCH_FAIL;
+    }
   }
-  d["card_type"] = cardTypeName();
-  d["card_size"] = SD_MMC.cardSize();
-  d["sector_size"] = SD_MMC.sectorSize();
-  d["fs"] = fsTypeCached;
-  uint64_t total = SD_MMC.totalBytes();
-  uint64_t used = SD_MMC.usedBytes();
-  d["total"] = total;
-  d["used"] = used;
-  d["free"] = (total >= used) ? (total - used) : 0;
+  JsonArray vols = d["volumes"].to<JsonArray>();
+  for (uint8_t v = 0; v < VOL_COUNT; v++) {
+    if (only != VOL_COUNT && v != only) {
+      continue;
+    }
+    fillVolume(vols.add<JsonObject>(), v, /*withUsage=*/true);
+  }
   return DISPATCH_OK;
 }
 
 DispatchResult actList(JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
+  const char *full = r.full;
 
   long offsetIn = p["offset"] | 0L;
   long limitIn = p["limit"] | (long)LIST_DEFAULT_LIMIT;
@@ -691,7 +1009,7 @@ DispatchResult actList(JsonObjectConst p, JsonObject d, CmdError *err) {
   DIR *dir = opendir(full);
   if (dir == nullptr) {
     int e = errno;
-    failErrno("cannot list", path, e, err);
+    failErrno("cannot list", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
 
@@ -776,14 +1094,12 @@ DispatchResult actList(JsonObjectConst p, JsonObject d, CmdError *err) {
 }
 
 DispatchResult actStat(JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
+  const char *full = r.full;
 
   d["path"] = path;
   struct stat st;
@@ -796,7 +1112,7 @@ DispatchResult actStat(JsonObjectConst p, JsonObject d, CmdError *err) {
       d["errno_code"] = errnoCode(e);
       return DISPATCH_OK;
     }
-    failErrno("cannot stat", path, e, err);
+    failErrno("cannot stat", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
   bool isDir = S_ISDIR(st.st_mode);
@@ -808,14 +1124,12 @@ DispatchResult actStat(JsonObjectConst p, JsonObject d, CmdError *err) {
 }
 
 DispatchResult actRead(JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
+  const char *full = r.full;
 
   long long offsetIn = p["offset"] | 0LL;
   long long lenIn = p["len"] | (long long)MAX_CHUNK;
@@ -836,7 +1150,7 @@ DispatchResult actRead(JsonObjectConst p, JsonObject d, CmdError *err) {
   struct stat st;
   if (stat(full, &st) != 0) {
     int e = errno;
-    failErrno("cannot read", path, e, err);
+    failErrno("cannot read", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
   if (S_ISDIR(st.st_mode)) {
@@ -861,13 +1175,13 @@ DispatchResult actRead(JsonObjectConst p, JsonObject d, CmdError *err) {
     FILE *fp = fopen(full, "rb");
     if (fp == nullptr) {
       int e = errno;
-      failErrno("cannot open", path, e, err);
+      failErrno("cannot open", path, e, r.vol, err);
       return DISPATCH_FAIL;
     }
     if (fseek(fp, (long)offsetIn, SEEK_SET) != 0) {
       int e = errno;
       fclose(fp);
-      failErrno("cannot seek in", path, e, err);
+      failErrno("cannot seek in", path, e, r.vol, err);
       return DISPATCH_FAIL;
     }
     got = fread(chunkBuf, 1, (size_t)lenIn, fp);
@@ -902,14 +1216,12 @@ DispatchResult actRead(JsonObjectConst p, JsonObject d, CmdError *err) {
 }
 
 DispatchResult actWrite(JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
+  const char *full = r.full;
 
   long long offsetIn = p["offset"] | 0LL;
   if (offsetIn < 0 || offsetIn > (long long)MAX_FILE_OFFSET) {
@@ -976,13 +1288,13 @@ DispatchResult actWrite(JsonObjectConst p, JsonObject d, CmdError *err) {
   FILE *fp = fopen(full, mode);
   if (fp == nullptr) {
     int e = errno;
-    failErrno("cannot open for writing", path, e, err);
+    failErrno("cannot open for writing", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
   if (offset != 0 && fseek(fp, (long)offset, SEEK_SET) != 0) {
     int e = errno;
     fclose(fp);
-    failErrno("cannot seek in", path, e, err);
+    failErrno("cannot seek in", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
   size_t written = raw > 0 ? fwrite(chunkBuf, 1, raw, fp) : 0;
@@ -1013,16 +1325,14 @@ DispatchResult actWrite(JsonObjectConst p, JsonObject d, CmdError *err) {
 }
 
 DispatchResult actMkdir(JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
-  if (path[1] == '\0') {
-    cmdErrorf(err, "EEXIST", "\"/\" is the card root and always exists");
+  const char *full = r.full;
+  if (r.isRoot) {
+    cmdErrorf(err, "EEXIST", "\"%s\" is a volume root and always exists", VOLUMES[r.vol].mount);
     return DISPATCH_FAIL;
   }
   // Single level only, deliberately: mkdir -p would have to invent intermediate
@@ -1030,7 +1340,7 @@ DispatchResult actMkdir(JsonObjectConst p, JsonObject d, CmdError *err) {
   // leave some of them behind with nothing saying which.
   if (mkdir(full, 0777) != 0) {
     int e = errno;
-    failErrno("cannot mkdir", path, e, err);
+    failErrno("cannot mkdir", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
   d["path"] = path;
@@ -1160,37 +1470,42 @@ DelErr removeTree(char *full, size_t fullCap, uint8_t depth, DelState *s) {
 }
 
 DispatchResult actDelete(JsonObjectConst p, JsonObject d, CmdError *err) {
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
+  // MUTABLE, unlike the other actions: removeTree() appends to and truncates
+  // this buffer in place, which is what keeps the recursion at one 201-byte
+  // name buffer per level instead of a whole path buffer.
+  char *full = r.full;
   bool recursive = p["recursive"] | false;
 
   d["path"] = path;
+  d["volume"] = VOLUMES[r.vol].name;
   d["recursive"] = recursive;
 
-  if (path[1] == '\0') {
-    // Deleting "/" recursively is "erase the card". If that is ever wanted it
-    // gets its own named action with its own confirmation, not a flag on this one.
-    cmdErrorf(err, "EARGS", "refusing to delete the card root \"/\"; name a file or directory inside it");
+  if (r.isRoot) {
+    // Deleting a volume root recursively is "erase the card" / "erase the
+    // LittleFS partition". If that is ever wanted it gets its own named action
+    // with its own confirmation, not a flag on this one — and for /fs it
+    // already has one: `storage.format`, at AUTH_PHYSICAL.
+    cmdErrorf(err, "EARGS", "refusing to delete the volume root \"%s\"; name a file or directory inside it",
+              VOLUMES[r.vol].mount);
     return DISPATCH_FAIL;
   }
 
   struct stat st;
   if (stat(full, &st) != 0) {
     int e = errno;
-    failErrno("cannot delete", path, e, err);
+    failErrno("cannot delete", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
 
   if (!S_ISDIR(st.st_mode)) {
     if (unlink(full) != 0) {
       int e = errno;
-      failErrno("cannot delete", path, e, err);
+      failErrno("cannot delete", path, e, r.vol, err);
       return DISPATCH_FAIL;
     }
     d["files"] = 1;
@@ -1201,7 +1516,7 @@ DispatchResult actDelete(JsonObjectConst p, JsonObject d, CmdError *err) {
   if (!recursive) {
     if (rmdir(full) != 0) {
       int e = errno;
-      failErrno("cannot delete", path, e, err);
+      failErrno("cannot delete", path, e, r.vol, err);
       return DISPATCH_FAIL;
     }
     d["files"] = 0;
@@ -1210,7 +1525,7 @@ DispatchResult actDelete(JsonObjectConst p, JsonObject d, CmdError *err) {
   }
 
   DelState s;
-  DelErr e = removeTree(full, sizeof(full), 1, &s);
+  DelErr e = removeTree(full, sizeof(r.full), 1, &s);
   // Counts go into `d` on BOTH paths. A bounded recursive delete that gives up
   // half-way has already changed the card, and a caller that cannot see how much
   // was removed cannot safely retry. `d` survives an error (ARCHITECTURE.md §2).
@@ -1222,8 +1537,13 @@ DispatchResult actDelete(JsonObjectConst p, JsonObject d, CmdError *err) {
 
   d["complete"] = false;
   if (s.failPath[0] != '\0') {
-    // Report the VFS path minus the mountpoint, so it is in the caller's terms.
-    d["failed_at"] = (const char *)(s.failPath + MOUNT_LEN);
+    // Report the VFS path in the CALLER'S terms — which, because the volume
+    // prefix and the mountpoint are the same string, is the VFS path itself.
+    // Written as the volume prefix plus the remainder anyway, so that the day
+    // those two stop being identical this line does not quietly start lying.
+    char shown[FULL_PATH_MAX];
+    snprintf(shown, sizeof(shown), "%s%s", VOLUMES[r.vol].mount, s.failPath + VOLUMES[r.vol].mountLen);
+    d["failed_at"] = (const char *)shown;
   }
   switch (e) {
     case DEL_DEPTH:
@@ -1240,11 +1560,11 @@ DispatchResult actDelete(JsonObjectConst p, JsonObject d, CmdError *err) {
       break;
     case DEL_OPEN:
       cmdErrorf(err, errnoCode(s.lastErrno), "cannot open a directory part-way through the delete: %s (errno %d)",
-                errnoAdvice(s.lastErrno), s.lastErrno);
+                errnoAdvice(s.lastErrno, r.vol), s.lastErrno);
       break;
     default:
       cmdErrorf(err, errnoCode(s.lastErrno), "delete failed part-way through: %s (errno %d)",
-                errnoAdvice(s.lastErrno), s.lastErrno);
+                errnoAdvice(s.lastErrno, r.vol), s.lastErrno);
       break;
   }
   return DISPATCH_FAIL;
@@ -1263,9 +1583,6 @@ DispatchResult actVerify(const CmdContext &ctx, JsonObjectConst p, JsonObject d,
     return DISPATCH_OK;
   }
 
-  if (!requireMounted(d, err)) {
-    return DISPATCH_FAIL;
-  }
   if (verify.active) {
     d["job"] = verify.id;
     d["bytes"] = verify.bytes;
@@ -1275,16 +1592,17 @@ DispatchResult actVerify(const CmdContext &ctx, JsonObjectConst p, JsonObject d,
     return DISPATCH_FAIL;
   }
 
-  char full[FULL_PATH_MAX];
+  Resolved r;
   const char *path = p["path"] | (const char *)nullptr;
-  if (!resolvePath(path, full, sizeof(full), d, err)) {
+  if (!resolvePath(path, &r, d, err)) {
     return DISPATCH_FAIL;
   }
+  const char *full = r.full;
 
   struct stat st;
   if (stat(full, &st) != 0) {
     int e = errno;
-    failErrno("cannot verify", path, e, err);
+    failErrno("cannot verify", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
   if (S_ISDIR(st.st_mode)) {
@@ -1295,7 +1613,7 @@ DispatchResult actVerify(const CmdContext &ctx, JsonObjectConst p, JsonObject d,
   FILE *fp = fopen(full, "rb");
   if (fp == nullptr) {
     int e = errno;
-    failErrno("cannot open", path, e, err);
+    failErrno("cannot open", path, e, r.vol, err);
     return DISPATCH_FAIL;
   }
 
@@ -1310,11 +1628,13 @@ DispatchResult actVerify(const CmdContext &ctx, JsonObjectConst p, JsonObject d,
   verify.haveResult = false;
   verify.resultCode = nullptr;
   verify.resultMsg[0] = '\0';
+  verify.vol = r.vol;
   snprintf(verify.path, sizeof(verify.path), "%s", path);
   Activity::begin("storage", "verify");  // out-of-band progress; see activity.h
 
   d["job"] = verify.id;
   d["path"] = path;
+  d["volume"] = VOLUMES[r.vol].name;
   d["size"] = verify.size;
   // ACCEPTED, not OK: hashing a multi-megabyte file inline would hold the
   // cooperative scheduler for seconds. The result arrives as
@@ -1326,23 +1646,101 @@ DispatchResult actVerify(const CmdContext &ctx, JsonObjectConst p, JsonObject d,
 // Status and dispatch
 // ===========================================================================
 
+// ---- format: the ONLY thing in this image that erases a filesystem --------
+//
+// /fs ONLY, and deliberately. Formatting the microSD is NOT offered: the card
+// must stay FAT32 for this board (see ../CLAUDE.md "microSD — resolved"), the
+// only formatter available on-device would produce whatever esp_vfs_fat chose,
+// and `mkfs.vfat -F 32 -s 64` on a PC is the documented, verified path. An
+// action that could quietly produce a differently-formatted card is one more
+// way to arrive back at the exFAT afternoon.
+DispatchResult actFormat(JsonObjectConst p, JsonObject d, CmdError *err) {
+  const char *volume = p["volume"] | (const char *)nullptr;
+  bool confirm = p["confirm"] | false;
+
+  if (volume == nullptr) {
+    listVolumes(d);
+    cmdErrorf(err, "EARGS", "format needs p.volume; only \"fs\" can be formatted by this device");
+    return DISPATCH_FAIL;
+  }
+  if (strcmp(volume, "sd") == 0) {
+    cmdErrorf(err, "EUNSUPPORTED",
+              "the microSD is not formatted by this device; it must stay FAT32 — use mkfs.vfat -F 32 -s 64 on a PC");
+    return DISPATCH_FAIL;
+  }
+  if (strcmp(volume, "fs") != 0) {
+    listVolumes(d);
+    cmdErrorf(err, "EVOLUME", "no volume named \"%.8s\"; only \"fs\" can be formatted", volume);
+    return DISPATCH_FAIL;
+  }
+  if (!confirm) {
+    // A second, explicit word. `p:{volume:"fs"}` alone is one typo away from
+    // being sent by someone who meant `free`, and this erases 7.75 MB of web
+    // assets and macros with no undo.
+    d["volume"] = "fs";
+    d["would_erase"] = Fs::partitionSize();
+    cmdErrorf(err, "ECONFIRM",
+              "this ERASES the whole /fs volume and cannot be undone; resend with p:{volume:\"fs\",confirm:true}");
+    return DISPATCH_FAIL;
+  }
+  if (verify.active) {
+    // The verify job holds an open FILE* which may live on this very volume.
+    // Refusing is better than cancelling somebody else's job as a side effect
+    // (the same stance actVerify takes about a second verify).
+    d["job"] = verify.id;
+    d["verify_path"] = (const char *)verify.path;
+    cmdErrorf(err, "EBUSY", "verify job %u is running and holds an open file; cancel it first", (unsigned)verify.id);
+    return DISPATCH_FAIL;
+  }
+
+  uint64_t beforeTotal = 0, beforeUsed = 0;
+  bool hadInfo = Fs::info(&beforeTotal, &beforeUsed);
+
+  const char *code = "EFORMAT";
+  char msg[160];
+  msg[0] = '\0';
+  bool ok = Fs::format(&code, msg, sizeof(msg));
+
+  d["volume"] = "fs";
+  d["mounted"] = Fs::mounted();
+  d["stage"] = Fs::stageName();
+  if (hadInfo) {
+    d["used_before"] = beforeUsed;
+  }
+  uint64_t total = 0, used = 0;
+  if (Fs::info(&total, &used)) {
+    d["total"] = total;
+    d["used"] = used;
+    d["free"] = (total >= used) ? (total - used) : 0;
+  }
+  if (!ok) {
+    cmdErrorf(err, code, "%s", msg);
+    return DISPATCH_FAIL;
+  }
+  d["formatted"] = true;
+  d["msg"] = (const char *)msg;  // cast: char[] would be stored by pointer
+  return DISPATCH_OK;
+}
+
 void fillStatus(JsonObject d) {
-  d["mounted"] = mounted;
-  d["mountpoint"] = MOUNT;
-  d["stage"] = stageName(lastStage);
-  if (lastStageErr != 0) {
-    d["stage_err"] = lastStageErr;
-  }
-  d["detail"] = (const char *)mountDetail;
-  if (mounted) {
-    d["card_type"] = cardTypeName();
-    d["fs"] = fsTypeCached;
-    d["card_size"] = SD_MMC.cardSize();
-  }
-  // Deliberately NOT calling totalBytes()/usedBytes() here: status() runs on
-  // every `modules` command, and f_getfree can walk the whole FAT if the FAT32
+  // Per-volume, WITHOUT usage: status() runs on every `modules` command, and
+  // SD_MMC.totalBytes() is f_getfree(), which walks the whole FAT if the FAT32
   // FSInfo free-cluster count is stale. That belongs behind the explicit `free`
-  // action, where the caller asked for it.
+  // and `caps` actions, where the caller asked for it.
+  JsonArray vols = d["volumes"].to<JsonArray>();
+  for (uint8_t v = 0; v < VOL_COUNT; v++) {
+    fillVolume(vols.add<JsonObject>(), v, /*withUsage=*/false);
+  }
+  // The SD diagnosis in full, and the LittleFS one, because the two-stage
+  // failure story is the whole reason this module reports a `stage` at all.
+  d["sd_detail"] = (const char *)mountDetail;
+  if (lastStageErr != 0) {
+    d["sd_stage_err"] = lastStageErr;
+  }
+  d["fs_detail"] = Fs::detail();
+  if (Fs::lastErr() != 0) {
+    d["fs_stage_err"] = Fs::lastErr();
+  }
   d["verify_active"] = verify.active;
   d["verify_job"] = verify.id;
   if (verify.active) {
@@ -1370,7 +1768,7 @@ DispatchResult storageDispatch(const CmdContext &ctx, const char *act, JsonObjec
     return requireAuth(ctx, false, err) ? actCaps(d) : DISPATCH_FAIL;
   }
   if (strcmp(act, "free") == 0) {
-    return requireAuth(ctx, false, err) ? actFree(d, err) : DISPATCH_FAIL;
+    return requireAuth(ctx, false, err) ? actFree(p, d, err) : DISPATCH_FAIL;
   }
   if (strcmp(act, "list") == 0) {
     return requireAuth(ctx, false, err) ? actList(p, d, err) : DISPATCH_FAIL;
@@ -1396,6 +1794,12 @@ DispatchResult storageDispatch(const CmdContext &ctx, const char *act, JsonObjec
     return requireAuth(ctx, true, err) ? actDelete(p, d, err) : DISPATCH_FAIL;
   }
 
+  // Destructive tier — ONE action, and it is above the mutating tier rather
+  // than in it. See the note above requirePhysical().
+  if (strcmp(act, "format") == 0) {
+    return requirePhysical(ctx, "'storage format'", err) ? actFormat(p, d, err) : DISPATCH_FAIL;
+  }
+
   if (strcmp(act, "status") == 0) {
     fillStatus(d);
     return DISPATCH_OK;
@@ -1403,7 +1807,7 @@ DispatchResult storageDispatch(const CmdContext &ctx, const char *act, JsonObjec
 
   cmdErrorf(err, "EUNKNOWN",
             "unknown action for module 'storage': \"%.16s\" "
-            "(caps/free/list/stat/read/write/mkdir/delete/verify/status)",
+            "(caps/free/list/stat/read/write/mkdir/delete/verify/format/status)",
             act);
   return DISPATCH_FAIL;
 }
@@ -1421,11 +1825,14 @@ void storageStatus(JsonObject d) { fillStatus(d); }
 // and `verify`'s "path|cancel:true" implied a choice the dispatch does not
 // enforce — cancel:true is checked FIRST and ignores path entirely.
 const ModuleParam PATH_ONLY[] = {
-    ModParam::str("path", true, "absolute path from the card root, e.g. \"/\" or \"/logs/run.txt\"."),
+    ModParam::str("path", true,
+                  "volume-prefixed path, e.g. \"/sd\", \"/sd/logs/run.txt\" or \"/fs/www/index.html.gz\". "
+                  "\"/sd\" and \"/fs\" are the volume roots; a trailing '/' is refused."),
 };
 
 const ModuleParam LIST_PARAMS[] = {
-    ModParam::str("path", true, "absolute directory path from the card root; \"/\" is the root."),
+    ModParam::str("path", true,
+                  "volume-prefixed directory path; \"/sd\" and \"/fs\" are the two volume roots."),
     ModParam::num("offset", false, "entries to skip; default 0. readdir has no seek, so this is reached by skipping.", 0,
                   (int32_t)LIST_MAX_OFFSET),
     ModParam::num("limit", false, "max entries in this page; default 32. Out-of-range values are CLAMPED, not rejected.",
@@ -1433,7 +1840,7 @@ const ModuleParam LIST_PARAMS[] = {
 };
 
 const ModuleParam READ_PARAMS[] = {
-    ModParam::str("path", true, "absolute file path from the card root."),
+    ModParam::str("path", true, "volume-prefixed file path, e.g. \"/sd/logs/run.txt\" or \"/fs/macros/a.json\"."),
     ModParam::num("offset", false, "byte offset to read from; default 0. File offsets here are 32-bit.", 0,
                   (int32_t)MAX_FILE_OFFSET),
     ModParam::num("len", false, "raw bytes to read; default and maximum are max_chunk (see the caps action). Larger is rejected.",
@@ -1441,7 +1848,7 @@ const ModuleParam READ_PARAMS[] = {
 };
 
 const ModuleParam WRITE_PARAMS[] = {
-    ModParam::str("path", true, "absolute file path from the card root."),
+    ModParam::str("path", true, "volume-prefixed file path, e.g. \"/sd/logs/run.txt\" or \"/fs/macros/a.json\"."),
     ModParam::str("data", true, "base64 of the bytes to write (padded, RFC 4648 §4). \"\" writes nothing."),
     ModParam::num("offset", false, "byte offset to write at; default 0. Writes must be contiguous — past EOF is refused.", 0,
                   (int32_t)MAX_FILE_OFFSET),
@@ -1449,7 +1856,7 @@ const ModuleParam WRITE_PARAMS[] = {
 };
 
 const ModuleParam DELETE_PARAMS[] = {
-    ModParam::str("path", true, "absolute path from the card root. The root \"/\" itself is refused."),
+    ModParam::str("path", true, "volume-prefixed path. A volume root (\"/sd\", \"/fs\") is refused."),
     ModParam::flag("recursive", false,
                    "delete a non-empty directory tree, bounded to 8 levels and 2000 entries. Without it, only a file "
                    "or an EMPTY directory is removed."),
@@ -1459,14 +1866,27 @@ const ModuleParam VERIFY_PARAMS[] = {
     // BOTH optional, and that is the honest description: actVerify checks
     // cancel FIRST and returns without looking at path, so neither is
     // unconditionally required and there is no "oneOf" in the dispatch.
-    ModParam::str("path", false, "absolute file path to hash. Required unless cancel is true, which is handled first."),
+    ModParam::str("path", false,
+                  "volume-prefixed file path to hash. Required unless cancel is true, which is handled first."),
     ModParam::flag("cancel", false, "cancel the RUNNING verify job instead of starting one; path is then ignored."),
 };
 
+const ModuleParam FREE_PARAMS[] = {
+    ModParam::str("volume", false, "\"sd\" or \"fs\"; omit to report every volume. Names the volume, not a path."),
+};
+
+const ModuleParam FORMAT_PARAMS[] = {
+    ModParam::str("volume", true, "\"fs\" — the LittleFS partition. \"sd\" is refused: the card must stay FAT32."),
+    ModParam::flag("confirm", true, "required second word. Without it nothing is erased and ECONFIRM is returned."),
+};
+
 const ModuleAction STORAGE_ACTIONS[] = {
-    {"caps", "transfer limits: max_chunk, max_path, encoding, crc32 format, listing and delete bounds", nullptr, 0},
-    {"free", "card type/size and total/used/free bytes (walks the FAT once if the FAT32 free count is stale)", nullptr,
-     0},
+    {"caps",
+     "transfer limits (max_chunk, max_path, crc32 format, listing/delete bounds) plus every volume, its mount state, "
+     "its own limits and its free space",
+     nullptr, 0},
+    {"free", "total/used/free per volume (walks the FAT for /sd if the FAT32 free count is stale)",
+     MOD_PARAMS(FREE_PARAMS)},
     {"list", "one PAGE of a directory; returns truncated + next_offset", MOD_PARAMS(LIST_PARAMS)},
     {"stat", "exists / is_dir / size / mtime for one path (a missing path is ok:true with exists:false)",
      MOD_PARAMS(PATH_ONLY)},
@@ -1477,23 +1897,35 @@ const ModuleAction STORAGE_ACTIONS[] = {
     {"delete", "delete a file, an EMPTY directory, or a bounded tree with recursive:true", MOD_PARAMS(DELETE_PARAMS)},
     {"verify", "crc32 a whole file (queued; progress + storage.verify.done events). cancel:true stops it",
      MOD_PARAMS(VERIFY_PARAMS)},
-    {"status", "mount state, failing bring-up stage, card/fs type, current verify job", nullptr, 0},
+    {"format",
+     "ERASE the whole /fs volume and remount it empty. USB console only (auth >= physical) and needs confirm:true. "
+     "The microSD is never formatted here",
+     MOD_PARAMS(FORMAT_PARAMS)},
+    {"status", "per-volume mount state, the failing bring-up stage for each, and the current verify job", nullptr, 0},
 };
 
 const ModuleDescriptor STORAGE_MODULE = {
     .id = "storage",
-    .name = "microSD",
+    .name = "Files (microSD + LittleFS)",
     .category = "storage",
     // SHARED, not exclusive: several readers of the card can coexist. `msc`
     // takes RES_SD EXCLUSIVE when it hands the raw block device to the host PC,
     // and that is what locks this module out — by arbitration, with neither
     // module naming the other. See claims.h.
+    //
+    // STILL ONLY RES_SD, even though this module now also serves /fs. LittleFS
+    // is not a contended resource: it is mounted at boot by fsmount.cpp and
+    // nothing else in the image wants it exclusively, so claiming it would
+    // invent a conflict that does not exist. The consequence — that `storage`
+    // holds RES_SD even when there is no card and it is serving /fs alone — is
+    // written up above storageEnable().
     .claims = Claims::claim(Claims::RES_SD, Claims::CLAIM_SHARED),
     // Off out of the box. Mounting the card costs time and holds RES_SD, and
     // exposing the user's files is opt-in.
     .defaultEnabled = false,
     // Nothing here binds at boot: SDMMC is a runtime peripheral, and both
-    // enable() and disable() really do mount and unmount.
+    // enable() and disable() really do mount and unmount. /fs is mounted at
+    // boot by Fs::begin() and is unaffected by either.
     .bootTimeBinding = false,
     .essential = false,
     .enable = storageEnable,

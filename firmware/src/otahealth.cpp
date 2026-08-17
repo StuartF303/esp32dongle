@@ -57,14 +57,21 @@ namespace {
 //     word-sized and naturally atomic on this core, so the worst case is one
 //     response reporting the phase from 250 ms ago. It calls
 //     registry.isEnabled(), which takes the registry's own lock.
-//   * confirmNow(), rollbackNow() and setBootNow() WRITE, and could in
-//     principle collide with a tick — except all three are AUTH_PHYSICAL
-//     (cmdauth.h OTA_MUTATE), i.e. CDC only, i.e. the loop task. A network
-//     session cannot reach them. (setBootNow() writes otadata rather than this
-//     state, and does not touch phase_ at all: which slot boots next is a
-//     different question from whether THIS image has proved itself.) If a
+//   * confirmNow() and rollbackNow() WRITE, and could in principle collide
+//     with a tick — except both are AUTH_PHYSICAL (cmdauth.h OTA_MUTATE), i.e.
+//     CDC only, i.e. the loop task. A network session cannot reach them. If a
 //     transport ever dispatches at PHYSICAL off-task, that changes and this
 //     note stops being true.
+//   * setBootNow() IS NOW CALLED OFF-TASK, by OtaUpload::run() on the HTTP
+//     server task when an upload asks to select the slot it just wrote
+//     (backlog S5). That is safe for a reason, not by luck: setBootNow()
+//     touches NONE of the state above. It reads the partition table, calls
+//     esp_ota_set_boot_partition() (which serialises its own otadata write
+//     internally) and emits on the bus — it never assigns phase_, ticks_,
+//     lastCriteria_ or decidedAtMs_, because which slot boots next is a
+//     different question from whether THIS image has proved itself. Keep it
+//     that way: adding a write to this file's state inside setBootNow() would
+//     introduce a genuine cross-core race with tick().
 //
 // The same trade activity.h makes (backlog C6), for the same reason: a mutex
 // here would buy nothing a stale read does not already tolerate.
