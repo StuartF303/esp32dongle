@@ -1,3 +1,30 @@
+# Stock LilyGO firmware — attribution and provenance
+
+**These binaries are not ours.** `bootloader.bin`, `partition-table.bin`, `app0.bin`, `spiffs.bin`,
+`otadata.bin`, `nvs.bin` and `coredump.bin` are a byte-for-byte capture of the firmware that
+**LilyGO** ships pre-installed on the T-Dongle-S3. The application is their `factory_screen`
+example, built by Lewis He on 12 Jun 2023.
+
+- Upstream source and the original firmware: <https://github.com/Xinyuan-LilyGO/T-Dongle-S3>
+- Copyright and licence: LilyGO / Xinyuan. Refer to that repository for terms.
+- Board vendor: <https://lilygo.cc>
+
+### Why it is in this repository
+
+The T-Dongle-S3 ships with **no OTA slot** — a single `app0` partition and nothing to fall back
+on. Reflashing it destroys the stock firmware permanently, and LilyGO does not publish a prebuilt
+binary image of it (only source, which will not rebuild bit-identically). This capture was taken
+from the device on 2026-08-15 **before anything was written to it**, and every region was verified
+against the hardware with `esptool verify-flash`.
+
+It is kept here so the device can always be returned to stock, and so anyone else who has already
+reflashed theirs can recover. `restore.sh` puts it all back; the round trip has been tested from a
+fully repartitioned device.
+
+If you are LilyGO and would prefer this not be redistributed, open an issue and it will be removed.
+
+---
+
 # T-Dongle-S3 factory firmware backup
 
 A complete, verified image of the firmware this **LilyGO T-Dongle-S3** shipped with,

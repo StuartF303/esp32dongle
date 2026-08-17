@@ -11,7 +11,7 @@ real on this board, and the obvious explanation was wrong more than once.
 ## Fast path
 
 ```bash
-cd ~/projects/usbdongle/firmware
+cd ~/projects/esp32dongle/firmware
 ~/.local/bin/pio run -d .              # build (guard scripts run first)
 ~/.local/bin/pio run -d . -t upload    # flash
 sleep 5                                # native USB re-enumerates after the reset
@@ -37,7 +37,7 @@ full path or the call fails with `command not found`.
 `tools/console.py` is the debug channel. Line-delimited JSON over native USB CDC.
 
 ```bash
-cd ~/projects/usbdongle/firmware
+cd ~/projects/esp32dongle/firmware
 uv run --with pyserial python tools/console.py info      # chip, MAC, IDF, running partition
 uv run --with pyserial python tools/console.py parts     # LIVE partition table off the device
 uv run --with pyserial python tools/console.py tasks     # scheduler table + worst-case runtimes
@@ -121,7 +121,7 @@ brickable. Hold BOOT (GPIO 0) while plugging in to force download mode.
 
 To return to factory firmware:
 ```bash
-cd ~/projects/usbdongle/backup/factory_release
+cd ~/projects/esp32dongle/backup/factory_release
 ./restore.sh --yes
 ```
 **Proven twice.** First on 2026-08-15 while the device was still factory-fresh, then again as a

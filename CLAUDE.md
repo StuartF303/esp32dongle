@@ -33,7 +33,7 @@ microSD ("TF", inside the USB-A shell) — **SDMMC 4-bit**, not SPI:
 Other: APA102 RGB LED on DI 40 / CI 39. Boot button GPIO 0. Broken-out header is just
 3V3, GPIO43 (TX), GPIO44 (RX), GND — two usable GPIOs.
 
-`T-Dongle-S3-schematic.pdf` (in this directory, from the LilyGO repo) confirms all of it:
+`hardware/T-Dongle-S3-schematic.pdf` (from from the LilyGO repo) confirms all of it:
 one combined **USB-3.0-TYPE-A-TF** connector carries both USB D+/D− and the six SD lines,
 the LCD is a 6-pin FPC, U3 is the W25Q flash, U5 the APA102. **No PSRAM part on the
 board** — visual confirmation of the eFuse/board-JSON finding. There is **no card-detect
@@ -147,7 +147,7 @@ gotchas. Captured 2026-08-15 while the device was still factory-fresh.
 
 ## Backlog
 
-`BACKLOG.md` holds work that was deliberately deferred, with the reasoning that deferred it —
+`docs/BACKLOG.md` holds work that was deliberately deferred, with the reasoning that deferred it —
 security gaps, known-but-accepted trade-offs, and planned modules. Read it before starting
 something new: several items are one-line fixes that are only cheap while the surrounding code
 is fresh, and one (built-in commands have no auth checks) becomes a real exposure the moment a
@@ -176,7 +176,7 @@ command sequence and every failure mode hit so far with its actual cause. Read i
 flashing rather than rediscovering them.
 
 No application code yet. Architecture and feature plan agreed 2026-08-15 — see
-`ARCHITECTURE.md`. Headlines:
+`docs/ARCHITECTURE.md`. Headlines:
 
 - Transport-agnostic command bus; USB CDC, HTTP/WebSocket and BLE GATT are adapters onto it.
 - **ESP32-S3 is BLE-only** (no Bluetooth Classic, no SPP/PAN), and iOS has no Web Bluetooth,
