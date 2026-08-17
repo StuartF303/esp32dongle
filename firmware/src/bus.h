@@ -11,10 +11,36 @@
 // into whatever framing it uses. Emitting therefore costs one indirect call
 // per sink plus whatever that sink does.
 //
-// Threading: sinks are registered once at boot (Console::begin() and friends)
-// and the table is never mutated afterwards, so reads need no lock. emit()
-// itself is only as thread-safe as the sinks are — a sink writing to Serial
-// from two tasks at once is the sink's problem, not the bus's.
+// ---- THREADING (revised for W2's HTTP transport) ------------------------
+//
+// Until W2 there was one task in the system and this was a non-question. There
+// are now two: the Arduino loop task (priority 1) and esp_http_server's own
+// task (priority 5). A command arriving over HTTP is dispatched on the HTTP
+// task, so a module can emit() from EITHER, concurrently.
+//
+// What is guaranteed here:
+//   * emit() is safe to call from any task, concurrently with other emit()s
+//     and with addSink(). The table is append-only and a sink pointer is
+//     published (release) before the count that exposes it is incremented
+//     (acquire on the read side), so a sink is never called half-registered.
+//   * addSink() is safe against a concurrent addSink() — it takes a spinlock —
+//     and is idempotent per sink pointer.
+//
+// What is NOT guaranteed, and callers must handle:
+//   * A SINK MAY RUN ON TWO TASKS AT ONCE. Nothing here serialises sinks. A
+//     sink that writes to a shared byte stream must lock internally (console.cpp
+//     does exactly that, or two JSON lines interleave on the CDC console and
+//     both become unparseable).
+//   * A sink is never REMOVED — there is no removeSink(), deliberately, because
+//     removal would need to be safe against an emit() already in flight on
+//     another core. A transport that can be disabled therefore keeps its sink
+//     registered for the life of the image and makes the sink itself a no-op
+//     while it is down (mod_http.cpp).
+//   * Ordering between events emitted from different tasks is whatever the
+//     scheduler does. Events carrying a sequence have to carry it themselves.
+//   * A sink runs on the EMITTER's task, with whatever locks the emitter holds.
+//     Modules emit from inside a registry-locked dispatch, so a sink must not
+//     block for long and must not call back into the registry.
 
 #pragma once
 

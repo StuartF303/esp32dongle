@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <ctype.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <esp_app_desc.h>
 #include <esp_chip_info.h>
 #include <esp_mac.h>
@@ -55,9 +57,30 @@ struct Command {
   CommandHandler handler;
 };
 
+// Serialises access to Serial for WHOLE lines.
+//
+// W2 made this necessary: Bus::emit() can now run on the HTTP server task (a
+// module dispatched from POST /api/cmd emits an event), while the loop task is
+// half-way through writing a heartbeat event or a command response. Serial is
+// a byte stream with no framing of its own, so two interleaved writes produce
+// one corrupt line and every host-side line parser — tools/console.py
+// included — chokes on it. serializeJson() makes many small write() calls, so
+// the window is wide, not theoretical.
+//
+// Non-recursive: nothing here writes a line from inside a line. Created in
+// begin(); a null handle degrades to no locking rather than crashing, matching
+// the registry's stance.
+SemaphoreHandle_t txLock = nullptr;
+
 void sendLine(JsonDocument &doc) {
+  if (txLock != nullptr) {
+    xSemaphoreTake(txLock, portMAX_DELAY);
+  }
   serializeJson(doc, Serial);
   Serial.print('\n');
+  if (txLock != nullptr) {
+    xSemaphoreGive(txLock);
+  }
 }
 
 void sendErrorNoId(const char *code, const char *msg) {
@@ -260,40 +283,10 @@ DispatchResult renderActionResult(const char *id, const ModuleActionResult &r, J
   return DISPATCH_FAIL;
 }
 
-// The exact shape GET /api/modules will serve.
+// The exact shape GET /api/modules serves — literally, since W2: mod_http.cpp
+// calls Console::fillModules() rather than re-rendering the registry itself.
 DispatchResult cmdModules(const CmdContext &, JsonObjectConst, JsonObject d, JsonObject, CmdError *) {
-  registry.list(d["modules"].to<JsonArray>());
-
-  // What the persisted enable-set did at boot. A persisted combination that
-  // is no longer satisfiable is skipped rather than fatal, so this is the
-  // only place it surfaces.
-  const ModuleRestoreReport &rr = registry.restoreReport();
-  JsonObject boot = d["boot"].to<JsonObject>();
-  boot["nvs"] = rr.nvsRead ? "read" : "empty";
-  boot["nvs_write_ok"] = rr.nvsWriteOk;
-  if (rr.nvsTooLong) {
-    // Distinct from "nothing is enabled", which is what this used to look
-    // like: the stored string did not fit the read buffer, so NOTHING was
-    // restored and the next explicit enable/disable will overwrite it.
-    boot["nvs_too_long"] = true;
-    boot["nvs_stored_len"] = rr.nvsStoredLen;
-  }
-  JsonArray restored = boot["restored"].to<JsonArray>();
-  for (uint8_t i = 0; i < rr.restoredCount; i++) {
-    restored.add(rr.restored[i]);
-  }
-  JsonArray skipped = boot["skipped"].to<JsonArray>();
-  for (uint8_t i = 0; i < rr.skippedCount; i++) {
-    skipped.add(rr.skipped[i]);
-  }
-  JsonArray unknown = boot["unknown"].to<JsonArray>();
-  for (uint8_t i = 0; i < rr.unknownCount; i++) {
-    unknown.add(rr.unknown[i]);
-  }
-  JsonArray armed = boot["armed"].to<JsonArray>();
-  for (uint8_t i = 0; i < rr.armedCount; i++) {
-    armed.add(rr.armed[i]);
-  }
+  Console::fillModules(d);
   return DISPATCH_OK;
 }
 
@@ -413,104 +406,20 @@ const Command *findCommand(const char *name) {
 
 // ---- request handling --------------------------------------------------
 
+// The CDC transport's use of the shared core. Everything CDC-specific lives
+// here: the AUTH_PHYSICAL context (someone with the cable in their hand can
+// already reflash the device, so gating them lower would be theatre), writing
+// the line, and the reboot flush.
 void dispatch(JsonObjectConst req) {
-  JsonVariantConst idVar = req["id"];
-  const char *act = req["act"] | (const char *)nullptr;
-  JsonObjectConst params = req["p"];
-
   JsonDocument resp;
-  if (!idVar.isNull()) {
-    resp["id"] = idVar;
-  }
-
-  if (!act) {
-    resp["ok"] = false;
-    JsonObject e = resp["e"].to<JsonObject>();
-    e["code"] = "ENOACT";
-    e["msg"] = "missing \"act\"";
-    sendLine(resp);
-    return;
-  }
-
-  // Who is asking. USB CDC is AUTH_PHYSICAL: someone with the cable in their
-  // hand can already reflash the device, so gating them below that level would
-  // be theatre. W2's Wi-Fi and BLE adapters pass AUTH_NONE until a session
-  // token is presented, and modules — not transports — decide what that buys.
-  CmdContext ctx;
-  ctx.transport = "cdc";
-  ctx.authLevel = AUTH_PHYSICAL;
-  ctx.reqId = idVar.is<uint32_t>() ? idVar.as<uint32_t>() : 0;
-
-  // A request carrying "mod" is aimed at a module, not at a built-in command.
-  // The registry answers ENOMOD / EDISABLED / EREBOOT (all naming the module)
-  // before the module's own dispatch is ever reached.
-  const char *mod = req["mod"] | (const char *)nullptr;
-  const Command *cmd = nullptr;
-  if (mod == nullptr) {
-    cmd = findCommand(act);
-    if (!cmd) {
-      resp["ok"] = false;
-      JsonObject e = resp["e"].to<JsonObject>();
-      e["code"] = "EUNKNOWN";
-      e["msg"] = String("unknown command: ") + act;
-      sendLine(resp);
-      return;
-    }
-  }
-
-  // Both `e` and `d` are created up front and the unused one removed, so a
-  // failing handler can attach machine-readable detail to `e` (see the
-  // CommandHandler contract above). "ok" is inserted first, and `e` before
-  // `d`, purely to keep the wire order that ARCHITECTURE.md section 2 shows —
-  // {"id","ok","d"} on success, {"id","ok","e","d"} on failure. ArduinoJson
-  // emits members in insertion order.
-  resp["ok"] = false;
-  JsonObject err = resp["e"].to<JsonObject>();
-  JsonObject data = resp["d"].to<JsonObject>();
-  // Placeholders, for the same insertion-order reason: an error object always
-  // reads {"code","msg",...} with any handler-supplied extras after, never
-  // with code/msg buried at the end.
-  err["code"] = "EFAIL";
-  err["msg"] = "command failed";
-
-  CmdError cerr;
-  cerr.code = nullptr;
-  cerr.msg[0] = '\0';
-  DispatchResult res = (mod != nullptr) ? registry.dispatch(mod, act, ctx, params, data, &cerr)
-                                        : cmd->handler(ctx, params, data, err, &cerr);
-
-  if (res == DISPATCH_FAIL) {
-    // Fill `e` before removing anything, so nothing is added to the document
-    // between a removal and a read of the handle it might have recycled.
-    err["code"] = cerr.code ? cerr.code : "EFAIL";
-    err["msg"] = cerr.msg[0] ? cerr.msg : "command failed";
-    resp["ok"] = false;
-    // KEEP a non-empty `d` on an error: partial results and diagnostic counts
-    // are exactly what a failure needs to carry. Only an empty `d` is dropped,
-    // and only to keep the common error response tight.
-    if (data.size() == 0) {
-      resp.remove("d");
-    }
-  } else {
-    resp.remove("e");
-    resp["ok"] = true;
-    // ACCEPTED: the work was queued and `d` describes the job. The completion
-    // arrives later as an event carrying the same id (see bus.h). Reported
-    // separately from OK so a caller knows to wait for it.
-    if (res == DISPATCH_ACCEPTED) {
-      resp["accepted"] = true;
-    }
-  }
-
+  bool restartNow = Console::execute(req, AUTH_PHYSICAL, "cdc", resp);
   sendLine(resp);
 
-  // `mod == nullptr` matters: without it, a future module with a "reboot"
-  // action would restart the chip as a side effect of its own command.
-  if (res == DISPATCH_OK && mod == nullptr && strcmp(act, "reboot") == 0) {
+  if (restartNow) {
     // Terminal action, not a scheduler task: the loop is ending for good, so
-    // the "never delay() in the main path" rule doesn't apply here. This
-    // gives the USB CDC TX queue a moment to actually get the response out
-    // before the chip resets.
+    // the "never delay() in the main path" rule doesn't apply here. This gives
+    // the USB CDC TX queue a moment to actually get the response out before
+    // the chip resets.
     Serial.flush();
     delay(100);
     esp_restart();
@@ -590,7 +499,143 @@ namespace Console {
 void begin() {
   lineLen = 0;
   lineOverflowed = false;
+  if (txLock == nullptr) {
+    txLock = xSemaphoreCreateMutex();
+  }
   Bus::addSink(eventSink);
+}
+
+// ---- the shared request -> response core --------------------------------
+//
+// See console.h for the contract. This is the ONLY dispatcher in the image;
+// CDC, HTTP and (later) BLE all funnel through it, which is what makes "the
+// REST mirror cannot drift from the console" a structural property rather than
+// a promise.
+bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, JsonDocument &resp) {
+  resp.clear();
+
+  JsonVariantConst idVar = req["id"];
+  const char *act = req["act"] | (const char *)nullptr;
+  JsonObjectConst params = req["p"];
+
+  if (!idVar.isNull()) {
+    resp["id"] = idVar;
+  }
+
+  if (!act) {
+    resp["ok"] = false;
+    JsonObject e = resp["e"].to<JsonObject>();
+    e["code"] = "ENOACT";
+    e["msg"] = "missing \"act\"";
+    return false;
+  }
+
+  // Who is asking. The transport decides; modules — not transports — decide
+  // what a level buys (see mod_storage.cpp's requireAuth).
+  CmdContext ctx;
+  ctx.transport = (transport != nullptr) ? transport : "?";
+  ctx.authLevel = authLevel;
+  ctx.reqId = idVar.is<uint32_t>() ? idVar.as<uint32_t>() : 0;
+
+  // A request carrying "mod" is aimed at a module, not at a built-in command.
+  // The registry answers ENOMOD / EDISABLED / EREBOOT (all naming the module)
+  // before the module's own dispatch is ever reached.
+  const char *mod = req["mod"] | (const char *)nullptr;
+  const Command *cmd = nullptr;
+  if (mod == nullptr) {
+    cmd = findCommand(act);
+    if (!cmd) {
+      resp["ok"] = false;
+      JsonObject e = resp["e"].to<JsonObject>();
+      e["code"] = "EUNKNOWN";
+      e["msg"] = String("unknown command: ") + act;
+      return false;
+    }
+  }
+
+  // Both `e` and `d` are created up front and the unused one removed, so a
+  // failing handler can attach machine-readable detail to `e` (see the
+  // CommandHandler contract above). "ok" is inserted first, and `e` before
+  // `d`, purely to keep the wire order that ARCHITECTURE.md section 2 shows —
+  // {"id","ok","d"} on success, {"id","ok","e","d"} on failure. ArduinoJson
+  // emits members in insertion order.
+  resp["ok"] = false;
+  JsonObject err = resp["e"].to<JsonObject>();
+  JsonObject data = resp["d"].to<JsonObject>();
+  // Placeholders, for the same insertion-order reason: an error object always
+  // reads {"code","msg",...} with any handler-supplied extras after, never
+  // with code/msg buried at the end.
+  err["code"] = "EFAIL";
+  err["msg"] = "command failed";
+
+  CmdError cerr;
+  cerr.code = nullptr;
+  cerr.msg[0] = '\0';
+  DispatchResult res = (mod != nullptr) ? registry.dispatch(mod, act, ctx, params, data, &cerr)
+                                        : cmd->handler(ctx, params, data, err, &cerr);
+
+  if (res == DISPATCH_FAIL) {
+    // Fill `e` before removing anything, so nothing is added to the document
+    // between a removal and a read of the handle it might have recycled.
+    err["code"] = cerr.code ? cerr.code : "EFAIL";
+    err["msg"] = cerr.msg[0] ? cerr.msg : "command failed";
+    resp["ok"] = false;
+    // KEEP a non-empty `d` on an error: partial results and diagnostic counts
+    // are exactly what a failure needs to carry. Only an empty `d` is dropped,
+    // and only to keep the common error response tight.
+    if (data.size() == 0) {
+      resp.remove("d");
+    }
+  } else {
+    resp.remove("e");
+    resp["ok"] = true;
+    // ACCEPTED: the work was queued and `d` describes the job. The completion
+    // arrives later as an event carrying the same id (see bus.h). Reported
+    // separately from OK so a caller knows to wait for it.
+    if (res == DISPATCH_ACCEPTED) {
+      resp["accepted"] = true;
+    }
+  }
+
+  // `mod == nullptr` matters: without it, a future module with a "reboot"
+  // action would restart the chip as a side effect of its own command. The
+  // restart itself belongs to the transport — only it knows how to flush.
+  return res == DISPATCH_OK && mod == nullptr && strcmp(act, "reboot") == 0;
+}
+
+void fillModules(JsonObject d) {
+  registry.list(d["modules"].to<JsonArray>());
+
+  // What the persisted enable-set did at boot. A persisted combination that
+  // is no longer satisfiable is skipped rather than fatal, so this is the
+  // only place it surfaces.
+  const ModuleRestoreReport &rr = registry.restoreReport();
+  JsonObject boot = d["boot"].to<JsonObject>();
+  boot["nvs"] = rr.nvsRead ? "read" : "empty";
+  boot["nvs_write_ok"] = rr.nvsWriteOk;
+  if (rr.nvsTooLong) {
+    // Distinct from "nothing is enabled", which is what this used to look
+    // like: the stored string did not fit the read buffer, so NOTHING was
+    // restored and the next explicit enable/disable will overwrite it.
+    boot["nvs_too_long"] = true;
+    boot["nvs_stored_len"] = rr.nvsStoredLen;
+  }
+  JsonArray restored = boot["restored"].to<JsonArray>();
+  for (uint8_t i = 0; i < rr.restoredCount; i++) {
+    restored.add(rr.restored[i]);
+  }
+  JsonArray skipped = boot["skipped"].to<JsonArray>();
+  for (uint8_t i = 0; i < rr.skippedCount; i++) {
+    skipped.add(rr.skipped[i]);
+  }
+  JsonArray unknown = boot["unknown"].to<JsonArray>();
+  for (uint8_t i = 0; i < rr.unknownCount; i++) {
+    unknown.add(rr.unknown[i]);
+  }
+  JsonArray armed = boot["armed"].to<JsonArray>();
+  for (uint8_t i = 0; i < rr.armedCount; i++) {
+    armed.add(rr.armed[i]);
+  }
 }
 
 void poll() {

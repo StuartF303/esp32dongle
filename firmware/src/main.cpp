@@ -17,6 +17,7 @@
 #include "led.h"
 #include "mod_cdc.h"
 #include "mod_hid.h"
+#include "mod_http.h"
 #include "mod_led.h"
 #include "mod_storage.h"
 #include "partition_info.h"
@@ -172,6 +173,11 @@ void setup() {
   // really do mount and unmount — and not defaultEnabled, so a fresh device
   // does not expose the card's contents until asked.
   addModule(storageModuleDescriptor());
+  // `http` is the Wi-Fi SoftAP + HTTP/WebSocket transport. NOT defaultEnabled:
+  // it only broadcasts an AP when someone asks it to. It is also the first
+  // consumer that runs on a task other than this one — see the threading note
+  // at the top of mod_http.cpp and the one in registry.h.
+  addModule(httpModuleDescriptor());
 
   // Applies each descriptor's defaultEnabled on a virgin NVS, and SEALS the
   // registry — no module may register after this.
@@ -199,6 +205,12 @@ void setup() {
   // Not a module tick: the console must keep answering even if the `cdc`
   // module were somehow off, or a mistake would be unrecoverable over USB.
   addTask("console.poll", 0, Console::poll);
+  // Also not a module tick, and for a sharper reason: it finishes a deferred
+  // HTTP shutdown, which calls httpd_stop() — a JOIN on the server task. A
+  // module tick runs inside the registry lock (Registry::tickAt), and joining a
+  // task that may be blocked on that lock is a deadlock. This runs outside it.
+  // See mod_http.h.
+  addTask("http.poll", 20, httpTransportPoll);
 
   Serial.println();
   Serial.println("setup() complete — entering scheduler loop. Try: help");
