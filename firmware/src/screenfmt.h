@@ -147,6 +147,34 @@ inline size_t compactBytes(char *dst, size_t cap, uint32_t bytes) {
   return ((size_t)n < cap) ? (size_t)n : cap - 1;
 }
 
+// ---- the HID badge state (backlog C3) -----------------------------------
+//
+// Three states, not two. The badge used to track LIVE state only
+// (Registry::enabledAt), which left the most alarming case of all invisible:
+// with `enable` sitting at AUTH_TOKEN, a network session CAN arm `hid` — it
+// simply cannot reboot to bind it (`reboot` is AUTH_PHYSICAL, cmdauth.h). So
+// the keyboard appears at the NEXT power-cycle, potentially with nothing
+// connecting the two events. The screen is what connects them.
+//
+// The rule, and the reason it is a function rather than three lines inside a
+// switch in mod_display.cpp: `pio test -e native` cannot compile that file, and
+// the precedence below is a judgement, not an obvious truth.
+//
+//   live                -> HID_LIVE.  Keystrokes can be injected RIGHT NOW.
+//   armed && !live      -> HID_ARMED. Binds at the next boot.
+//   !armed && live      -> HID_LIVE.  Disarmed since boot, but the interface is
+//                                     STILL BOUND, so the host still has a
+//                                     keyboard. Live wins: the badge reports
+//                                     the hazard, not the intent.
+//   neither             -> HID_OFF.
+enum HidBadge : uint8_t {
+  HID_OFF = 0,
+  HID_LIVE = 1,
+  HID_ARMED = 2,
+};
+
+inline HidBadge hidBadge(bool armed, bool live) { return live ? HID_LIVE : (armed ? HID_ARMED : HID_OFF); }
+
 }  // namespace ScreenFmt
 
 // ===========================================================================

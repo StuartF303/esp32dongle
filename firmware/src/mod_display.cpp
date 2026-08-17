@@ -199,7 +199,10 @@ struct World {
   uint8_t clients;
   uint8_t sessions;
   char mods[48];
-  bool hidOn;
+  // LIVE and INTENT, kept apart: hidArmed && !hidLive is "armed, binds at the
+  // next boot", which is a different badge (backlog C3). See ScreenFmt::hidBadge.
+  bool hidLive;
+  bool hidArmed;
   uint32_t heapFree;
   uint32_t heapMin;
   uint32_t heapMaxBlock;
@@ -293,18 +296,24 @@ void sampleWorld() {
   // Enabled modules, from the registry's own accessors. `display` is left out
   // (a lit screen is its own evidence) and `hid` is left out of the text
   // because it gets a badge of its own instead — a keystroke injector being
-  // live is not something to render as the fourth word on a grey line.
+  // live, or one boot away from live, is not something to render as the fourth
+  // word on a grey line.
   size_t used = 0;
   for (uint8_t i = 0; i < registry.count(); i++) {
-    if (!registry.enabledAt(i)) {
-      continue;
-    }
     const ModuleDescriptor *m = registry.at(i);
     if (m == nullptr || m->id == nullptr) {
       continue;
     }
+    // `hid` is read BEFORE the enabled filter, not after: an armed-but-unbound
+    // hid is NOT enabled (the registry only records the intent until the next
+    // boot), so the old "skip everything disabled" loop could never see the
+    // state this badge exists to show.
     if (strcmp(m->id, "hid") == 0) {
-      w.hidOn = true;
+      w.hidLive = registry.enabledAt(i);
+      w.hidArmed = registry.armedAt(i);
+      continue;
+    }
+    if (!registry.enabledAt(i)) {
       continue;
     }
     if (strcmp(m->id, "display") == 0) {
@@ -340,6 +349,9 @@ void sampleWorld() {
 constexpr uint32_t AUX_AUTH_BLANK = 0;
 constexpr uint32_t AUX_AUTH_PIN = 1;
 constexpr uint32_t AUX_AUTH_PAIRED = 2;
+// REG_MODS's aux is a ScreenFmt::HidBadge (screenfmt.h) — OFF / LIVE / ARMED.
+// It is in the cache key, so arming `hid` from a phone dirties the region and
+// the badge appears within one tick, without a full redraw.
 
 uint8_t animFrame(uint32_t now) { return (uint8_t)((now / ANIM_MS) & 3u); }
 
@@ -428,9 +440,13 @@ void buildStatus(uint8_t region, uint32_t now, char *out, size_t cap, uint32_t *
     }
 
     case REG_MODS: {
-      size_t cols = world_.hidOn ? COLS_MODS_HID : COLS_X2;
+      // Both badge states occupy the SAME 22 px on the right, so the text
+      // budget is the same for either and COLS_MODS_HID stays the one number
+      // that has to agree with the drawing code below.
+      ScreenFmt::HidBadge badge = ScreenFmt::hidBadge(world_.hidArmed, world_.hidLive);
+      size_t cols = (badge == ScreenFmt::HID_OFF) ? COLS_X2 : COLS_MODS_HID;
       ScreenFmt::fitPrefixed(out, cap, "on: ", world_.mods, cols);
-      *aux = world_.hidOn ? 1u : 0u;
+      *aux = (uint32_t)badge;
       break;
     }
 
@@ -595,12 +611,26 @@ void drawRegion(uint8_t r) {
     case REG_MODS:
       tft.fillRect(q.x, q.y, q.w, q.h, C_BG);
       drawText(2, (int16_t)(q.y + 2), text, C_DIM, 1);
-      if (aux) {
-        // hid is live: keystrokes can be injected into the host PC right now.
-        // ARCHITECTURE.md section 4 makes that reboot-gated and never
-        // default-enabled; this is the outward sign that it happened.
+      // Badge geometry, once: x from W-22 to W-1 (22 px), the full region
+      // height, text 2 px inside at size 1 — "HID" is 3 * CHAR_W = 18 px, so it
+      // clears the right-hand edge by 2 px and the outlined variant's border by
+      // 1 px on every side.
+      if (aux == (uint32_t)ScreenFmt::HID_LIVE) {
+        // SOLID RED. hid is live: keystrokes can be injected into the host PC
+        // right now. ARCHITECTURE.md section 4 makes that reboot-gated and
+        // never default-enabled; this is the outward sign that it happened.
         tft.fillRect((int16_t)(W - 22), q.y, 22, q.h, C_ALERT);
         drawText((int16_t)(W - 20), (int16_t)(q.y + 2), "HID", ST77XX_BLACK, 1);
+      } else if (aux == (uint32_t)ScreenFmt::HID_ARMED) {
+        // HOLLOW YELLOW. Armed but not bound: nothing can be typed until the
+        // device is power-cycled, and then it can. Deliberately unlike BOTH
+        // neighbours in the state space — not the absence of a badge, and not
+        // the solid red block — because the difference that matters is "already
+        // dangerous" versus "dangerous after the next reboot". Outline rather
+        // than fill says the same thing in shape as well as colour, for anyone
+        // reading it across a room or on a photograph.
+        tft.drawRect((int16_t)(W - 22), q.y, 22, q.h, C_WARN);
+        drawText((int16_t)(W - 20), (int16_t)(q.y + 2), "HID", C_WARN, 1);
       }
       break;
 

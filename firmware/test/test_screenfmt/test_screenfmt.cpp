@@ -225,6 +225,28 @@ void test_dirty_zero_regions_is_inert() {
   TEST_ASSERT_EQUAL_UINT8(0, Dirty::takeNext(r));
 }
 
+// ---- ScreenFmt::hidBadge (backlog C3) ------------------------------------
+
+void test_hidbadge_off_when_neither_armed_nor_live() {
+  TEST_ASSERT_EQUAL_UINT8(ScreenFmt::HID_OFF, ScreenFmt::hidBadge(false, false));
+}
+
+void test_hidbadge_armed_is_its_own_state_not_off() {
+  // THE POINT OF C3. Armed but not bound: nothing can be typed yet, and the
+  // keyboard appears at the next power-cycle. Rendering that as "off" is what
+  // made an `enable hid` from a phone invisible until it was too late.
+  TEST_ASSERT_EQUAL_UINT8(ScreenFmt::HID_ARMED, ScreenFmt::hidBadge(true, false));
+  TEST_ASSERT_TRUE(ScreenFmt::hidBadge(true, false) != ScreenFmt::hidBadge(false, false));
+  TEST_ASSERT_TRUE(ScreenFmt::hidBadge(true, false) != ScreenFmt::hidBadge(true, true));
+}
+
+void test_hidbadge_live_wins_over_intent_in_both_directions() {
+  TEST_ASSERT_EQUAL_UINT8(ScreenFmt::HID_LIVE, ScreenFmt::hidBadge(true, true));
+  // Disarmed since boot but STILL BOUND: the host still has a keyboard until
+  // the next restart, so the badge must report the hazard, not the intent.
+  TEST_ASSERT_EQUAL_UINT8(ScreenFmt::HID_LIVE, ScreenFmt::hidBadge(false, true));
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_fit_passes_short_strings_through);
@@ -247,5 +269,8 @@ int main(int, char **) {
   RUN_TEST(test_dirty_takenext_is_round_robin_not_lowest_first);
   RUN_TEST(test_dirty_takenext_wraps_the_cursor);
   RUN_TEST(test_dirty_zero_regions_is_inert);
+  RUN_TEST(test_hidbadge_off_when_neither_armed_nor_live);
+  RUN_TEST(test_hidbadge_armed_is_its_own_state_not_off);
+  RUN_TEST(test_hidbadge_live_wins_over_intent_in_both_directions);
   return UNITY_END();
 }

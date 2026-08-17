@@ -10,17 +10,20 @@ for verified hardware facts.
 
 ## Security — do before this leaves your desk
 
-**S1. Built-in commands have no auth checks at all.**
-`info`, `parts`, `mem`, `uptime`, `tasks`, `bootprobe`, `reboot` are dispatched without ever
-consulting `ctx.authLevel`; only *modules* check. Nothing is exposed today because
-`mod_http.cpp` returns 401 before dispatching, but that makes the HTTP transport the only thing
-holding the line, and the design says modules decide their own auth. Any future transport that
-dispatches at `AUTH_NONE` — BLE is next — instantly exposes `reboot` and full hardware detail to
-an unauthenticated stranger. Gate the built-ins, then let transports dispatch honestly.
+**S6. Module-side actions still have no auth check.**
+S1 gated the built-ins; several module actions remain open by their own choice: `led.set`,
+`led.auto`, `hid.status`, `storage.status`, `display.status`, `display.screen`, `display.refresh`.
+None are exposed today (HTTP still 401s pre-dispatch), but they are the same class as S1 and will
+matter the moment BLE dispatches at `AUTH_NONE`. `hid.status` in particular tells a stranger
+whether the dongle is currently a keyboard.
 
-**S2. `reboot` is reachable at `AUTH_TOKEN` over the network.**
-A phone with a valid session can restart the device. Probably fine for a personal tool; decide
-deliberately rather than by omission. Related to S1.
+**S7. `Registry::dispatch()` answers before the module's gate.**
+`ENOMOD` / `EDISABLED` / `EREBOOT` are returned prior to the module's own auth check, so the
+module map and each module's enabled state are readable at any auth level.
+
+**S8. `led` alias and `led` module now disagree.**
+The `led` built-in is `AUTH_TOKEN` after S1; `{"mod":"led","act":"set"}` is ungated. Same
+capability, two different bars. Reconcile in whichever direction you prefer.
 
 **S3. The AP passphrase is a public secret, by choice.**
 `pass-a9d8` is derivable from the broadcast SSID, and WPA2-PSK has no forward secrecy against a
@@ -53,10 +56,6 @@ for stuart to decide.
 So an unauthenticated client cannot discover the limits it is required to negotiate against
 (`max_chunk`, `max_path`). Defensible, slightly awkward; `caps` is the one action worth
 considering at `AUTH_NONE`.
-
-**C3. `hid` armed-but-pending-reboot is invisible on the LCD.**
-The HID badge tracks *live* state. "Armed, reboots into a keyboard" arguably deserves a warning
-glyph too — that is exactly the state worth noticing from across the room.
 
 **C4. Deferred-teardown window in `disable http`.**
 In the contended case the module reports disabled and `RES_WIFI` is released up to 20 ms before
@@ -137,6 +136,18 @@ and the native tests already cover the security-critical path sanitisation.
 ---
 
 ## Resolved, kept for the reasoning
+
+- **S1 — built-in commands had no auth check.** Done 2026-08-17. Gated centrally in
+  `Console::execute` from a single `.rodata` policy table, enforced BEFORE `findCommand()` so an
+  unauthenticated caller cannot tell `EAUTH` from `EUNKNOWN` and enumerate the surface. Unlisted
+  commands fail closed at `PHYSICAL`. That is the property BLE relies on to dispatch honestly at
+  `AUTH_NONE`.
+- **S2 — `reboot` over the network.** Closed as a side effect of S1: `reboot` is `AUTH_PHYSICAL`
+  and a network session can never reach that level, by design.
+- **C3 — armed-but-pending `hid` invisible.** Done 2026-08-17: hollow yellow badge, distinct from
+  both solid-red live and no badge. This is the agreed mitigation for stuart's S1 choice that
+  arming stays at `AUTH_TOKEN` — a session can arm the keyboard but not reboot to bind it, so the
+  screen is what makes a pending arm visible rather than it landing silently at the next power-up.
 
 - **LCD ownership vs the PIN.** An out-of-band channel a client can draw on is not out-of-band.
   Resolved 2026-08-17: the screen is entirely device-owned, no draw/text/image action exists, and

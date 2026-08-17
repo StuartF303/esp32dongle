@@ -55,11 +55,18 @@ void begin();
 // CDC-specific.
 //
 // `authLevel` is an AuthLevel (registry.h) and `transport` is the name that
-// reaches CmdContext — "cdc" (AUTH_PHYSICAL), "http"/"ws" (AUTH_TOKEN). NOTE
-// that the BUILT-IN commands do not gate themselves on authLevel; only modules
-// do. A transport that admits unauthenticated callers must therefore refuse
-// them itself before calling this, or `info`/`parts`/`reboot` are open to
-// anyone. mod_http.cpp does exactly that.
+// reaches CmdContext — "cdc" (AUTH_PHYSICAL), "http"/"ws" (AUTH_TOKEN).
+//
+// THE BUILT-INS NOW GATE THEMSELVES (backlog S1, 2026-08-17). Every command in
+// the table carries a minimum AuthLevel from CmdAuth::BUILTINS (cmdauth.h) —
+// `reboot` at AUTH_PHYSICAL, everything else at AUTH_TOKEN, nothing at
+// AUTH_NONE — and this function enforces it centrally before any handler runs.
+// Modules continue to gate themselves as before.
+//
+// So A TRANSPORT MAY DISPATCH AT AUTH_NONE. It will get an EAUTH response
+// indistinguishable from a module's, not a hardware detail or a restart. That
+// is the property the BLE adapter is meant to rely on; mod_http.cpp's 401 is
+// kept as defence in depth rather than as the only defence.
 //
 // Returns TRUE when the request was a successful built-in `reboot`, meaning
 // the caller must flush its transport and then esp_restart(). The restart is

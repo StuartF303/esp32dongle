@@ -16,6 +16,7 @@
 
 #include "bus.h"
 #include "claims_selftest.h"
+#include "cmdauth.h"
 #include "partition_info.h"
 #include "protocol.h"
 #include "bootprobe.h"
@@ -55,7 +56,20 @@ struct Command {
   const char *name;
   const char *help;
   CommandHandler handler;
+  // The AuthLevel a caller must hold for `handler` to run at all. Enforced in
+  // execute() BEFORE the handler is called — see the gate there — so no
+  // built-in checks auth for itself and none of them can forget to. The value
+  // comes from CmdAuth::requiredFor(), which is the single source of truth for
+  // the policy (cmdauth.h).
+  uint8_t minAuth;
 };
+
+// CmdAuth cannot include registry.h (it would stop being host-testable), so it
+// carries its own copies of the three levels. These are the only thing keeping
+// the two definitions the same value.
+static_assert(CmdAuth::NONE == AUTH_NONE, "CmdAuth::NONE has drifted from AuthLevel");
+static_assert(CmdAuth::TOKEN == AUTH_TOKEN, "CmdAuth::TOKEN has drifted from AuthLevel");
+static_assert(CmdAuth::PHYSICAL == AUTH_PHYSICAL, "CmdAuth::PHYSICAL has drifted from AuthLevel");
 
 // Serialises access to Serial for WHOLE lines.
 //
@@ -108,8 +122,10 @@ void eventSink(const char *name, Bus::FillFn fill, void *ctx) {
 
 // ---- handlers --------------------------------------------------------
 
-extern const Command COMMANDS[];
-extern const size_t COMMAND_COUNT;
+// Defined after the COMMANDS table, which it walks — the table cannot be
+// forward-declared any more (it is constexpr, so the static_asserts below it
+// can read it), so the FUNCTION is forward-declared instead.
+DispatchResult cmdHelp(const CmdContext &ctx, JsonObjectConst p, JsonObject d, JsonObject e, CmdError *err);
 
 // Reports what the static-constructor probe observed. See bootprobe.h: this is
 // the only evidence that hid's arming mechanism works on real silicon, because
@@ -120,16 +136,6 @@ DispatchResult cmdBootProbe(const CmdContext &, JsonObjectConst, JsonObject d, J
   d["nvs_init_ok"] = (BootProbe::nvsInitErr == 0);
   d["led_armed_at_boot"] = BootProbe::ledArmed;
   d["led_enabled_now"] = registry.isEnabled("led");
-  return DISPATCH_OK;
-}
-
-DispatchResult cmdHelp(const CmdContext &, JsonObjectConst, JsonObject d, JsonObject, CmdError *) {
-  JsonArray cmds = d["commands"].to<JsonArray>();
-  for (size_t i = 0; i < COMMAND_COUNT; i++) {
-    JsonObject o = cmds.add<JsonObject>();
-    o["act"] = COMMANDS[i].name;
-    o["help"] = COMMANDS[i].help;
-  }
   return DISPATCH_OK;
 }
 
@@ -377,23 +383,66 @@ DispatchResult cmdReboot(const CmdContext &, JsonObjectConst, JsonObject d, Json
   return DISPATCH_OK;  // dispatch() actually restarts, after this response is on the wire
 }
 
-const Command COMMANDS[] = {
-    {"help", "list commands", cmdHelp},
-    {"info", "chip/build/partition identity", cmdInfo},
-    {"parts", "live partition table", cmdParts},
-    {"mem", "heap free / min-free / largest block", cmdMem},
-    {"uptime", "ms since boot", cmdUptime},
-    {"tasks", "scheduler task table (intervals, worst-case runtimes)", cmdTasks},
-    {"led", "alias for mod:\"led\" act:\"set\"; p:{rgb:\"rrggbb\"} or p:{rgb:\"off\"}", cmdLed},
-    {"modules", "registered modules: id, name, category, enabled, claims, actions, blocked_by, status", cmdModules},
-    {"enable", "enable a module; p:{id:\"led\"[,force:true]}", cmdEnable},
-    {"disable", "disable a module; p:{id:\"led\"}", cmdDisable},
-    {"selftest", "assert the claim arbitration rule against a synthetic case table", cmdSelftest},
-    {"log", "get/set runtime log level; p:{level:\"error|warn|info|debug|trace\"}", cmdLog},
-    {"bootprobe", "what the static-ctor NVS probe saw (hid arming depends on it)", cmdBootProbe},
-    {"reboot", "esp_restart() — responds first", cmdReboot},
+// CONSTEXPR so the policy static_asserts below can read it. Every row's
+// minAuth comes from CmdAuth::requiredFor(name) rather than a literal, so the
+// level for a command is written down exactly once, in cmdauth.h.
+constexpr Command COMMANDS[] = {
+    {"help", "list commands, each with the auth level it needs", cmdHelp, CmdAuth::requiredFor("help")},
+    {"info", "chip/build/partition identity", cmdInfo, CmdAuth::requiredFor("info")},
+    {"parts", "live partition table", cmdParts, CmdAuth::requiredFor("parts")},
+    {"mem", "heap free / min-free / largest block", cmdMem, CmdAuth::requiredFor("mem")},
+    {"uptime", "ms since boot", cmdUptime, CmdAuth::requiredFor("uptime")},
+    {"tasks", "scheduler task table (intervals, worst-case runtimes)", cmdTasks, CmdAuth::requiredFor("tasks")},
+    {"led", "alias for mod:\"led\" act:\"set\"; p:{rgb:\"rrggbb\"} or p:{rgb:\"off\"}", cmdLed,
+     CmdAuth::requiredFor("led")},
+    {"modules", "registered modules: id, name, category, enabled, claims, actions, blocked_by, status", cmdModules,
+     CmdAuth::requiredFor("modules")},
+    {"enable", "enable a module; p:{id:\"led\"[,force:true]}", cmdEnable, CmdAuth::requiredFor("enable")},
+    {"disable", "disable a module; p:{id:\"led\"}", cmdDisable, CmdAuth::requiredFor("disable")},
+    {"selftest", "assert the claim arbitration rule against a synthetic case table", cmdSelftest,
+     CmdAuth::requiredFor("selftest")},
+    {"log", "get/set runtime log level; p:{level:\"error|warn|info|debug|trace\"}", cmdLog,
+     CmdAuth::requiredFor("log")},
+    {"bootprobe", "what the static-ctor NVS probe saw (hid arming depends on it)", cmdBootProbe,
+     CmdAuth::requiredFor("bootprobe")},
+    {"reboot", "esp_restart() — responds first (auth >= physical: the cable, not the network)", cmdReboot,
+     CmdAuth::requiredFor("reboot")},
 };
-const size_t COMMAND_COUNT = sizeof(COMMANDS) / sizeof(COMMANDS[0]);
+constexpr size_t COMMAND_COUNT = sizeof(COMMANDS) / sizeof(COMMANDS[0]);
+
+// The two ways the table and the policy could drift, both made into build
+// failures rather than a silent AUTH_PHYSICAL (or, worse, a level nobody
+// chose).
+constexpr bool everyCommandHasAPolicy() {
+  for (size_t i = 0; i < COMMAND_COUNT; i++) {
+    if (!CmdAuth::isListed(COMMANDS[i].name)) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(everyCommandHasAPolicy(),
+              "a built-in command has no entry in CmdAuth::BUILTINS — add one (cmdauth.h) rather than letting it "
+              "default to AUTH_PHYSICAL");
+static_assert(COMMAND_COUNT == CmdAuth::BUILTIN_COUNT,
+              "CmdAuth::BUILTINS names a command that no longer exists in COMMANDS, or vice versa");
+
+// Every command's level, and whether THIS caller has it — so a UI can grey out
+// what the session cannot use instead of discovering it by failure. `auth` is
+// the caller's own level, which is otherwise invisible to it.
+DispatchResult cmdHelp(const CmdContext &ctx, JsonObjectConst, JsonObject d, JsonObject, CmdError *) {
+  d["auth"] = CmdAuth::levelName(ctx.authLevel);
+  d["auth_level"] = ctx.authLevel;
+  JsonArray cmds = d["commands"].to<JsonArray>();
+  for (size_t i = 0; i < COMMAND_COUNT; i++) {
+    JsonObject o = cmds.add<JsonObject>();
+    o["act"] = COMMANDS[i].name;
+    o["help"] = COMMANDS[i].help;
+    o["min_auth"] = CmdAuth::levelName(COMMANDS[i].minAuth);
+    o["allowed"] = CmdAuth::permits(ctx.authLevel, COMMANDS[i].minAuth);
+  }
+  return DISPATCH_OK;
+}
 
 const Command *findCommand(const char *name) {
   for (size_t i = 0; i < COMMAND_COUNT; i++) {
@@ -402,6 +451,32 @@ const Command *findCommand(const char *name) {
     }
   }
   return nullptr;
+}
+
+// Fills `resp` with the refusal for a built-in the caller may not run, and
+// returns false (the "do not restart" value execute() hands back).
+//
+// It goes through cmdErrorf() and CmdError::msg — the SAME path a module's
+// EAUTH takes (mod_hid.cpp requireInjectAuth, mod_storage.cpp requireAuth) —
+// so the code, the response shape, the wording and even the 96-byte truncation
+// point are identical. A caller must not be able to tell a built-in's refusal
+// from a module's; anything extra in `e` here would give it away.
+bool authDenied(JsonDocument &resp, const char *what, uint8_t need, const CmdContext &ctx) {
+  // Formatted into a SEPARATE buffer first: cmdErrorf() vsnprintf()s into
+  // cerr.msg, and passing cerr.msg as its own argument would be an overlapping
+  // copy. Same size, so the truncation point is unchanged.
+  char msg[sizeof(CmdError::msg)];
+  CmdAuth::denyMessage(msg, sizeof(msg), what, need, ctx.transport, ctx.authLevel);
+  CmdError cerr;
+  cmdErrorf(&cerr, "EAUTH", "%s", msg);
+  resp["ok"] = false;
+  JsonObject e = resp["e"].to<JsonObject>();
+  e["code"] = cerr.code;
+  // Cast is load-bearing: cerr.msg is a char[96] on this stack frame, and
+  // ArduinoJson 7.4.3 stores a char-array by POINTER without copying. See the
+  // note above renderActionResult().
+  e["msg"] = (const char *)cerr.msg;
+  return false;
 }
 
 // ---- request handling --------------------------------------------------
@@ -543,6 +618,23 @@ bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, Json
   const char *mod = req["mod"] | (const char *)nullptr;
   const Command *cmd = nullptr;
   if (mod == nullptr) {
+    // ---- THE AUTH GATE (backlog S1) -------------------------------------
+    //
+    // ONE check, before any handler runs, rather than thirteen inside them.
+    // The level per command is CmdAuth::BUILTINS (cmdauth.h); nothing in this
+    // file decides policy, and no built-in reads ctx.authLevel for itself.
+    //
+    // It is what lets a transport dispatch honestly: mod_http.cpp's 401 is now
+    // defence in depth, and the BLE adapter may hand an unauthenticated client
+    // straight to this function.
+    //
+    // Order matters. The PRE-FLIGHT check comes before findCommand() so a
+    // caller below the lowest level any built-in accepts is refused without
+    // being told whether the name it sent exists — otherwise EUNKNOWN vs EAUTH
+    // enumerates the whole built-in surface for a client with no session.
+    if (!CmdAuth::permits(authLevel, CmdAuth::minimumLevel())) {
+      return authDenied(resp, "any built-in command", CmdAuth::minimumLevel(), ctx);
+    }
     cmd = findCommand(act);
     if (!cmd) {
       resp["ok"] = false;
@@ -550,6 +642,11 @@ bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, Json
       e["code"] = "EUNKNOWN";
       e["msg"] = String("unknown command: ") + act;
       return false;
+    }
+    if (!CmdAuth::permits(authLevel, cmd->minAuth)) {
+      char what[48];
+      snprintf(what, sizeof(what), "the built-in command '%.16s'", cmd->name);
+      return authDenied(resp, what, cmd->minAuth, ctx);
     }
   }
 

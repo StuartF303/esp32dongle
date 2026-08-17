@@ -247,6 +247,15 @@ std::atomic<bool> teardownPending_{false};
 // while the response was still in the socket buffer — i.e. `reboot` over HTTP
 // would look like a hang. Deadline first, release-store the flag, acquire-load
 // it in the tick.
+//
+// CURRENTLY UNREACHABLE, deliberately kept. Backlog S1 put `reboot` at
+// AUTH_PHYSICAL (cmdauth.h) and this transport dispatches at AUTH_TOKEN — a
+// level it can never exceed, because nothing arriving over a radio can prove it
+// is holding the cable. So Console::execute() refuses `reboot` here with EAUTH
+// and never returns true. The machinery stays because it is the only correct
+// way to restart from a request handler if that policy is ever revisited, and
+// because deleting a working cross-core handshake to re-derive it later is a
+// bad trade.
 char rebootReason_[8] = {0};
 std::atomic<bool> rebootPending_{false};
 uint32_t rebootAtMs_ = 0;
@@ -1205,6 +1214,26 @@ esp_err_t handleModules(httpd_req_t *req) {
   return sendJsonDoc(req, "200 OK", doc);
 }
 
+// ---- THE 401 IS NOW DEFENCE IN DEPTH, NOT THE DEFENCE ---------------------
+//
+// It used to be the only thing standing in front of the built-in commands:
+// `info`, `parts`, `mem`, `bootprobe` and `reboot` were dispatched from
+// console.cpp's table without ever reading ctx.authLevel, so this handler
+// returning 401 before Console::execute() WAS the security boundary for one
+// third of the command surface — in a design whose premise is that the command
+// layer decides for itself, precisely so that three transport adapters cannot
+// disagree about it.
+//
+// Fixed by backlog S1 (2026-08-17): every built-in carries a minimum AuthLevel
+// (cmdauth.h) which Console::execute() enforces centrally. A TRANSPORT MAY NOW
+// DISPATCH AT AUTH_NONE SAFELY — an unauthenticated caller gets EAUTH from the
+// command layer, not a partition table. That is the property the BLE adapter
+// (backlog F1) is meant to rely on, and it is why this stays: two independent
+// refusals, neither of which is load-bearing alone.
+//
+// Keeping it also means an unauthenticated HTTP client is refused by HTTP's own
+// vocabulary — 401 with WWW-Authenticate, which is what a browser and a curl
+// user expect — rather than a 200 carrying an EAUTH envelope.
 esp_err_t handleCmd(httpd_req_t *req) {
   if (authenticate(req) == 0) {
     return send401(req);
@@ -1263,6 +1292,13 @@ esp_err_t handleCmd(httpd_req_t *req) {
 // frame. Anything else is answered with EAUTH and the socket is closed — so an
 // unauthenticated client can reach the command bus at no level, and the
 // AUTH_NONE CmdContext never gets as far as a dispatch.
+//
+// That last sentence is now belt AND braces rather than the belt: since backlog
+// S1 the built-ins enforce their own minimum AuthLevel inside
+// Console::execute() (cmdauth.h), so dispatching an AUTH_NONE context would be
+// safe. This transport still refuses first — see the block above handleCmd() —
+// because closing the socket is a cheaper answer to a stranger than parsing and
+// dispatching their command.
 esp_err_t handleWs(httpd_req_t *req) {
   int fd = httpd_req_to_sockfd(req);
   uint32_t now = millis();

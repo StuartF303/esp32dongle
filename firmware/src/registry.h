@@ -392,6 +392,13 @@ class Registry {
   uint8_t count() const { return count_; }
   const ModuleDescriptor *at(uint8_t i) const { return i < count_ ? mods_[i] : nullptr; }
   bool enabledAt(uint8_t i) const { return i < count_ && enabled_[i]; }
+  // PERSISTED INTENT, not live state — `armed` in list()'s JSON, desired_
+  // internally. They differ only for a bootTimeBinding module: armedAt() &&
+  // !enabledAt() is "armed, binds its USB interface at the next boot", which is
+  // exactly the state `display` has to render for `hid` (backlog C3). Without
+  // an accessor the only ways to read it were a ~4 KB list() document or
+  // ModulePersist::wasEnabledAtBoot(), an NVS read, twice a second.
+  bool armedAt(uint8_t i) const { return i < count_ && desired_[i]; }
   int8_t indexOf(const char *id) const;
 
   // Scheduler trampoline target. Public because the trampoline table in
