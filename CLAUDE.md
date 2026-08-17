@@ -145,6 +145,14 @@ gotchas. Captured 2026-08-15 while the device was still factory-fresh.
 
 **This is the only fallback** — there is no OTA slot — so it must stay intact.
 
+## Backlog
+
+`BACKLOG.md` holds work that was deliberately deferred, with the reasoning that deferred it —
+security gaps, known-but-accepted trade-offs, and planned modules. Read it before starting
+something new: several items are one-line fixes that are only cheap while the surrounding code
+is fresh, and one (built-in commands have no auth checks) becomes a real exposure the moment a
+transport dispatches at AUTH_NONE.
+
 ## Status
 
 All three original open questions (PSRAM, LCD, microSD) are now settled — see above.
