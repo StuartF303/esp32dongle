@@ -613,6 +613,11 @@ void fillModules(JsonObject d) {
   JsonObject boot = d["boot"].to<JsonObject>();
   boot["nvs"] = rr.nvsRead ? "read" : "empty";
   boot["nvs_write_ok"] = rr.nvsWriteOk;
+  // The KNOWN-module set (modset.h). "empty" means this boot could not tell a
+  // newly added module from one the owner disabled, so it assumed the latter —
+  // which is why a default-on module added by a firmware update comes up on
+  // the boot AFTER the one that first wrote this key.
+  boot["known"] = rr.knownRead ? "read" : "empty";
   if (rr.nvsTooLong) {
     // Distinct from "nothing is enabled", which is what this used to look
     // like: the stored string did not fit the read buffer, so NOTHING was
@@ -635,6 +640,12 @@ void fillModules(JsonObject d) {
   JsonArray armed = boot["armed"].to<JsonArray>();
   for (uint8_t i = 0; i < rr.armedCount; i++) {
     armed.add(rr.armed[i]);
+  }
+  // Modules this device had never seen before, which therefore took their
+  // descriptor's defaultEnabled rather than being treated as "off".
+  JsonArray defaulted = boot["defaulted"].to<JsonArray>();
+  for (uint8_t i = 0; i < rr.defaultedCount; i++) {
+    defaulted.add(rr.defaulted[i]);
   }
 }
 

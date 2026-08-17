@@ -101,10 +101,19 @@ void ledStatus(JsonObject d) {
 
 // Static, .rodata. This is what lets a UI render the module's controls
 // without a line of module-specific front-end code — see ARCHITECTURE.md
-// section 2.
+// section 2, and modparam.h for why this is a table rather than a sentence.
+//
+// Derived from ledDispatch above, not from the prose it replaces: the old
+// hint said rgb:"rrggbb"|"off" and never mentioned that parseHexColor()
+// accepts a leading '#', which is the form every colour picker on a phone
+// produces.
+const ModuleParam SET_PARAMS[] = {
+    ModParam::str("rgb", true, "6 hex digits — \"ff0000\", or \"#ff0000\"; or \"off\". Case-insensitive."),
+};
+
 const ModuleAction LED_ACTIONS[] = {
-    {"set", "set a fixed colour", "rgb:\"rrggbb\"|\"off\""},
-    {"auto", "return to the heartbeat blink", ""},
+    {"set", "set a fixed colour", MOD_PARAMS(SET_PARAMS)},
+    {"auto", "return to the heartbeat blink", nullptr, 0},
 };
 
 void ledTick() { Led::heartbeatTask(); }

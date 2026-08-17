@@ -954,11 +954,27 @@ void displayStatus(JsonObject d) {
   d["pin_on_screen"] = Pairing::visible();
 }
 
+// Read off displayDispatch above. Both `backlight` parameters are optional
+// because either one alone satisfies it — but at least one is required, and
+// pct is checked first, so `on` is ignored when both are sent. The help says
+// so; the schema does not invent a mutual exclusion the dispatch never
+// enforces.
+const ModuleParam BACKLIGHT_PARAMS[] = {
+    ModParam::num("pct", false, "brightness 0..100 (0 == off). Wins if `on` is sent too. One of pct/on is required.", 0,
+                  100),
+    ModParam::flag("on", false, "true == full brightness, false == off. Ignored when pct is given. One of pct/on is required."),
+};
+
+const ModuleParam SCREEN_PARAMS[] = {
+    ModParam::choice("name", true, "which firmware-defined screen to show. `diag` also HIDES the pairing PIN.",
+                     "status,diag"),
+};
+
 const ModuleAction DISPLAY_ACTIONS[] = {
-    {"status", "panel, backlight, current screen and redraw statistics", ""},
-    {"backlight", "backlight on/off or 0..100% (auth >= token)", "on:true|false | pct:0..100"},
-    {"screen", "select a firmware-defined screen", "name:\"status\"|\"diag\""},
-    {"refresh", "force a full repaint", ""},
+    {"status", "panel, backlight, current screen and redraw statistics", nullptr, 0},
+    {"backlight", "backlight on/off or 0..100% (auth >= token)", MOD_PARAMS(BACKLIGHT_PARAMS)},
+    {"screen", "select a firmware-defined screen", MOD_PARAMS(SCREEN_PARAMS)},
+    {"refresh", "force a full repaint", nullptr, 0},
 };
 
 const ModuleDescriptor DISPLAY_MODULE = {

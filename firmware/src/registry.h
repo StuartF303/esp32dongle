@@ -71,6 +71,7 @@
 #include <stdint.h>
 
 #include "claims.h"
+#include "modparam.h"
 
 // ---- command context ----------------------------------------------------
 
@@ -150,10 +151,19 @@ typedef void (*ModuleTaskFn)();
 // /api/modules, a new module needs zero front-end changes" true rather than
 // aspirational: without it the listing says a module exists but nothing about
 // what it DOES, so every module still needs a hand-written panel.
+//
+// `params` is a MACHINE-READABLE table (modparam.h), not a prose sketch. It
+// used to be one free-text string and the UI could do nothing with it but put
+// it in a placeholder over a raw-JSON box — see the defect described at the
+// top of modparam.h. The rule for filling it in: read the dispatch handler and
+// describe what it ACTUALLY accepts, including which parameters are genuinely
+// optional. The prose it replaced had already drifted from the code in six
+// places.
 struct ModuleAction {
-  const char *act;     // "set", "type", "scan"
-  const char *help;    // one line, imperative, for a tooltip or `help` output
-  const char *params;  // sketch of `p`, e.g. "rgb:\"rrggbb\"|\"off\"" — "" for none
+  const char *act;             // "set", "type", "scan"
+  const char *help;            // one line, imperative, for a tooltip or `help` output
+  const ModuleParam *params;   // static .rodata table; nullptr for an action with no params
+  uint8_t paramCount;
 };
 
 struct ModuleDescriptor {
@@ -162,10 +172,14 @@ struct ModuleDescriptor {
   const char *category;     // free-form grouping for the UI ("status", "transport", "input", ...)
   Claims::ClaimSet claims;  // build with Claims::claim(...) / Claims::none()
 
-  // First-boot default. Applied by restoreFromNvs() when NVS holds nothing at
-  // all — NOT when the user has persisted an empty set. Lives here rather than
-  // as a hardcoded id in main.cpp so that "is this on out of the box?" is
-  // answered in the module's own file. `hid` must never set this.
+  // Default state on a device that has never heard of this module. Applied by
+  // restoreFromNvs() on a virgin NVS AND to a module that is absent from the
+  // persisted KNOWN set — i.e. one newly added to the firmware (modset.h).
+  // It is NOT applied to a module the owner has explicitly turned off: that
+  // one is in the known set and absent from the enabled set, and it stays off.
+  // Lives here rather than as a hardcoded id in main.cpp so that "is this on
+  // out of the box?" is answered in the module's own file. `hid` must never
+  // set this.
   bool defaultEnabled;
 
   // The module's real gate is boot, not runtime: it owns a USB interface whose
@@ -226,6 +240,12 @@ struct ModuleRestoreReport {
 
   bool nvsRead;     // false == nothing persisted yet (first boot), not an error
   bool nvsWriteOk;  // false == a persist() call failed; state is live-only
+  // false == the KNOWN-module set is absent: a virgin device, or one upgraded
+  // from a build that never wrote one. In the latter case every registered
+  // module is treated as known for that boot, so nothing the owner disabled is
+  // resurrected — see modset.h. It is written at the end of this restore, so
+  // it is false at most once per device.
+  bool knownRead;
   // The stored string was longer than buf_, so Preferences::getString()
   // returned 0 and left the buffer EMPTY. Without this flag that is
   // indistinguishable from "nothing is enabled": every module silently off,
@@ -239,6 +259,11 @@ struct ModuleRestoreReport {
   uint8_t skippedCount;
   const char *unknown[MAX_LIST];  // persisted ids with no matching module (points into buf_)
   uint8_t unknownCount;
+  // Modules this device had never heard of, which therefore took their
+  // descriptor's defaultEnabled. Reported because "why did that turn itself
+  // on?" must have an answer that is not "read the source".
+  const char *defaulted[MAX_LIST];
+  uint8_t defaultedCount;
   // bootTimeBinding modules the user has armed. Whether one actually BOUND is
   // decided by its own static-constructor check, not by anything in here.
   const char *armed[MAX_LIST];
@@ -260,7 +285,11 @@ namespace ModulePersist {
 // !! SHARED FORMAT !! This and Registry::persist() are two readers of one
 // on-flash format ("id1,id2,..." in namespace "modreg", key "on"). Change one
 // and you must change the other; there is no compiler check that spans them.
-// The format is defined once, in registry.cpp, next to both implementations.
+// The keys live in registry.cpp and the parser in modset.h, which both use.
+//
+// It reads the ENABLED set only. The companion "known" key (modset.h) is a
+// boot-decision input for the Registry and means nothing here: a TinyUSB
+// module asks "did the user arm me", and the answer is the enabled set.
 //
 // Returns false if NVS is unreadable, the key is absent, or the stored value
 // is too long to parse — i.e. it fails CLOSED. For `hid` that means "a
@@ -284,6 +313,11 @@ class Registry {
   // Longest "id1,id2,..." string we will persist. Public because
   // ModulePersist::wasEnabledAtBoot() reads the same string with the same
   // buffer size and must not carry its own copy of the number.
+  //
+  // UNCHANGED at 192 by the addition of the KNOWN set (modset.h): that is a
+  // second NVS key of the same shape, whose worst case is the same 12 ids, so
+  // the same bound covers both. It is a stack buffer in restoreFromNvs(), not
+  // a second member, so the second list costs no static RAM either.
   static const size_t PERSIST_BUF_SIZE = 192;
   // 12 ids x 15 chars + 11 commas + NUL == 192, exactly. If MAX_MODULES or
   // MAX_ID_LEN grows, the persisted set silently truncates and modules quietly
@@ -368,6 +402,8 @@ class Registry {
   bool startModule(uint8_t idx, const char **errMsg);
   bool stopModule(uint8_t idx, const char **errMsg);
   void persist();
+  // Records the set of ids this firmware registers. See modset.h.
+  void persistKnown(const char *current);
   // THE arbitration query, used by both enable() (to refuse) and list() (to
   // render blocked_by). One implementation, so the rule a UI shows and the
   // rule the device applies cannot drift apart.

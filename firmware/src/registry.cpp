@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "modset.h"
 #include "scheduler.h"
 
 Registry registry;
@@ -32,8 +33,19 @@ namespace {
 // later). That partition also has to carry Wi-Fi STA config, an auth PIN and a
 // rotating session token, and NVS needs spare pages for compaction — so one
 // short string here, not a key per module.
+//
+// TWO KEYS, and the second one is not a nicety:
+//   "on"    — the ids that are ENABLED (what the owner asked for).
+//   "known" — every id REGISTERED at the last boot.
+// Without the second, "absent from the enabled set" cannot be told apart from
+// "this firmware has a module the device has never seen", so a newly added
+// default-on module was off forever. The rule is ModSet::wantAtBoot(); the
+// reasoning and the migration stance are in modset.h. Worst case is the same
+// 12 ids as "on", so both fit PERSIST_BUF_SIZE and the nvs partition grows by
+// at most another ~200 bytes.
 const char *NVS_NAMESPACE = "modreg";
 const char *NVS_KEY = "on";
+const char *NVS_KEY_KNOWN = "known";
 
 // Appends to a bounded buffer at *pos. Silently truncates rather than
 // overflowing; every caller here is building a human-readable message.
@@ -180,20 +192,9 @@ bool ModulePersist::wasEnabledAtBoot(const char *id) {
   }
   buf[sizeof(buf) - 1] = '\0';
 
-  size_t idLen = strlen(id);
-  const char *cur = buf;
-  while (*cur != '\0') {
-    const char *comma = strchr(cur, ',');
-    size_t len = (comma != nullptr) ? (size_t)(comma - cur) : strlen(cur);
-    if (len == idLen && strncmp(cur, id, idLen) == 0) {
-      return true;
-    }
-    if (comma == nullptr) {
-      break;
-    }
-    cur = comma + 1;
-  }
-  return false;
+  // ONE parser, shared with restoreFromNvs() (modset.h). The token walk used
+  // to be written out twice, in two files, for one on-flash format.
+  return ModSet::contains(buf, id);
 }
 
 // ---- registration --------------------------------------------------------
@@ -653,13 +654,63 @@ void Registry::list(JsonArray out) {
       blockedBy.add(blockers[b]);
     }
 
-    // What the module DOES. Static .rodata, so this costs flash, not RAM.
+    // What the module DOES, and what each action TAKES. Static .rodata, so
+    // this costs flash, not RAM.
+    //
+    // `params` is an ARRAY OF OBJECTS, not a prose string:
+    //   {"name":"rgb","type":"string","required":true,"help":"..."}
+    //   {"name":"wpm","type":"int","required":false,"help":"...","min":1,"max":2000}
+    //   {"name":"name","type":"enum","required":true,"help":"...","enum":["status","diag"]}
+    // Keys are omitted when they do not apply — an absent "min" means the
+    // dispatch imposes no lower bound, which is not the same as INT32_MIN.
+    // This is the shape W4's real UI consumes too, so keep it obvious.
     JsonArray actions = o["actions"].to<JsonArray>();
     for (uint8_t a = 0; a < m->actionCount; a++) {
+      const ModuleAction &act = m->actions[a];
       JsonObject ao = actions.add<JsonObject>();
-      ao["act"] = m->actions[a].act;
-      ao["help"] = m->actions[a].help;
-      ao["params"] = m->actions[a].params;
+      ao["act"] = act.act;
+      ao["help"] = act.help;
+      JsonArray params = ao["params"].to<JsonArray>();
+      uint8_t nParams = (act.params != nullptr) ? act.paramCount : 0;
+      for (uint8_t q = 0; q < nParams; q++) {
+        const ModuleParam &pd = act.params[q];
+        JsonObject po = params.add<JsonObject>();
+        po["name"] = pd.name;
+        po["type"] = ModParam::typeName(pd.type);
+        po["required"] = pd.required;
+        if (pd.help != nullptr && pd.help[0] != '\0') {
+          po["help"] = pd.help;
+        }
+        if (pd.type == P_ENUM || pd.type == P_ENUM_LIST) {
+          JsonArray vals = po["enum"].to<JsonArray>();
+          char v[ModParam::MAX_ENUM_VALUE + 1];
+          uint8_t n = ModParam::enumCount(pd.enumVals);
+          bool truncated = false;
+          for (uint8_t e = 0; e < n; e++) {
+            // The RETURN is the value's full length, so an over-long value is
+            // reported rather than silently shortened into a value the module
+            // would then reject.
+            if (ModParam::enumValueAt(pd.enumVals, e, v, sizeof(v)) >= sizeof(v)) {
+              truncated = true;
+            }
+            // Cast for the same reason mod_storage.cpp casts b64Buf/hex: `v`
+            // is a stack buffer, and this makes the "ArduinoJson copies it"
+            // expectation explicit rather than dependent on constness.
+            vals.add((const char *)v);
+          }
+          if (truncated) {
+            po["enum_truncated"] = true;
+          }
+        }
+        if (pd.type == P_INT) {
+          if (pd.min != ModParam::NO_MIN) {
+            po["min"] = pd.min;
+          }
+          if (pd.max != ModParam::NO_MAX) {
+            po["max"] = pd.max;
+          }
+        }
+      }
     }
 
     // status() is only called while the module is enabled — a disabled module
@@ -741,11 +792,15 @@ void Registry::persist() {
   // skipped at boot because its resources were taken. Persisting enabled_
   // would quietly delete both kinds of intent at the next write.
   char out[PERSIST_BUF_SIZE];
-  size_t pos = 0;
   out[0] = '\0';
+  bool fits = true;
   for (uint8_t i = 0; i < count_; i++) {
-    if (desired_[i]) {
-      appendf(out, sizeof(out), &pos, "%s%s", pos ? "," : "", mods_[i]->id);
+    if (desired_[i] && !ModSet::append(out, sizeof(out), mods_[i]->id)) {
+      // Cannot happen while PERSIST_BUF_SIZE covers MAX_MODULES x MAX_ID_LEN
+      // (static_assert in the header) — but a silent truncation here means
+      // modules stop coming back after a reboot with nothing saying why, so it
+      // is reported rather than trusted to arithmetic.
+      fits = false;
     }
   }
 
@@ -754,13 +809,34 @@ void Registry::persist() {
     report_.nvsWriteOk = false;
     return;
   }
+  size_t pos = strlen(out);
   size_t written = prefs.putString(NVS_KEY, out);
   prefs.end();
 
   // putString() returns strlen(value), so an empty set legitimately returns 0
   // and cannot be distinguished from a failure that way. Only the non-empty
   // case is checked.
-  report_.nvsWriteOk = (pos == 0) || (written == pos);
+  report_.nvsWriteOk = fits && ((pos == 0) || (written == pos));
+}
+
+// Writes the set of ids this firmware registers, so the NEXT boot can tell
+// "absent because new" from "absent because the owner turned it off"
+// (modset.h). Called once, from restoreFromNvs(), and ONLY when the stored
+// value actually differs — the caller has already read it, and the set changes
+// when the firmware changes rather than when a module is toggled, so this is
+// not a per-boot flash write.
+void Registry::persistKnown(const char *current) {
+  Preferences w;
+  if (!w.begin(NVS_NAMESPACE, false)) {
+    report_.nvsWriteOk = false;
+    return;
+  }
+  size_t want = strlen(current);
+  size_t written = w.putString(NVS_KEY_KNOWN, current);
+  w.end();
+  if (want != 0 && written != want) {
+    report_.nvsWriteOk = false;
+  }
 }
 
 void Registry::restoreFromNvs() {
@@ -772,13 +848,31 @@ void Registry::restoreFromNvs() {
 
   size_t storedLen = 0;  // NVS length INCLUDING the NUL, 0 if the key is absent
   size_t got = 0;
+  // The KNOWN set. A stack buffer, not a member: nothing in report_ points
+  // into it (unlike buf_, which report_.unknown indexes), so it costs no
+  // static RAM at all — 192 bytes of the loop task's 8 K stack, in setup().
+  char known[PERSIST_BUF_SIZE];
+  known[0] = '\0';
+  size_t knownStoredLen = 0;
+  size_t knownGot = 0;
   Preferences prefs;
   if (prefs.begin(NVS_NAMESPACE, true)) {
     storedLen = prefs.getStringLength(NVS_KEY);
     got = prefs.getString(NVS_KEY, buf_, sizeof(buf_));
+    knownStoredLen = prefs.getStringLength(NVS_KEY_KNOWN);
+    knownGot = prefs.getString(NVS_KEY_KNOWN, known, sizeof(known));
     prefs.end();
   }
   buf_[sizeof(buf_) - 1] = '\0';
+  known[sizeof(known) - 1] = '\0';
+  // Same three-way read as the enabled set below. An over-long stored value
+  // (getString returns 0 and leaves the buffer untouched) is treated as
+  // ABSENT, i.e. conservatively: nothing gets defaulted back on because a
+  // string would not fit a buffer.
+  report_.knownRead = (knownStoredLen > 0 && knownGot > 0);
+  if (!report_.knownRead) {
+    known[0] = '\0';
+  }
 
   // Three distinct outcomes, and the old code collapsed them into one.
   //   storedLen == 0            -> nothing persisted: first boot, or NVS erased.
@@ -797,28 +891,43 @@ void Registry::restoreFromNvs() {
 
   bool want[MAX_MODULES] = {false};
 
-  if (!report_.nvsRead) {
-    // First boot: the descriptors decide, not a hardcoded id list in main.cpp.
-    for (uint8_t i = 0; i < count_; i++) {
-      want[i] = mods_[i]->defaultEnabled;
+  // ---- PASS 1: the decision, against the lists while they are still INTACT.
+  //
+  // ModSet::wantAtBoot() is the whole rule and it is host-tested (modset.h,
+  // test_modset). nullptr for the enabled list means "the key is absent", i.e.
+  // a virgin device, and every module takes its own default; nullptr for the
+  // known list means this device predates the known set, and nothing is
+  // defaulted back on. Order matters: pass 2 destroys buf_.
+  const char *enabledList = report_.nvsRead ? buf_ : nullptr;
+  const char *knownList = report_.knownRead ? known : nullptr;
+  for (uint8_t i = 0; i < count_; i++) {
+    want[i] = ModSet::wantAtBoot(enabledList, knownList, mods_[i]->id, mods_[i]->defaultEnabled);
+    // Turned on because this device has never heard of it. Recorded so that
+    // "why is that suddenly on?" is answerable from the `modules` command
+    // rather than from the source.
+    if (want[i] && enabledList != nullptr && !ModSet::contains(enabledList, mods_[i]->id) &&
+        report_.defaultedCount < ModuleRestoreReport::MAX_LIST) {
+      report_.defaulted[report_.defaultedCount++] = mods_[i]->id;
     }
-  } else if (!report_.nvsTooLong) {
-    // Split in place. Each token stays a NUL-terminated string inside buf_,
-    // which is a member, so report_.unknown[] may safely point into it.
+  }
+
+  // ---- PASS 2: persisted ids this firmware no longer builds.
+  //
+  // Split in place. Each token stays a NUL-terminated string inside buf_,
+  // which is a member, so report_.unknown[] may safely point into it — and
+  // buf_ is unusable as a list from here on, which is why the decision above
+  // had to come first.
+  if (report_.nvsRead && !report_.nvsTooLong) {
     char *cur = buf_;
     while (cur != nullptr && *cur != '\0') {
       char *comma = strchr(cur, ',');
       if (comma != nullptr) {
         *comma = '\0';
       }
-      if (*cur != '\0') {
-        int8_t idx = indexOf(cur);
-        if (idx >= 0) {
-          want[idx] = true;
-        } else if (report_.unknownCount < ModuleRestoreReport::MAX_LIST) {
-          // A persisted id we no longer build. Recorded, then ignored.
-          report_.unknown[report_.unknownCount++] = cur;
-        }
+      if (*cur != '\0' && indexOf(cur) < 0 && report_.unknownCount < ModuleRestoreReport::MAX_LIST) {
+        // A persisted id we no longer build. Recorded, then ignored — never
+        // fatal, and it does not stop the rest of the set being restored.
+        report_.unknown[report_.unknownCount++] = cur;
       }
       cur = (comma != nullptr) ? comma + 1 : nullptr;
     }
@@ -866,6 +975,48 @@ void Registry::restoreFromNvs() {
     }
   }
   restoring_ = false;
+
+  // ---- record what this firmware knows about, for the NEXT boot ----------
+  //
+  // Written AFTER the replay, and from the REGISTERED set rather than from
+  // what actually started: a module that was blocked or failed to start is
+  // still a module this device has heard of, and re-defaulting it every boot
+  // would be a loop that quietly overrode the owner.
+  char knownNow[PERSIST_BUF_SIZE];
+  knownNow[0] = '\0';
+  for (uint8_t i = 0; i < count_; i++) {
+    if (!ModSet::append(knownNow, sizeof(knownNow), mods_[i]->id)) {
+      // Unreachable while the PERSIST_BUF_SIZE static_assert holds. If it ever
+      // is reached, the known set is short — which would re-default the missing
+      // modules next boot — so it is reported rather than written silently.
+      report_.nvsWriteOk = false;
+    }
+  }
+  // A module that was defaulted ON has just changed the intent, and persist()
+  // was suppressed for the whole replay (restoring_). Without this write the
+  // default would be applied again on EVERY boot: the id would be in the known
+  // set but still absent from the enabled set, so the next boot would decide
+  // "off" and the module would flap on for one boot and off the next.
+  //
+  // NOT written when the stored set was too long to read: that value is intact
+  // on flash and recoverable, and overwriting it with what we could not read
+  // would destroy the owner's configuration to fix a display bug.
+  //
+  // BEFORE the known set, deliberately. If power is lost between the two
+  // writes, the enabled set is the one that has to have landed: the new
+  // default is then honoured next boot regardless. The other order loses it.
+  // (It is also why this is not folded into persist(), which sets nvsWriteOk
+  // absolutely and would clear a failure reported by persistKnown().)
+  if (report_.defaultedCount > 0 && !report_.nvsTooLong) {
+    persist();
+  }
+
+  // Only when it moved: `known` is what this boot read, and rewriting an
+  // identical string every boot would be a flash write per power cycle for
+  // nothing.
+  if (!report_.knownRead || strcmp(known, knownNow) != 0) {
+    persistKnown(knownNow);
+  }
 
   // From here on the module set is fixed. add() fails.
   sealed_ = true;

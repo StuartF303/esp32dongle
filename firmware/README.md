@@ -69,6 +69,8 @@ upload them — which would repartition it.
 | `src/scheduler.h/.cpp` | Small fixed-size cooperative task scheduler: register a name/interval/callback, `run()` once per `loop()` pass. Tracks last-run time, run count, last and worst-case execution time per task (see the `tasks` console command) and never lets an overrunning task starve the others by catching up in a burst. |
 | `src/claims.h` | Resource enum (`usb`/`sd`/`wifi`/`ble`/`lcd`/`led`), shared/exclusive claim sets, and the whole arbitration rule. **Dependency-free** (`<stdint.h>` only) so it compiles for the host — see `[env:native]`. |
 | `src/claims_selftest.h` | The arbitration assertion table. Run on-target by the `selftest` command and on the host by `pio test -e native`; one table, two runners. |
+| `src/modparam.h` | The machine-readable action-parameter schema (`ParamType` / `ModuleParam`) a module's action table is built from, plus the enum-list splitter `Registry::list()` emits through. **Dependency-free**, so `pio test -e native` covers it. This is what lets the web UI render a real form per action instead of demanding hand-typed JSON. |
+| `src/modset.h` | The persisted module-id list format (`"a,b,c"`) and the boot decision `ModSet::wantAtBoot()` — including how a module NEW to a device gets its `defaultEnabled` while one the owner turned off stays off. **Dependency-free**; read the header before touching NVS persistence. |
 | `src/registry.h/.cpp` | The module registry — the contract W2/W3 compile against. Descriptors, claim arbitration, enable/disable with `force`, NVS persistence, per-module scheduler ticks, and a recursive mutex around the public API. Read the header comment before writing a module. |
 | `src/bus.h/.cpp` | Transport-agnostic event bus. Modules call `Bus::emit()`; transports register a sink. A module must never call into a transport directly. |
 | `src/protocol.h` | Wire framing constants shared by every transport — currently just the maximum line length, defined once so CDC/WS/BLE cannot disagree. |
@@ -78,6 +80,7 @@ upload them — which would repartition it.
 | `src/partition_info.h/.cpp` | The partition-subtype-name lookup shared by the boot banner and the `parts` console command, so there's one switch statement to keep in sync with the partition table. |
 | `src/console.h/.cpp` | The USB CDC transport: line-delimited JSON per `../ARCHITECTURE.md` section 2, plus a bare-word shorthand (e.g. `info`, `led ff0000`) for typing by hand. Built-in commands: `help`, `info`, `parts`, `mem`, `uptime`, `tasks`, `led`, `modules`, `enable`, `disable`, `selftest`, `log`, `reboot`. |
 | `test/test_claims/` | Host unit tests for the claim rule. `pio test -e native` — no device involved. |
+| `test/test_modparam/`, `test/test_modset/` | Host unit tests for the action-parameter schema and for the boot decision (new module gets its default, a disabled one stays off, an unknown persisted id is tolerated). |
 | `tools/console.py` | Host-side helper, run via `uv run --with pyserial python tools/console.py ...` — one-shot command/response, `--raw` literal JSON, `--monitor` for events, `--reset` to pulse DTR/RTS and capture the boot log. |
 
 ## Monitoring after a flash

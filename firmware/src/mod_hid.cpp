@@ -514,15 +514,49 @@ DispatchResult hidDispatch(const CmdContext &ctx, const char *act, JsonObjectCon
 void hidStatus(JsonObject d) { fillStatus(d); }
 
 // Static .rodata; this is what lets the web UI render the module's controls
-// without any module-specific front-end code (ARCHITECTURE.md §2).
+// without any module-specific front-end code (ARCHITECTURE.md §2). Every
+// entry below is read off actType/actKey/actLayout, NOT off the prose hints
+// they replace — see modparam.h.
+//
+// `wpm` and `delay_ms` are BOTH optional and neither is a "oneOf": actType
+// accepts either, and delay_ms wins when both are present. That is what the
+// help strings say, because inventing a mutual-exclusion concept the dispatch
+// does not enforce would be a second description of the code rather than the
+// code's own.
+const ModuleParam TYPE_PARAMS[] = {
+    ModParam::str("text", true,
+                  "the string to type: 1..512 characters, printable ASCII plus tab and newline. Longer is "
+                  "rejected, never truncated; CR is ignored."),
+    ModParam::num("wpm", false, "typing speed in words per minute (5 chars/word). Clamped to this range. Ignored if delay_ms is given.",
+                  1, 2000),
+    ModParam::num("delay_ms", false, "per-character delay in ms. Clamped to this range. Takes precedence over wpm; default 0.", 0,
+                  60000),
+};
+
+const ModuleParam KEY_PARAMS[] = {
+    ModParam::str("key", true,
+                  "one printable ASCII character, or a named key: Enter/Return, Esc, Tab, Space, Backspace, "
+                  "Delete, Insert, Home, End, PageUp, PageDown, Up, Down, Left, Right, CapsLock, NumLock, "
+                  "ScrollLock, PrintScreen, Pause, Menu, F1..F24. Case-insensitive."),
+    // A JSON ARRAY, which is why P_ENUM_LIST exists (modparam.h). Sent as a
+    // string it would parse to a null JsonArrayConst and the modifiers would
+    // vanish with no error at all.
+    ModParam::choiceList("mods", false, "modifiers held while the key is pressed. \"win\" and \"cmd\" are accepted as aliases of gui.",
+                         "ctrl,shift,alt,gui"),
+};
+
+const ModuleParam LAYOUT_PARAMS[] = {
+    ModParam::choice("set", false,
+                     "omit to READ the current layout. Setting it needs auth >= token and persists to NVS.",
+                     "en_GB,en_US"),
+};
+
 const ModuleAction HID_ACTIONS[] = {
-    {"type", "type a string into the host (queued; completes with a hid.done event)",
-     "text:\"...\"[,wpm:N|delay_ms:N]"},
-    {"key", "send one keystroke, optionally with modifiers",
-     "key:\"Enter\"|\"F5\"|\"a\"[,mods:[\"ctrl\",\"alt\",\"shift\",\"gui\"]]"},
-    {"release", "releaseAll() — panic stop for a stuck key or modifier", ""},
-    {"status", "armed/bound/layout/queue depth/current job/chars sent", ""},
-    {"layout", "get or set the HOST keyboard layout (en_GB default, en_US selectable)", "[set:\"en_GB\"|\"en_US\"]"},
+    {"type", "type a string into the host (queued; completes with a hid.done event)", MOD_PARAMS(TYPE_PARAMS)},
+    {"key", "send one keystroke, optionally with modifiers", MOD_PARAMS(KEY_PARAMS)},
+    {"release", "releaseAll() — panic stop for a stuck key or modifier", nullptr, 0},
+    {"status", "armed/bound/layout/queue depth/current job/chars sent", nullptr, 0},
+    {"layout", "get or set the HOST keyboard layout (en_GB default, en_US selectable)", MOD_PARAMS(LAYOUT_PARAMS)},
 };
 
 const ModuleDescriptor HID_MODULE = {

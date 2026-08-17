@@ -2190,16 +2190,39 @@ void httpStatus(JsonObject d) { fillApStatus(d); }
 
 // Static .rodata — this is what lets the embedded page render the module's
 // controls without naming it (webui.h).
+const ModuleParam PSK_PARAMS[] = {
+    ModParam::str("set", false,
+                  "omit to READ the current passphrase. 8..63 printable ASCII replaces it, restarts the AP and "
+                  "drops every session, client and WebSocket."),
+};
+
+const ModuleParam PIN_PARAMS[] = {
+    ModParam::flag("regenerate", false, "issue a NEW pairing PIN and revoke every session. Omit to just read the current one."),
+};
+
+const ModuleParam SESSIONS_PARAMS[] = {
+    // A string, because that is the only one of the two accepted forms a text
+    // field can produce. actSessions takes a session id as a JSON NUMBER or
+    // the literal string "all"; a quoted number is rejected with EARGS, so the
+    // numeric form has to go through the raw-JSON escape hatch. Stated here
+    // rather than papered over — the fix, if stuart wants it, is one
+    // strtoul() in actSessions, and that is a behaviour change, not a
+    // descriptor change.
+    ModParam::str("revoke", false,
+                  "\"all\" revokes every session. Omit to just list them. A single id must be sent as a JSON "
+                  "NUMBER (p:{\"revoke\":7}) — use the raw JSON box for that."),
+};
+
 const ModuleAction HTTP_ACTIONS[] = {
-    {"status", "AP and server state: ssid, ip, clients, sessions, WebSocket clients, event counters", ""},
+    {"status", "AP and server state: ssid, ip, clients, sessions, WebSocket clients, event counters", nullptr, 0},
     {"psk",
      "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping "
      "every session and client. USB console only (auth >= physical), both ways",
-     "[set:\"passphrase\"]"},
+     MOD_PARAMS(PSK_PARAMS)},
     {"pin", "the pairing PIN. USB console only; regenerate:true issues a new one and revokes every session",
-     "[regenerate:true]"},
+     MOD_PARAMS(PIN_PARAMS)},
     {"sessions", "list live sessions (ids only, never tokens), or revoke one / all of them",
-     "[revoke:N|\"all\"]"},
+     MOD_PARAMS(SESSIONS_PARAMS)},
 };
 
 const ModuleDescriptor HTTP_MODULE = {

@@ -1413,22 +1413,71 @@ void storageStatus(JsonObject d) { fillStatus(d); }
 // Static .rodata. This is what lets the web UI render storage's controls with
 // no module-specific front-end code (ARCHITECTURE.md section 2) — and `caps` is
 // what lets it size its chunks without guessing.
+//
+// Read off the handlers above, not off the prose hints these replace. Three of
+// those hints were WRONG, in the direction that costs a caller a round trip:
+// `read` advertised "path,offset,len" and `write` "path,offset,data" as though
+// offset and len were required, when both default (offset 0, len max_chunk);
+// and `verify`'s "path|cancel:true" implied a choice the dispatch does not
+// enforce — cancel:true is checked FIRST and ignores path entirely.
+const ModuleParam PATH_ONLY[] = {
+    ModParam::str("path", true, "absolute path from the card root, e.g. \"/\" or \"/logs/run.txt\"."),
+};
+
+const ModuleParam LIST_PARAMS[] = {
+    ModParam::str("path", true, "absolute directory path from the card root; \"/\" is the root."),
+    ModParam::num("offset", false, "entries to skip; default 0. readdir has no seek, so this is reached by skipping.", 0,
+                  (int32_t)LIST_MAX_OFFSET),
+    ModParam::num("limit", false, "max entries in this page; default 32. Out-of-range values are CLAMPED, not rejected.",
+                  1, (int32_t)LIST_MAX_LIMIT),
+};
+
+const ModuleParam READ_PARAMS[] = {
+    ModParam::str("path", true, "absolute file path from the card root."),
+    ModParam::num("offset", false, "byte offset to read from; default 0. File offsets here are 32-bit.", 0,
+                  (int32_t)MAX_FILE_OFFSET),
+    ModParam::num("len", false, "raw bytes to read; default and maximum are max_chunk (see the caps action). Larger is rejected.",
+                  0, (int32_t)MAX_CHUNK),
+};
+
+const ModuleParam WRITE_PARAMS[] = {
+    ModParam::str("path", true, "absolute file path from the card root."),
+    ModParam::str("data", true, "base64 of the bytes to write (padded, RFC 4648 §4). \"\" writes nothing."),
+    ModParam::num("offset", false, "byte offset to write at; default 0. Writes must be contiguous — past EOF is refused.", 0,
+                  (int32_t)MAX_FILE_OFFSET),
+    ModParam::flag("truncate", false, "replace the file rather than overwrite in place. Only valid at offset 0; refused elsewhere."),
+};
+
+const ModuleParam DELETE_PARAMS[] = {
+    ModParam::str("path", true, "absolute path from the card root. The root \"/\" itself is refused."),
+    ModParam::flag("recursive", false,
+                   "delete a non-empty directory tree, bounded to 8 levels and 2000 entries. Without it, only a file "
+                   "or an EMPTY directory is removed."),
+};
+
+const ModuleParam VERIFY_PARAMS[] = {
+    // BOTH optional, and that is the honest description: actVerify checks
+    // cancel FIRST and returns without looking at path, so neither is
+    // unconditionally required and there is no "oneOf" in the dispatch.
+    ModParam::str("path", false, "absolute file path to hash. Required unless cancel is true, which is handled first."),
+    ModParam::flag("cancel", false, "cancel the RUNNING verify job instead of starting one; path is then ignored."),
+};
+
 const ModuleAction STORAGE_ACTIONS[] = {
-    {"caps", "transfer limits: max_chunk, max_path, encoding, crc32 format, listing and delete bounds", ""},
-    {"free", "card type/size and total/used/free bytes (walks the FAT once if the FAT32 free count is stale)", ""},
-    {"list", "one PAGE of a directory; returns truncated + next_offset", "path:\"/\"[,offset:N,limit:N]"},
+    {"caps", "transfer limits: max_chunk, max_path, encoding, crc32 format, listing and delete bounds", nullptr, 0},
+    {"free", "card type/size and total/used/free bytes (walks the FAT once if the FAT32 free count is stale)", nullptr,
+     0},
+    {"list", "one PAGE of a directory; returns truncated + next_offset", MOD_PARAMS(LIST_PARAMS)},
     {"stat", "exists / is_dir / size / mtime for one path (a missing path is ok:true with exists:false)",
-     "path:\"/f.txt\""},
+     MOD_PARAMS(PATH_ONLY)},
     {"read", "read one chunk as base64 with a crc32; the caller drives offset, so it resumes by construction",
-     "path:\"/f.txt\",offset:N,len:N"},
-    {"write", "write one base64 chunk at an offset; returns the crc32 of what was written",
-     "path:\"/f.txt\",offset:N,data:\"<b64>\"[,truncate:true]"},
-    {"mkdir", "create one directory (not -p: intermediate directories are not invented)", "path:\"/dir\""},
-    {"delete", "delete a file, an EMPTY directory, or a bounded tree with recursive:true",
-     "path:\"/x\"[,recursive:true]"},
+     MOD_PARAMS(READ_PARAMS)},
+    {"write", "write one base64 chunk at an offset; returns the crc32 of what was written", MOD_PARAMS(WRITE_PARAMS)},
+    {"mkdir", "create one directory (not -p: intermediate directories are not invented)", MOD_PARAMS(PATH_ONLY)},
+    {"delete", "delete a file, an EMPTY directory, or a bounded tree with recursive:true", MOD_PARAMS(DELETE_PARAMS)},
     {"verify", "crc32 a whole file (queued; progress + storage.verify.done events). cancel:true stops it",
-     "path:\"/f.txt\"|cancel:true"},
-    {"status", "mount state, failing bring-up stage, card/fs type, current verify job", ""},
+     MOD_PARAMS(VERIFY_PARAMS)},
+    {"status", "mount state, failing bring-up stage, card/fs type, current verify job", nullptr, 0},
 };
 
 const ModuleDescriptor STORAGE_MODULE = {

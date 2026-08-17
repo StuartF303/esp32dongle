@@ -93,6 +93,16 @@ schematics under `schematic/`, and PlatformIO board JSONs under `boards/`.
 Bash tool. Do **not** retry with `sudo` from the Bash tool: that shell has no TTY, so
 sudo cannot prompt. Ask stuart to run it in his own terminal and paste the output.
 
+## grep lies about some source files
+
+`grep` here is **ugrep 7.5.0**, not GNU grep. It applies a binary heuristic and
+`firmware/src/console.cpp` trips it (`file` reports `data`), so matches are silently
+suppressed and it exits 1 — indistinguishable from "no match". This already cost one session:
+searching that file for its command table returned nothing and looked like a wrong pattern.
+
+**Use `grep -a` on anything under `firmware/src/`.** The files are valid UTF-8; the heuristic
+is just wrong about them.
+
 ## HID event access
 
 `stuart` was added to the `input` group on 2026-08-16 so the dongle's own keystrokes can be
