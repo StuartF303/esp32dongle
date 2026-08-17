@@ -199,8 +199,11 @@ is what buys "never repartition again", which is the whole point of getting this
 cycles and the card is 128 GB and replaceable. §4 routes `wifiscan`/`blescan` output to SD
 accordingly.
 
-Dual OTA is the point of the exercise: after the first flash, every iteration goes over the air
-from the phone, and a bad build rolls back instead of bricking.
+Dual OTA is the point of the exercise: after the first flash, every iteration should go over the
+air from the phone, and a bad build should roll back instead of bricking. **Half of that is
+built.** The rollback *confirmation* is implemented and described below; the *delivery* path —
+anything that writes an image into the inactive slot — does not exist yet (backlog S5), so
+updates are still a USB flash today.
 
 **Guard rail — done, and re-proven after the fact.** `restore.sh --yes` was first run on
 2026-08-15 while the device was still factory-fresh. It was then run again as a full round-trip
@@ -310,12 +313,79 @@ One trap this uncovered: under TinyUSB, esptool's DTR/RTS reset is implemented i
 (`scripts/touch_reset.py`, wired into the env) drops it into the ROM bootloader and restores a
 fully automated flash loop.
 
-#### OTA rollback is not automatic
+#### OTA rollback — armed by the bootloader, confirmed by the app
 
-Two OTA slots in the partition table do not by themselves give rollback. It also needs
-`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` and the app calling
-`esp_ota_mark_app_valid_cancel_rollback()` once it has confirmed itself healthy — e.g. after
-Wi-Fi and the HTTP server are up. Until that call exists, a bad OTA does *not* roll back.
+**Corrected 2026-08-17.** Backlog S4 claimed `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` was not
+set. It is, and always has been:
+`~/.platformio/packages/framework-arduinoespressif32-libs/esp32s3/sdkconfig` line 424
+(`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`) and line 4392 (`CONFIG_APP_ROLLBACK_ENABLE=y`).
+We flash the **prebuilt** bootloader from that package — `bin/bootloader_qio_80m.elf`, which
+carries the symbol `set_actual_ota_seq`, compiled only under that option.
+
+That made the real bug worse than "rollback doesn't work". The bootloader was *armed* and the
+app never confirmed itself, so the first image delivered by OTA would have landed in
+`ESP_OTA_IMG_PENDING_VERIFY`, appeared to work, and been reverted by the bootloader at the next
+restart — with nothing anywhere connecting the two events. It had never bitten only because a USB
+flash never produces `PENDING_VERIFY`: PlatformIO writes
+`framework-arduinoespressif32/tools/partitions/boot_app0.bin` at otadata's offset, and that file
+is **not blank** — sector 0 carries one valid entry (`ota_seq = 1`, `ota_state = 0xFFFFFFFF`
+i.e. `UNDEFINED`, `crc = 0x4743989a`) and sector 1 carries `ota_seq = 0`, which is invalid by
+definition. `ota_seq 1` selects slot `(1-1) % 2` = app0, and `UNDEFINED` is the state the
+bootloader boots without limits. It is byte-for-byte identical to
+`backup/factory_release/otadata.bin`. That is why `info` reports `UNDEFINED` rather than nothing.
+
+This is **app-side only**. No `sdkconfig.defaults`: adding one switches the project to a
+from-source ESP-IDF build, costs the 12-second deploy loop and changes which `boot_app0` code
+path runs (see `firmware/scripts/check_boot_app0.py`).
+
+**What is implemented** — `firmware/src/otadecide.h` (pure, host-tested) and
+`firmware/src/otahealth.{h,cpp}` (the flash/registry/clock half), driven by an `ota.health`
+scheduler task at 250 ms:
+
+- On boot, read `esp_ota_get_state_partition()` for the running partition. Anything other than
+  `PENDING_VERIFY` — which is every USB flash — parks in `idle` and never acts again.
+- On `PENDING_VERIFY`, run a health check and call `esp_ota_mark_app_valid_cancel_rollback()`
+  only when **all five** criteria hold:
+
+  | criterion | threshold | what it proves |
+  |---|---|---|
+  | `ticks` | 40 runs of the health task (≈10 s) | the cooperative scheduler is dispatching, not wedged |
+  | `registry` | `ModuleRestoreReport::nvsTooLong` is false | the module registry restored without its one fatal outcome |
+  | `essential` | `cdc` is enabled | the console — the only guaranteed link to the device — is up |
+  | `console` | one request answered on **any** transport, **or** 20 s elapsed | it answers, or nobody is asking |
+  | `uptime` | 30 s | a crash loop cannot reach its own mark-valid call |
+
+- **Wi-Fi is deliberately not a criterion.** `http` is opt-in with `defaultEnabled = false`, so
+  requiring the AP would roll back a perfectly good build on a device whose owner has the radio
+  off — which is the factory default. The same reasoning excludes `storage` (no card is legal,
+  and there is no card-detect pin), `display` and `hid`.
+- **The window is 180 s** (6× the uptime gate). If the criteria are still outstanding then, the
+  app calls `esp_ota_mark_app_invalid_rollback_and_reboot()` rather than sitting in
+  `PENDING_VERIFY` indefinitely — because the bootloader would roll back anyway at whatever
+  restart happened next, and the owner would experience that as "the update vanished" days
+  later. Deciding inside the window at least makes it an event.
+- Confirmation and rollback both emit on the bus — `ota.pending`, `ota.confirmed`,
+  `ota.rollback`, `ota.confirm_failed` — so they are visible on every transport and in the boot
+  log, with the criteria mask expanded to named booleans rather than a number.
+- The LCD costs nothing extra: `otahealth.cpp` reports through `activity.h`, so the existing
+  footer renders `ota verify NN%` on both screens with no new region and no change to
+  `mod_display.cpp`.
+
+**The `ota` built-in** exposes and overrides all of it. No params: running partition, state,
+whether confirmation is pending, each criterion, seconds left in the window, and the rollback
+target — reported as *two separate facts*, `has_app` (a valid image magic word is present) and
+`rollback_possible` (`otadata` actually blesses it as bootable). `p:{confirm:true}` and
+`p:{rollback:true}` force the two transitions and are **`AUTH_PHYSICAL`**; `rollback` refuses,
+naming which of the two facts is missing, rather than rolling into an erased slot.
+
+`ota` is the first built-in whose *parameters* are gated above its row in `CmdAuth::BUILTINS`
+(reads at `TOKEN`, mutates at `CmdAuth::OTA_MUTATE == PHYSICAL`). The read stays at `TOKEN` on
+purpose: once S5 lands, the client that pushed an update is the one that needs to see whether it
+was confirmed.
+
+**Still missing (backlog S5):** there is no OTA delivery path at all — nothing calls
+`esp_ota_begin`/`esp_ota_write`, and no transport accepts an image. Until then this machinery
+only ever runs if `otadata` is put into `PENDING_VERIFY` by hand.
 
 ### UI
 Phone web app (module cards, toggles, per-module panels, WS live data) · on-device LCD (mode,

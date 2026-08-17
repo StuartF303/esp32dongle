@@ -21,6 +21,8 @@
 #include "mod_http.h"
 #include "mod_led.h"
 #include "mod_storage.h"
+#include "otadecide.h"
+#include "otahealth.h"
 #include "partition_info.h"
 #include "registry.h"
 #include "scheduler.h"
@@ -209,6 +211,18 @@ void setup() {
                   (unsigned)restore.armedCount);
   }
 
+  // OTA rollback confirmation (backlog S4). MUST come after
+  // registry.restoreFromNvs() — it asks the registry whether `cdc` came up, and
+  // `display` only subscribes to activity.h in its enable(), so beginning
+  // earlier would report the pending state to nobody. Also after
+  // Console::begin(), which is what puts the CDC sink on the bus for the
+  // "ota.pending" event.
+  //
+  // On a USB flash this does nothing at all: otadata is erased, the running
+  // partition reports UNDEFINED, and both begin() and every subsequent tick
+  // take an early return.
+  OtaHealth::begin();
+
   addTask("heartbeat.event", 5000, heartbeatEventTask);
   // Not a module tick: the console must keep answering even if the `cdc`
   // module were somehow off, or a mistake would be unrecoverable over USB.
@@ -219,6 +233,13 @@ void setup() {
   // task that may be blocked on that lock is a deadlock. This runs outside it.
   // See mod_http.h.
   addTask("http.poll", 20, httpTransportPoll);
+  // Not a module tick either, and for the sharpest reason of the three: the
+  // OTA health check must run whatever the module set is. Hanging it off a
+  // module would mean a disabled module could leave an OTA'd image in
+  // PENDING_VERIFY, i.e. silently rolled back at the next restart. Its own
+  // run count is also CRIT_TICKS — the evidence that the scheduler is
+  // dispatching at all (otadecide.h).
+  addTask("ota.health", OtaDecide::DEFAULTS.tickMs, OtaHealth::tick);
 
   Serial.println();
   Serial.println("setup() complete — entering scheduler loop. Try: help");

@@ -63,9 +63,13 @@ void test_reboot_is_physical_only() {
 }
 
 void test_every_other_builtin_is_token() {
-  const char *tokenLevel[] = {"help",     "info",    "parts",    "mem", "uptime",   "tasks",
+  const char *tokenLevel[] = {"help",     "info",    "parts",    "mem",     "uptime",   "tasks",
                               "led",      "modules", "enable",   "disable", "selftest", "log",
-                              "bootprobe"};
+                              "bootprobe",
+                              // `ota` READS at token. Its two mutating params
+                              // are a separate gate — see the OTA_MUTATE test
+                              // below.
+                              "ota"};
   for (size_t i = 0; i < sizeof(tokenLevel) / sizeof(tokenLevel[0]); i++) {
     TEST_ASSERT_TRUE_MESSAGE(CmdAuth::isListed(tokenLevel[i]), tokenLevel[i]);
     TEST_ASSERT_EQUAL_UINT8_MESSAGE(CmdAuth::TOKEN, CmdAuth::requiredFor(tokenLevel[i]), tokenLevel[i]);
@@ -73,6 +77,25 @@ void test_every_other_builtin_is_token() {
   // ...and that list plus `reboot` is the WHOLE table. A command added to
   // cmdauth.h without being considered here fails this.
   TEST_ASSERT_EQUAL_size_t(sizeof(tokenLevel) / sizeof(tokenLevel[0]) + 1, CmdAuth::BUILTIN_COUNT);
+}
+
+// The one parameter-level gate among the built-ins (backlog S4). `ota` reads at
+// TOKEN so a phone that pushed an update can see whether it stuck; `confirm`
+// and `rollback` decide which image this device boots and sit at PHYSICAL
+// beside `reboot`.
+void test_ota_mutating_params_are_physical() {
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::TOKEN, CmdAuth::requiredFor("ota"));
+  TEST_ASSERT_EQUAL_UINT8(CmdAuth::PHYSICAL, CmdAuth::OTA_MUTATE);
+  // A parameter gate may only RAISE. Console::execute()'s central gate has
+  // already run by the time the handler sees the request, so a lower value here
+  // would be dead code that reads as if it were a gate. (Also a static_assert
+  // in cmdauth.h; asserted here so a failure names the invariant.)
+  TEST_ASSERT_TRUE(CmdAuth::OTA_MUTATE >= CmdAuth::requiredFor("ota"));
+  // A token session may read but not mutate; the cable may do both.
+  TEST_ASSERT_TRUE(CmdAuth::permits(CmdAuth::TOKEN, CmdAuth::requiredFor("ota")));
+  TEST_ASSERT_FALSE(CmdAuth::permits(CmdAuth::TOKEN, CmdAuth::OTA_MUTATE));
+  TEST_ASSERT_TRUE(CmdAuth::permits(CmdAuth::PHYSICAL, CmdAuth::OTA_MUTATE));
+  TEST_ASSERT_FALSE(CmdAuth::permits(CmdAuth::NONE, CmdAuth::requiredFor("ota")));
 }
 
 void test_nothing_is_reachable_at_auth_none() {
@@ -140,6 +163,9 @@ void test_decision_table_command_by_level() {
       {"enable", CmdAuth::NONE, false},    {"enable", CmdAuth::TOKEN, true},    {"enable", CmdAuth::PHYSICAL, true},
       {"disable", CmdAuth::NONE, false},   {"disable", CmdAuth::TOKEN, true},   {"disable", CmdAuth::PHYSICAL, true},
       {"reboot", CmdAuth::NONE, false},    {"reboot", CmdAuth::TOKEN, false},   {"reboot", CmdAuth::PHYSICAL, true},
+      // `ota` with no params — READING the rollback state. A phone session may;
+      // an unauthenticated one may not.
+      {"ota", CmdAuth::NONE, false},       {"ota", CmdAuth::TOKEN, true},       {"ota", CmdAuth::PHYSICAL, true},
       // An unknown command, at every level: only the cable clears the
       // fail-closed default.
       {"nosuchcommand", CmdAuth::NONE, false}, {"nosuchcommand", CmdAuth::TOKEN, false},
@@ -205,6 +231,7 @@ int main(int, char **) {
   RUN_TEST(test_permits_is_cumulative_not_exact);
   RUN_TEST(test_reboot_is_physical_only);
   RUN_TEST(test_every_other_builtin_is_token);
+  RUN_TEST(test_ota_mutating_params_are_physical);
   RUN_TEST(test_nothing_is_reachable_at_auth_none);
   RUN_TEST(test_unlisted_commands_fail_closed);
   RUN_TEST(test_lookup_is_exact_not_prefix);

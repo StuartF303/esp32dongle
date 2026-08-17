@@ -32,15 +32,12 @@ chose this knowingly for typeability (2026-08-16); recorded here so it is revisi
 not rediscovered. Mitigation if wanted: a typeable-but-private passphrase, or moving the PIN
 exchange to something the air link cannot reveal.
 
-**S4. OTA rollback is not actually enabled.**
-The partition table has two OTA slots, but `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is not set and
-nothing calls `esp_ota_mark_app_valid_cancel_rollback()`. `ARCHITECTURE.md` claims "a bad build
-rolls back instead of bricking"; today it would not. Needs a real health check to gate the
-mark-valid call — Wi-Fi and the console up, say. Until then a bad OTA is a USB recovery.
-
 **S5. No OTA update path exists at all.**
 Dual slots and 7.75 MB of LittleFS, and updates still require USB. This is the payoff the whole
-16 MB repartition was for.
+16 MB repartition was for. Note that S4's confirmation machinery is now in place and **cannot be
+exercised without this** — nothing in the image writes the inactive slot or moves `otadata`, so
+`PENDING_VERIFY` can only be reached by hand today (esptool, or an `esp_ota_set_boot_partition()`
+call that does not exist yet).
 
 ---
 
@@ -144,6 +141,30 @@ and the native tests already cover the security-critical path sanitisation.
   `AUTH_NONE`.
 - **S2 — `reboot` over the network.** Closed as a side effect of S1: `reboot` is `AUTH_PHYSICAL`
   and a network session can never reach that level, by design.
+- **S4 — OTA rollback was never confirmed. Done 2026-08-17, on a corrected premise.**
+  The item claimed `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` was not set. **It was**, and so was
+  `CONFIG_APP_ROLLBACK_ENABLE` — lines 424 and 4392 of
+  `~/.platformio/packages/framework-arduinoespressif32-libs/esp32s3/sdkconfig`, and the prebuilt
+  bootloader we flash carries `set_actual_ota_seq`, which IDF compiles only under that option.
+  So the bug was the *worse* one: the bootloader was armed, nothing called
+  `esp_ota_mark_app_valid_cancel_rollback()`, and the first OTA would have appeared to work and
+  then silently reverted at the next restart. USB flashing hid it, because it leaves `otadata`
+  erased (`ota_state UNDEFINED`, as `info` reports).
+
+  **Done:** `src/otadecide.h` (pure decision table, 16 host tests) + `src/otahealth.{h,cpp}`
+  (`ota.health` task at 250 ms). Five criteria — scheduler ticking, registry restore not fatal,
+  essential `cdc` up, a request answered on any transport *or* a 20 s grace, and 30 s uptime —
+  then mark-valid; a 180 s window, after which it marks invalid and reboots rather than leaving
+  the image pending. Wi-Fi is deliberately **not** a criterion: `http` is `defaultEnabled=false`,
+  so requiring the AP would roll back good builds on the factory default. Bus events
+  `ota.pending` / `ota.confirmed` / `ota.rollback` / `ota.confirm_failed`; the LCD footer shows
+  it through `activity.h` with no new region. New `ota` built-in reports the state and forces
+  either transition at `AUTH_PHYSICAL`, refusing a rollback into a slot `otadata` does not bless.
+  See ARCHITECTURE.md §4 "OTA rollback — armed by the bootloader, confirmed by the app".
+
+  **Not done, and not in scope here:** the delivery path (S5). Also *untested on hardware* —
+  reaching `PENDING_VERIFY` needs `otadata` moved by hand, since nothing in the image can do it.
+
 - **C3 — armed-but-pending `hid` invisible.** Done 2026-08-17: hollow yellow badge, distinct from
   both solid-red live and no badge. This is the agreed mitigation for stuart's S1 choice that
   arming stays at `AUTH_TOKEN` — a session can arm the keyboard but not reboot to bind it, so the

@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <atomic>
 #include <ctype.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -20,6 +21,7 @@
 #include "partition_info.h"
 #include "protocol.h"
 #include "bootprobe.h"
+#include "otahealth.h"
 #include "registry.h"
 #include "scheduler.h"
 
@@ -85,6 +87,17 @@ static_assert(CmdAuth::PHYSICAL == AUTH_PHYSICAL, "CmdAuth::PHYSICAL has drifted
 // begin(); a null handle degrades to no locking rather than crashing, matching
 // the registry's stance.
 SemaphoreHandle_t txLock = nullptr;
+
+// Requests answered by execute(), any transport. See Console::requestsAnswered()
+// in console.h.
+//
+// std::atomic rather than `volatile`: execute() runs on the loop task AND on
+// esp_http_server's task, and `volatile` gives ordering without atomicity — the
+// read-modify-write of a plain counter can still lose an increment across two
+// cores, and C++20 deprecates `++` on a volatile for exactly that reason
+// (-Wvolatile). relaxed ordering is enough: nothing else is published through
+// this counter, and every consumer only asks whether it is non-zero.
+std::atomic<uint32_t> requestsAnswered_{0};
 
 void sendLine(JsonDocument &doc) {
   if (txLock != nullptr) {
@@ -383,6 +396,71 @@ DispatchResult cmdReboot(const CmdContext &, JsonObjectConst, JsonObject d, Json
   return DISPATCH_OK;  // dispatch() actually restarts, after this response is on the wire
 }
 
+// ---- ota (backlog S4) ----------------------------------------------------
+//
+// Read-only with no params. The two mutating params are gated at
+// CmdAuth::OTA_MUTATE (PHYSICAL) here in the handler rather than by the row in
+// CmdAuth::BUILTINS — the ONLY built-in that does this, and the reasoning is
+// written down beside that constant in cmdauth.h.
+//
+// The refusal goes through the same CmdAuth::denyMessage() the central gate
+// uses, so `ota p:{rollback:true}` from a phone is byte-for-byte
+// indistinguishable from the refusal `reboot` gives it.
+DispatchResult cmdOta(const CmdContext &ctx, JsonObjectConst p, JsonObject d, JsonObject, CmdError *err) {
+  bool confirm = p["confirm"] | false;
+  bool rollback = p["rollback"] | false;
+
+  // Bare-word shorthand, so `ota confirm` / `ota rollback` are typeable on the
+  // CDC console like every other built-in (handleBareWord() puts the rest of
+  // the line in p.arg). Only those two exact words; anything else is IGNORED
+  // rather than guessed at, exactly as `enable`'s optional "force" is — a
+  // destructive command must not be reachable by a near miss.
+  const char *arg = p["arg"] | (const char *)nullptr;
+  if (arg != nullptr) {
+    confirm = confirm || strcmp(arg, "confirm") == 0;
+    rollback = rollback || strcmp(arg, "rollback") == 0;
+  }
+
+  // Status FIRST, on every path including the refusals below: a caller told
+  // "no" still needs to see the state it was reasoning about, and `d` survives
+  // an error response (ARCHITECTURE.md section 2).
+  OtaHealth::fillStatus(d);
+
+  if (!confirm && !rollback) {
+    return DISPATCH_OK;
+  }
+  if (confirm && rollback) {
+    cmdErrorf(err, "EARGS", "confirm and rollback are opposites; ask for one");
+    return DISPATCH_FAIL;
+  }
+  if (!CmdAuth::permits(ctx.authLevel, CmdAuth::OTA_MUTATE)) {
+    char what[48];
+    snprintf(what, sizeof(what), "'ota %s'", confirm ? "confirm" : "rollback");
+    char msg[sizeof(CmdError::msg)];
+    CmdAuth::denyMessage(msg, sizeof(msg), what, CmdAuth::OTA_MUTATE, ctx.transport, ctx.authLevel);
+    cmdErrorf(err, "EAUTH", "%s", msg);
+    return DISPATCH_FAIL;
+  }
+
+  const char *code = "EOTA";
+  char msg[sizeof(CmdError::msg)];
+  msg[0] = '\0';
+  // rollbackNow() does not return on success — the chip restarts into the other
+  // slot. That is why there is no "restarting" response to render: unlike
+  // `reboot`, this one cannot be deferred until after the reply, because the
+  // decision and the restart are a single IDF call.
+  bool ok = confirm ? OtaHealth::confirmNow(&code, msg, sizeof(msg)) : OtaHealth::rollbackNow(&code, msg, sizeof(msg));
+  if (!ok) {
+    cmdErrorf(err, code, "%s", msg);
+    return DISPATCH_FAIL;
+  }
+  // Re-read: `d` was filled before the transition, so it still says "pending".
+  d.clear();
+  OtaHealth::fillStatus(d);
+  d["msg"] = (const char *)msg;  // cast: char[] is stored by pointer, see renderActionResult()
+  return DISPATCH_OK;
+}
+
 // CONSTEXPR so the policy static_asserts below can read it. Every row's
 // minAuth comes from CmdAuth::requiredFor(name) rather than a literal, so the
 // level for a command is written down exactly once, in cmdauth.h.
@@ -405,6 +483,8 @@ constexpr Command COMMANDS[] = {
      CmdAuth::requiredFor("log")},
     {"bootprobe", "what the static-ctor NVS probe saw (hid arming depends on it)", cmdBootProbe,
      CmdAuth::requiredFor("bootprobe")},
+    {"ota", "rollback state + health criteria; p:{confirm:true} or p:{rollback:true} (auth >= physical)", cmdOta,
+     CmdAuth::requiredFor("ota")},
     {"reboot", "esp_restart() — responds first (auth >= physical: the cable, not the network)", cmdReboot,
      CmdAuth::requiredFor("reboot")},
 };
@@ -588,6 +668,12 @@ void begin() {
 // a promise.
 bool execute(JsonObjectConst req, uint8_t authLevel, const char *transport, JsonDocument &resp) {
   resp.clear();
+
+  // Counted HERE, at the top, because every path out of this function fills
+  // `resp` — including ENOACT, EAUTH and EUNKNOWN. The counter's consumer
+  // (otahealth.cpp) is asking whether the command core ran end to end, and a
+  // refusal proves that just as well as a success does.
+  requestsAnswered_.fetch_add(1, std::memory_order_relaxed);
 
   JsonVariantConst idVar = req["id"];
   const char *act = req["act"] | (const char *)nullptr;
@@ -780,5 +866,7 @@ void poll() {
 }
 
 bool connected() { return (bool)Serial; }
+
+uint32_t requestsAnswered() { return requestsAnswered_.load(std::memory_order_relaxed); }
 
 }  // namespace Console

@@ -92,4 +92,19 @@ void poll();
 // status). Always true on builds where the framework cannot tell.
 bool connected();
 
+// How many protocol requests execute() has answered since boot, over EVERY
+// transport — CDC, HTTP and WebSocket alike. Counts refusals and errors too:
+// the question it answers is "did the command core run end to end", not "did
+// anyone like the result".
+//
+// It exists for otahealth.cpp's CRIT_CONSOLE (otadecide.h). Deliberately
+// transport-agnostic, for the same reason modules emit on the bus rather than
+// naming a transport: an image confirmed over Wi-Fi is as alive as one
+// confirmed over the cable.
+//
+// Thread-safety: a relaxed std::atomic, incremented on whichever task
+// dispatched (the loop task or esp_http_server's). It never decreases and no
+// other state is published through it.
+uint32_t requestsAnswered();
+
 }  // namespace Console

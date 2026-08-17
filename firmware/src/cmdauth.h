@@ -30,6 +30,11 @@
 //   every other built-in AUTH_TOKEN
 //   nothing             AUTH_NONE
 //
+// ONE EXCEPTION, added with the OTA rollback work (S4): `ota` is a TOKEN row
+// whose two mutating parameters sit at OTA_MUTATE == PHYSICAL. See the block
+// above that constant for why, and for why it is the only per-parameter gate
+// among the built-ins.
+//
 // Note what is deliberately NOT here: `enable`/`disable` are AUTH_TOKEN even
 // for a bootTimeBinding module like `hid`, i.e. a network session may ARM the
 // keyboard. Stuart's call, on the grounds that arming is inert until a reboot
@@ -86,12 +91,45 @@ constexpr Policy BUILTINS[] = {
     {"uptime", TOKEN},    {"tasks", TOKEN},    {"led", TOKEN},       {"modules", TOKEN},
     {"enable", TOKEN},    {"disable", TOKEN},  {"selftest", TOKEN},  {"log", TOKEN},
     {"bootprobe", TOKEN},
+    // READ-ONLY at TOKEN; its two MUTATING parameters are gated separately at
+    // OTA_MUTATE below. Reading is deliberately available to a phone session:
+    // once S5 lands, the thing that pushed an update is the thing that needs to
+    // see whether it was confirmed, and a device that cannot report its own OTA
+    // state to the client that updated it is worse than useless.
+    {"ota", TOKEN},
     // The only one above TOKEN. A phone with a valid session can do a great
     // deal to this device, but it cannot take it away from the person at the
     // desk.
     {"reboot", PHYSICAL},
 };
 constexpr size_t BUILTIN_COUNT = sizeof(BUILTINS) / sizeof(BUILTINS[0]);
+
+// ---- parameter-level elevation ------------------------------------------
+//
+// A COMMAND's row above is a FLOOR, not the whole story. `ota` reads at TOKEN
+// but its `confirm` and `rollback` parameters are terminal decisions about
+// which image this device boots — `rollback` restarts the chip into the other
+// slot — so they sit at PHYSICAL alongside `reboot`.
+//
+// This is the FIRST built-in to raise its own bar per-parameter, and it is
+// worth being blunt about the trade. S1's rule is "no built-in checks auth for
+// itself", enforced centrally in Console::execute(); an extra check inside a
+// handler is a second gate that a reader of BUILTINS alone would not see. The
+// alternative — putting the whole command at PHYSICAL — is consistent but makes
+// the OTA state invisible to the only client that will ever perform an OTA.
+//
+// The mitigations: the elevated level is written HERE, next to the table, not
+// as a literal in console.cpp; it is only ever HIGHER than the row (a
+// parameter can never open a door the row closed, because execute()'s gate has
+// already run by then); and it goes through the same CmdAuth::denyMessage(), so
+// the refusal is byte-for-byte a module's refusal.
+//
+// Modules already do exactly this (mod_display.cpp's backlight, mod_hid.cpp's
+// requireInjectAuth), so the pattern is not new to the image — only to the
+// built-ins.
+// (The assert that this only ever RAISES the level is below requiredFor(),
+// which cannot be called before it is declared.)
+constexpr uint8_t OTA_MUTATE = PHYSICAL;
 
 // What an UNLISTED command requires. PHYSICAL, i.e. fail CLOSED: a built-in
 // added to console.cpp without a policy entry is refused to every network
@@ -123,6 +161,13 @@ constexpr bool isListed(const char *name) {
   }
   return false;
 }
+
+// The invariant for OTA_MUTATE, declared above: a parameter gate may only RAISE
+// its command's level. Execute()'s central gate has already run by the time a
+// handler sees the request, so a lower value here would not open anything — it
+// would simply be dead, misleading code claiming a gate that does nothing.
+static_assert(OTA_MUTATE >= requiredFor("ota"), "a parameter gate may only raise its command's level, never lower it");
+static_assert(isListed("ota"), "the `ota` built-in has no policy row");
 
 // The LOWEST level any built-in accepts — TOKEN today.
 //
