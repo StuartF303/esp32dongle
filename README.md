@@ -30,6 +30,7 @@ UI renders itself from those descriptors, so a new module needs no front-end cha
 | `hardware/` | Schematic. |
 | `backup/factory_release/` | Verified image of the stock LilyGO firmware — see its README. |
 | `CLAUDE.md` | Working notes and verified hardware facts. Read this before touching the device. |
+| `COWORK.md` | How the design and firmware sides split the work, and the shared constraints. |
 
 ## Build and flash
 
