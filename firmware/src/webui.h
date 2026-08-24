@@ -203,6 +203,13 @@ var ARRIVED=(function(){
 // whole single-session design exists to prevent, arriving through the other
 // door. localStorage survives both, so the page comes back holding the token
 // the device is still honouring.
+//
+// WHAT IT COSTS IS RECORDED AS BACKLOG S12, not left implicit: localStorage is
+// keyed by ORIGIN and is durable, and this origin is http://192.168.4.1 -- the
+// SoftAP default here and on a long tail of other consumer devices. A token
+// that survives a tab close also survives the phone joining somebody else's
+// 192.168.4.1. Accepted trade, bounded by the idle and absolute session caps;
+// read S12 before changing either side of it.
 var T=localStorage.getItem("tk"),ws=null;
 // From GET /api/status. 0 until it answers; nothing hardcodes 4.
 var PINLEN=0;

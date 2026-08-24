@@ -29,8 +29,10 @@
 #include "modauth.h"
 #include "otaupload.h"
 #include "pairing.h"
+#include "pairurl.h"
 #include "pinpolicy.h"
 #include "protocol.h"
+#include "qrfit.h"
 #include "ratelimit.h"
 #include "registry.h"
 #include "webui.h"
@@ -290,11 +292,42 @@ bool sinkRegistered_ = false;
 // udp_remove(), which is what actually unbinds and returns the pcb to
 // MEMP_NUM_UDP_PCB. So the destructor has to run, so it has to be `delete`.
 //
-// Deleting a DNSServer whose listen() never succeeded is safe: ~AsyncUDP()
-// passes a possibly-null _pcb to udp_recv() and udp_remove(), and both begin
-// with LWIP_ERROR("... invalid pcb", pcb != NULL, return) — a guard that is
-// compiled in regardless of LWIP_NOASSERT, because LWIP_ERROR always runs its
-// handler and only the diagnostic is conditional (lwIP src/core/udp.c).
+// Deleting a DNSServer whose listen() never succeeded is safe, but NOT for the
+// reason this comment used to give. It said the null-pcb guard "is compiled in
+// regardless of LWIP_NOASSERT" — and LWIP_NOASSERT is not defined in this build
+// at all, so that was an argument about a macro playing no part. Re-derived
+// against the pinned tree (lwIP 2.2.0 as shipped in
+// framework-arduinoespressif32-libs/esp32s3):
+//
+//   * ~AsyncUDP() (AsyncUDP.cpp:590) passes a possibly-null _pcb to udp_recv()
+//     and then _udp_remove(); both guard with
+//     LWIP_ERROR("udp_{recv,remove}: invalid pcb", pcb != NULL, return)
+//     (udp.c:1162 and :1185).
+//   * LWIP_NOASSERT IS NOT DEFINED HERE. The IDF port only defines it
+//     `#ifndef CONFIG_LWIP_ESP_LWIP_ASSERT` (port/esp32xx/include/arch/cc.h),
+//     and this build sets CONFIG_LWIP_ESP_LWIP_ASSERT=y (sdkconfig:2747).
+//     Assertions are ON.
+//   * WHAT ACTUALLY MAKES IT SAFE is that the IDF port OVERRIDES LWIP_ERROR
+//     before lwIP's own debug.h can define it. cc.h reaches the compiler via
+//     lwip/arch.h, ahead of debug.h, and debug.h's definition sits inside
+//     `#ifndef LWIP_ERROR` — so the port's wins:
+//         #define LWIP_ERROR(message, expression, handler) \
+//             do { if (!(expression)) { handler; }} while(0)
+//     (the CONFIG_LWIP_DEBUG-off branch; the port's own comment says it is
+//     deliberately declining to abort the way an assert-enabled build otherwise
+//     would). So the guard runs `return` and nothing else — no abort, no
+//     diagnostic.
+//
+// Corroborated from the shipped binary rather than the source alone: `strings
+// lib/liblwip.a` contains twenty "...: invalid pcb" messages, all of them from
+// tcp.c/tcp_out.c LWIP_ASSERT sites, and NEITHER udp.c string — exactly what
+// you get when those two are LWIP_ERROR under the port's non-debug branch,
+// which discards the message.
+//
+// THE CONCLUSION IS UNCHANGED; the mechanism is a property of the IDF port, not
+// of lwIP. Anyone reasoning from stock lwIP semantics on the strength of the old
+// sentence would have reached the right answer for the wrong reason, and would
+// have been wrong the moment CONFIG_LWIP_DEBUG or the port's override moved.
 //
 // WHAT IS *NOT* RECLAIMED, stated because it is the number that matters on
 // this board: AsyncUDP's shared "async_udp" task (4 KB stack) and its 32-slot
@@ -305,6 +338,23 @@ bool sinkRegistered_ = false;
 DNSServer *dns_ = nullptr;
 // Free-heap delta measured across the DNS responder's construction and start,
 // in bytes, from the device rather than from arithmetic. Reported by status().
+//
+// IT IS A DELTA, NOT A CONSTANT, and it must not be quoted as one. Two
+// ESP.getFreeHeap() samples with a construct+start between them pick up
+// whatever else the allocator did in that window, so the figure jitters.
+// Measured on this device, 2026-08-24:
+//
+//     first enable of a boot   5,168 on three consecutive cold boots
+//                              (5,388 seen once in an earlier session)
+//     later enables            204 or 424, alternating unpredictably across
+//                              48 disable/enable cycles
+//
+// THE SHAPE IS THE FACT; the numbers are a sample. The ~4.7 KB step on the
+// first enable is real and reproduces every time — it is AsyncUDP's shared
+// "async_udp" task (4 KB stack) plus its 32-slot queue, created on the first
+// listen() and never destroyed — and the two-order-of-magnitude drop on later
+// enables is real too. The exact value of either is not, so a budget for F1
+// (BLE, ~40 KB) should be drawn against "about 5 KB, once" rather than 5,168.
 int32_t dnsHeapCost_ = 0;
 
 char ssid_[24] = {0};
@@ -357,6 +407,26 @@ char psk_[AuthFmt::PSK_MAX + 1] = {0};
 // authLock_, mirrored in NVS under NVS_KEY_PSK_SRC.
 bool pskSet_ = false;
 char pin_[AuthFmt::PIN_LEN + 1] = {0};
+
+// THE ONE ASSERT pairing.h CANNOT MAKE ABOUT ITSELF. It is dependency-free —
+// <stddef.h>/<stdint.h>/<string.h> and nothing else, so that the native env can
+// compile it — which means it cannot see AuthFmt::PIN_LEN and cannot size
+// MAX_PIN from it. This file includes both, so it is the only place the two can
+// be compared, and the comparison belongs here rather than in a comment.
+//
+// WHAT BREAKS WITHOUT IT, and it is precisely the failure the "WHY THE PIN
+// TRUNCATES AND THE PAYLOAD DOES NOT" note in pairing.h reasons about: if
+// PIN_LEN ever exceeds MAX_PIN, publish() bounds the PIN to MAX_PIN and stores
+// the PREFIX, while the CODE_PAIR url built a few lines below carries the FULL
+// value. The panel would then show digits that do not match what the device
+// accepts — and the QR beside them would carry digits that do. That note argues
+// a truncated PIN is safe because it is VISIBLY wrong and the user retries; a
+// truncated PIN next to an untruncated QR of the same PIN is not visibly wrong
+// at all, it is a scannable code that works and printed digits that do not.
+// Sixteen against four leaves plenty of room today; this is here so the day it
+// does not is a build failure.
+static_assert(Pairing::MAX_PIN >= AuthFmt::PIN_LEN,
+              "Pairing::publish() would truncate the PIN on the panel while the pair URL carries it in full");
 
 // ---- shutdown coordination: the one genuine deadlock in this design -----
 //
@@ -1594,9 +1664,24 @@ esp_err_t handlePage(httpd_req_t *req) { return sendWebUi(req); }
 //    template length, so a URI of any other length is rejected BEFORE the
 //    strncmp. That is the same length-then-compare rule the default matcher
 //    (httpd_uri_match_simple) applies, so the exact routes behave identically
-//    with the wildcard matcher installed. `match_upto` is the URI length up to
-//    the query string, so `/api/status?x=1` still matches and `/api/statusXYZ`
-//    still does not.
+//    with the wildcard matcher installed.
+//
+//    WHAT THE MATCHER IS ACTUALLY GIVEN, spelled out because a looser version
+//    of this sentence ("`match_upto` is the URI length up to the query
+//    string") is what let handleWildcard() below drift out of step with the
+//    router for two years' worth of request forms. httpd_uri():
+//
+//        if (res->field_set & (1 << UF_PATH)) {
+//            uri = httpd_find_uri_handler(hd, req->uri + res->field_data[UF_PATH].off,
+//                                         res->field_data[UF_PATH].len, req->method, &err);
+//        }
+//
+//    so it is http_parser's UF_PATH field — POINTER AND LENGTH, not just a
+//    clamped length, and the parameter is named `len` rather than
+//    `match_upto`. `/api/status?x=1` matches because the query is outside
+//    UF_PATH; `http://192.168.4.1/api/status` matches because the OFFSET skips
+//    the authority; `/api/statusXYZ` does not, on length. The handler is still
+//    handed the whole `req->uri`, which is why PairUrl::pathOf() exists.
 //
 // ===========================================================================
 // THE PIN ROUTE IS NOT A PIN CHECK. THIS IS THE IMPORTANT PART.
@@ -1680,6 +1765,23 @@ constexpr Probe PROBES[] = {
     {"/connecttest.txt", "200 OK", "text/plain", PROBE_CONNECTTEST_BODY},
 };
 
+// "A probe path is checked before the PIN shape, and no probe path is PIN_LEN
+// digits, so the two cannot collide" — made a compile error rather than a
+// sentence. It reads the LIVE table, so adding a row named "/4821" (or moving
+// PIN_LEN to 13 and adding "/generate_204"... which is not digits, but the
+// point is that neither end of this can be checked by eye) fails the build
+// instead of quietly turning one probe path into a page that any of 10^4 URLs
+// also serves.
+constexpr bool noProbeIsPairShaped() {
+  for (const Probe &p : PROBES) {
+    if (PairUrl::isPairPath(p.path, PairUrl::litLen(p.path))) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(noProbeIsPairShaped(), "a captive-probe path is now PIN-shaped; the probe lookup would shadow the pair URL");
+
 esp_err_t sendProbe(httpd_req_t *req, const Probe &p) {
   httpd_resp_set_status(req, p.status);
   if (p.type != nullptr) {
@@ -1688,43 +1790,61 @@ esp_err_t sendProbe(httpd_req_t *req, const Probe &p) {
   // The ONLY header these get, and it is not about this device: a cached
   // "the internet works" is an answer we cannot withdraw when the phone moves
   // to a network where it is false. Deliberately NOT setCommonHeaders() —
-  // nothing here should acquire a header by inheritance, and the response must
-  // stay byte-comparable with what a real captive-free network returns.
-  // esp_http_server adds only "HTTP/1.1 <status>", Content-Type and
-  // Content-Length (httpd_txrx.c: `httpd_hdr_str`); there is no Server header
-  // and nothing names the device.
+  // nothing here should acquire a header by inheritance, and NOTHING IN A PROBE
+  // RESPONSE SHOULD NAME THE DEVICE. esp_http_server adds only
+  // "HTTP/1.1 <status>", Content-Type and Content-Length (httpd_txrx.c's
+  // `httpd_hdr_str`, which is that one format string and nothing else); there
+  // is no Server header.
+  //
+  // WHAT THESE ARE NOT is byte-identical to a real captive-free network, and an
+  // earlier version of this comment claimed they were. The 204 rows set no
+  // type, so `ra->content_type` keeps httpd's default and the response carries
+  // `Content-Type: text/html` and `Content-Length: 0` — a real
+  // connectivitycheck.gstatic.com/generate_204 sends neither. The
+  // `Cache-Control: no-store` is ours as well. NONE OF IT CHANGES A VERDICT:
+  // every probe client tests the status code, and for Apple/Microsoft the body
+  // text, and no platform's probe inspects these headers — which is why this is
+  // a comment fix and not a code change. Do not "restore byte-comparability" by
+  // reaching into the response writer; the headers are unavoidable there
+  // (httpd_resp_send always emits both) and the gain would be zero.
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   return httpd_resp_send(req, p.body != nullptr ? p.body : "", p.body != nullptr ? HTTPD_RESP_USE_STRLEN : 0);
 }
 
 esp_err_t handleWildcard(httpd_req_t *req) {
-  // req->uri carries the query string; the matcher was given the length up to
-  // it, so compare on the same basis. strcspn rather than strchr so a URI with
-  // no '?' needs no second branch.
-  const char *uri = req->uri;
-  const size_t n = strcspn(uri, "?");
+  // THE PATH, ON THE SAME BASIS THE ROUTER MATCHED ON.
+  //
+  // This used to be `strcspn(req->uri, "?")` under a comment claiming exactly
+  // that, and the claim was FALSE for two inputs — an absolute-form target and
+  // a fragment. Both failed closed with a 404, so it was correctness and an
+  // honest comment rather than a hole, but "the path" meaning one thing in the
+  // router and another here is a bug waiting for its second edit.
+  //
+  // The router calls httpd_find_uri_handler() with `req->uri +
+  // res->field_data[UF_PATH].off` and `.len` — the pointer is moved as well as
+  // the length clamped (verified in the pinned httpd_uri.c AND in the
+  // disassembly of the shipped libesp_http_server.a; the derivation is in
+  // pairurl.h). We are handed `req->uri` unmodified, so `GET
+  // http://192.168.4.1/4821` arrives here with its first byte 'h' and
+  // `GET /4821#x` arrives with all seven bytes. PairUrl::pathOf() does the same
+  // two removals httpd's parse did, and is host-tested over both forms —
+  // which nothing in mod_http.cpp can be.
+  const PairUrl::Path path = PairUrl::pathOf(req->uri);
 
   for (size_t i = 0; i < sizeof(PROBES) / sizeof(PROBES[0]); i++) {
-    if (strlen(PROBES[i].path) == n && strncmp(uri, PROBES[i].path, n) == 0) {
+    // Length-then-compare, the same rule httpd_uri_match_simple() applies, so
+    // `/generate_204x` cannot reach a probe answer.
+    if (PairUrl::equals(path, PROBES[i].path)) {
       return sendProbe(req, PROBES[i]);
     }
   }
 
-  // The pair URL. SHAPE ONLY — see the block above. `n == PIN_LEN + 1` counts
-  // the leading slash, so this matches "/dddd" and nothing longer: "/48211"
-  // and "/4821/x" both fall through to the 404, because a path that merely
-  // starts with the right digits is not a pair URL.
-  if (n == (size_t)AuthFmt::PIN_LEN + 1 && uri[0] == '/') {
-    bool allDigits = true;
-    for (size_t i = 1; i < n; i++) {
-      if (uri[i] < '0' || uri[i] > '9') {
-        allDigits = false;
-        break;
-      }
-    }
-    if (allDigits) {
-      return sendWebUi(req);
-    }
+  // The pair URL. SHAPE ONLY — see the block above and pairurl.h, which owns
+  // the predicate and asserts it over all 10^4 digit strings and every
+  // near-miss shape. "/48211", "/4821/x" and "/482a" are all false: a path that
+  // merely starts with the right digits is not a pair URL.
+  if (PairUrl::isPairPath(path)) {
+    return sendWebUi(req);
   }
 
   // Everything else. ONE message for every unmatched path, with nothing in it
@@ -1956,6 +2076,16 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
     // fabricated value defeats that.
     AuthEvt ev{decision == RateLimit::LOCKED ? "locked" : "rate_limited", attemptsLeft, retryMs, 0, true, false};
     Bus::emit("http.auth", fillAuthEvent, &ev);
+    // THE SAME WIPE THE 401 AND 200 PATHS DO, and this exit was the one that
+    // did not. It is worth almost nothing on its own — `candidate` is a 5-byte
+    // stack frame holding the CALLER'S OWN guess, which they just sent us in
+    // clear over the wire, and the frame is reused by the next request within
+    // microseconds. What it is worth is the discipline: this file's stated rule
+    // (the SECRETS block at the top) is that a PIN-shaped value never survives a
+    // return, and a rule with one exception is a rule nobody can check by
+    // reading. The exception is also the WORST one to leave open, because the
+    // 429 branch is the one an attacker can drive at will.
+    memset(candidate, 0, sizeof(candidate));
     return sendJsonDoc(req, "429 Too Many Requests", doc);
   }
 
@@ -2832,7 +2962,17 @@ bool startServer(char *err, size_t errCap) {
 // commented out in AsyncUDP.cpp. So the first enable pays and later
 // enable/disable cycles do not, and a delta measured on a second enable will
 // be much smaller than the first. That is a property of the framework, not a
-// leak of ours: see the note beside dns_ for what stopDns() does reclaim.
+// leak of ours: see the note beside dns_ for what stopDns() does reclaim, and
+// for the OBSERVED SPREAD — this is a jittery two-sample delta and the
+// individual figures should not be quoted as a fixed cost.
+//
+// AND IT IS NOT A LEAK EITHER, which was worth establishing rather than
+// assuming. 48 consecutive `disable http` / `enable http` cycles on this
+// device, 2026-08-24: free_heap oscillated in a ~500 byte band with no trend,
+// and `min_free_heap` — the low-water mark, which a per-cycle leak cannot
+// leave alone — did not move at all across the last 24 of them, nor did
+// `largest_free_block`. An earlier four-sample series looked monotonically
+// downward at ~125 B/cycle; that was noise inside this band.
 void stopDns() {
   if (dns_ == nullptr) {
     return;
@@ -3684,18 +3824,119 @@ void passphraseRejection(AuthFmt::PassphraseCheck c, size_t len, size_t bad, Cmd
   }
 }
 
+// ---- "will this passphrase still fit the join QR?" -----------------------
+//
+// THE TRAP THIS EXISTS TO CLOSE, and it is live rather than hypothetical:
+// stuart has already used `psk set` once with a hand-chosen value.
+//
+// `psk set` accepts the full WPA2 range, 8..63 characters. The JOIN QR does
+// not. ARCHITECTURE.md §"QR pairing on the LCD" measured the cliff and it is
+// much earlier than the limit looks: qrfit.h can only draw up to VERSION 3
+// (29 modules — version 4 is 41 modules with its quiet zone, which is 1 px per
+// module on an 80 px panel and unreadable by any camera), and version 3 at ECC
+// LOW holds 53 bytes in byte mode. The `WIFI:T:WPA;S:...;P:...;;` envelope is
+// 18 bytes and a 12-character SSID spends 12 more, so a SCANNABLE join code has
+// room for about 23 passphrase characters — not 63.
+//
+// AND ESCAPING COUNTS AGAINST IT. wifiqr.h doubles each of `\ ; , : "`, so a
+// 40-character all-semicolon passphrase occupies 80 bytes and falls back too.
+// That is why this ENCODES rather than counting: the only honest answer comes
+// from the same encoder, on the same payload, at the same ECC and version cap
+// the renderer will use.
+//
+// CROSSING THE LINE IS OTHERWISE SILENT. Nothing fails; the panel simply stops
+// drawing a join QR and prints the passphrase as text (mod_display.cpp's REG_QR
+// fallback), which the operator only discovers by walking over to look at the
+// device — or by pointing a phone at it and waiting.
+//
+// COST: one qrcodegen_encodeText at mask AUTO, measured at ~12 ms on this chip,
+// on an AUTH_PHYSICAL action reachable only over the USB cable and used perhaps
+// once in the life of the device. It is NOT on the tick path — httpTick()
+// publishes the payload and lets mod_display.cpp encode it once per
+// Pairing::seq().
+//
+// SECRETS: `payload` is the passphrase in a different wrapper (pairing.h, "THE
+// JOIN PAYLOAD IS A SECRET. ALL OF IT.") and the encoder's output buffer is
+// that same string as a module bitstream. Both are wiped before returning, the
+// same discipline mod_display.cpp's qrForget() applies to its cached copy.
+struct JoinFit {
+  bool ok;        // a symbol was produced AND the panel can draw it at 2 px/module
+  size_t bytes;   // the escaped `WIFI:` payload's length, 0 if it would not even build
+  uint8_t version;  // 1..3 when ok, else 0
+};
+
+JoinFit joinQrFit(const char *ssid, const char *psk) {
+  JoinFit f{false, 0, 0};
+  char payload[Pairing::MAX_PAYLOAD + 1];
+  if (!WifiQr::join(payload, sizeof(payload), ssid, psk)) {
+    // Over MAX_PAYLOAD, or an empty SSID/passphrase. Unreachable for a legal
+    // pair (the worst legal case is 190 of 224) but reported as "does not fit"
+    // rather than asserted, because that is exactly what it means on the panel.
+    memset(payload, 0, sizeof(payload));
+    return f;
+  }
+  f.bytes = strlen(payload);
+
+  uint8_t tmp[QrFit::BUF_LEN];
+  uint8_t qr[QrFit::BUF_LEN];
+  QrFit::Fit fit = QrFit::encode(payload, tmp, qr);
+  f.ok = fit.ok;
+  // qrfit.h's sizeForVersion() inverted: 21, 25, 29 modules are versions 1..3.
+  f.version = fit.ok ? (uint8_t)((fit.size - 17) / 4) : (uint8_t)0;
+
+  memset(payload, 0, sizeof(payload));
+  memset(tmp, 0, sizeof(tmp));
+  memset(qr, 0, sizeof(qr));
+  return f;
+}
+
+// Adds the three fields both branches of `psk` report. Kept together so the
+// read and the write cannot drift into describing the QR differently.
+//
+// It reports the fit of what is CURRENTLY LIVE. On a failed `set` that reverted
+// (see setPassphrase step 4), that is the OLD passphrase — which is the honest
+// answer to "what will the panel show", and the reason this is computed from
+// psk_ after the fact rather than from the argument.
+void addJoinQrFields(JsonObject d) {
+  char ssid[sizeof(ssid_)];
+  char psk[sizeof(psk_)];
+  {
+    // Copy under the lock, encode outside it. Holding authLock_ across ~12 ms
+    // of mask selection would stall httpTick()'s 250 ms pass for no reason.
+    Lock l(authLock_);
+    snprintf(ssid, sizeof(ssid), "%s", ssid_);
+    snprintf(psk, sizeof(psk), "%s", psk_);
+  }
+  JoinFit f = joinQrFit(ssid, psk);
+  memset(psk, 0, sizeof(psk));
+  // The FACT, never the payload: whether the panel can draw a join code, how
+  // many bytes the code would carry, and which version. A QR's version is not
+  // its content — mod_display.cpp reports the same figure on `display status`.
+  d["qr_join_ok"] = f.ok;
+  d["qr_join_bytes"] = (uint32_t)f.bytes;
+  if (f.ok) {
+    d["qr_join_version"] = (uint32_t)f.version;
+  }
+}
+
 DispatchResult actPsk(JsonObjectConst p, JsonObject d, CmdError *err) {
   JsonVariantConst setv = p["set"];
   if (setv.isNull()) {
-    Lock l(authLock_);
-    d["ssid"] = (const char *)ssid_;
-    d["psk"] = (const char *)psk_;
-    // Which of the two this is matters: a generated passphrase is 64.4 bits and
-    // unrelated to anything public, an owner-chosen one is whatever the owner
-    // decided it should be. See the note beside psk_.
-    d["source"] = pskSet_ ? "set" : "generated";
-    d["len"] = (uint32_t)strlen(psk_);
-    d["security"] = "wpa2-psk/ccmp";
+    {
+      Lock l(authLock_);
+      d["ssid"] = (const char *)ssid_;
+      d["psk"] = (const char *)psk_;
+      // Which of the two this is matters: a generated passphrase is 64.4 bits and
+      // unrelated to anything public, an owner-chosen one is whatever the owner
+      // decided it should be. See the note beside psk_.
+      d["source"] = pskSet_ ? "set" : "generated";
+      d["len"] = (uint32_t)strlen(psk_);
+      d["security"] = "wpa2-psk/ccmp";
+    }
+    // On the READ too, not just the write: an owner who set a long passphrase
+    // in an earlier session has no other way to find out that the join QR has
+    // been a text fallback ever since. See addJoinQrFields().
+    addJoinQrFields(d);
     return DISPATCH_OK;
   }
 
@@ -3740,6 +3981,14 @@ DispatchResult actPsk(JsonObjectConst p, JsonObject d, CmdError *err) {
     Lock l(authLock_);
     d["source"] = pskSet_ ? "set" : "generated";
   }
+  // THE ONE FIELD THAT IS A WARNING. `qr_join_ok: false` means the value that
+  // is now live cannot be drawn as a scannable join code and the panel will
+  // print it as text instead — which is a real, silent regression in how the
+  // device is paired, and it happens well before the 63-character WPA2 limit
+  // the rejection messages talk about. Nothing here refuses the passphrase over
+  // it: WPA2 legality and QR legibility are different questions, and the owner
+  // on the cable is entitled to trade the second away.
+  addJoinQrFields(d);
   if (!ok) {
     d["reverted"] = rep.reverted;
     d["nvs_reverted"] = rep.nvsReverted;
@@ -3881,7 +4130,9 @@ const ModuleParam PSK_PARAMS[] = {
     ModParam::str("set", false,
                   "omit to READ the current passphrase. 8..63 printable ASCII replaces it, restarts the AP and "
                   "drops every session, client and WebSocket. Ending a session rotates the pairing PIN, so the "
-                  "LCD will show a new one."),
+                  "LCD will show a new one. The reply's qr_join_ok says whether the value still fits the LCD's "
+                  "join QR — it stops fitting at roughly 23 characters, far below the 63 WPA2 allows, and each "
+                  "of \\ ; , : \" counts twice."),
 };
 
 const ModuleParam PIN_PARAMS[] = {
@@ -3906,7 +4157,8 @@ constexpr ModuleAction HTTP_ACTIONS[] = {
      ModAuth::requiredFor("http", "status")},
     {"psk",
      "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping "
-     "every session and client and rotating the pairing PIN. USB console only (auth >= physical), both ways",
+     "every session and client and rotating the pairing PIN. Reports qr_join_ok: a passphrase can stop being "
+     "scannable from the LCD long before 63 characters. USB console only (auth >= physical), both ways",
      MOD_PARAMS(PSK_PARAMS), ModAuth::requiredFor("http", "psk")},
     {"pin", "the pairing PIN. USB console only; regenerate:true issues a new one and revokes every session",
      MOD_PARAMS(PIN_PARAMS), ModAuth::requiredFor("http", "pin")},

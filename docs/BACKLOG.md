@@ -40,6 +40,29 @@ from a build that no longer exists, the value opens nothing, and the design prop
 no new PIN is ever written to flash — holds regardless. Recorded so the next person to dump the
 partition finds an explanation instead of a live-looking credential.
 
+**S12. The session token is a durable secret at a colliding origin (`http://192.168.4.1`).**
+`webui.h` moved the token from `sessionStorage` to `localStorage` on 2026-08-24, and the reasoning
+is sound and stands: `sessionStorage` does not survive a tab close or an iOS tab eviction, so a
+phone that got evicted came back with no token while the device still held the session for up to
+90 s — locked out of its own device, with no PIN on the LCD to re-pair with, which is the exact
+lockout the single-session design exists to prevent. `localStorage` closes that.
+
+**What it costs, which `sessionStorage` did not.** `localStorage` is keyed by ORIGIN and is
+durable, and this origin is `http://192.168.4.1` — the ESP32 SoftAP default, and the default of a
+long tail of travel routers, dashcams, cameras and drones. Any *other* device the phone later
+joins that serves a page from that address gets same-origin read access to our token. It needs
+hostile JS on that other device and the token has to still be live, so the probability is low, and
+it is bounded by the 15-minute idle and 4-hour absolute caps. It is slightly compounded by the
+page's `script-src 'unsafe-inline'`, which is what makes an injected script on such a page cheap
+to write.
+
+**Accepted, not fixed.** The lockout it prevents is certain and happens to the owner; the leak it
+risks needs a second hostile device on the same default address. Recorded so it is revisited on
+purpose. If it is ever revisited, the levers are: a non-default SoftAP address (a one-line
+`softAPConfig()` and a change to every printed/QR'd URL, including the version-1 QR budget in
+ARCHITECTURE.md); binding the token to something `localStorage` cannot carry across origins; or
+clearing the key on a clean unpair, which helps only the tidy case.
+
 **S11. A WebSocket may sit unauthenticated for as long as it likes, and there are only three.**
 `mod_http.cpp` writes `wsClients_[].openedMs` in `wsAdd()` and **nothing ever reads it**. There is
 therefore no handshake timeout: a socket that completes the HTTP upgrade and then never sends the

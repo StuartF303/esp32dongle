@@ -358,11 +358,27 @@ The uppercase scheme is worth a whole version and costs nothing: URL schemes are
 to every browser, and `HTTP://192.168.4.1/4821` is entirely inside QR alphanumeric mode
 (`0-9 A-Z $%*+-./: `), where the lowercase form falls back to byte mode.
 
-**The last row is the rule that had to be measured.** `psk set` accepts any legal WPA2
-passphrase up to 63 characters, and a long one pushes the join code to version 5, where 80 pixels
-of panel leaves 1 px per module — 0.14 mm, below what a phone can resolve. So the renderer
-**refuses to draw below 2 px/module and prints the SSID and passphrase as text instead**. An
-unreadable QR is worse than no QR: it looks like it should work.
+**The last row is the rule that had to be measured — and the cliff is much earlier than it
+looks.** The renderer **refuses to draw below 2 px/module and prints the SSID and passphrase as
+text instead**, because an unreadable QR is worse than no QR: it looks like it should work.
+
+But version 3 at ECC LOW holds **53 bytes in byte mode**, and the `WIFI:` envelope plus a 12-character
+SSID already spends 30 of them (`WIFI:T:WPA;S:` 13 + SSID 12 + `;P:` 3 + `;;` 2). So the
+passphrase budget for a scannable join code is **23 characters, not 63** — measured against the
+vendored encoder:
+
+```
+23-char psk -> 53 bytes -> version 3, drawable at 2 px/module
+24-char psk -> 54 bytes -> does not encode at version 3; text fallback
+```
+
+Escaping counts against that budget too: each `\ ; , : "` in the SSID or passphrase becomes two
+bytes, so a 40-character all-semicolon passphrase expands to 80 and falls back as well.
+
+The generated passphrase is 15 characters and fits with room. A hand-chosen `psk set` value can
+cross the line without any warning that it has — the panel simply stops showing a join QR and
+prints the key as text. That is a real trap and is why `psk set` reports whether the new value
+still fits.
 
 Security is unchanged by the QR: a camera needs line of sight to the screen, the same out-of-band
 property as reading the digits. The QR is therefore governed by the same `Pairing::shouldShow()`
@@ -379,7 +395,7 @@ seconds later. The 90 s grace window exists partly to survive that. Not provokin
 than surviving it.
 
 So the device runs a **DNS responder that answers every query with 192.168.4.1**, and replies to
-the two well-known probes with exactly what a working connection returns:
+the well-known probes with what a working connection returns:
 
 | probe | expected |
 |---|---|
@@ -388,6 +404,30 @@ the two well-known probes with exactly what a working connection returns:
 
 The DNS responder is required, not optional: the probes are fetched **by hostname**, so without
 one they never reach this device at all and the answer is moot.
+
+**Corrected 2026-08-24, after review: this works on iOS and very probably does not on Android.**
+The earlier version of this section claimed both platforms would go quiet. Apple's CNA decides on
+HTTP alone and on the literal string `Success` in the body, so suppressing the sheet is expected
+to work. Android does not: `NetworkMonitor` runs an **HTTPS** probe
+(`https://www.google.com/generate_204`, `Settings.Global.captive_portal_use_https`, default on) in
+parallel with the HTTP one, and only the HTTPS 204 marks a network *validated*. HTTP 200–399
+excluding 204 marks it a *captive portal*. A 204 on HTTP with the HTTPS probe failing is neither,
+and on Android 10+ that is `PARTIAL_CONNECTIVITY` — the "Wi-Fi has limited connectivity, stay
+connected?" prompt, network unvalidated, mobile data still preferred.
+
+This device cannot answer the HTTPS probe. Nothing listens on 443, and it could not present a
+valid `www.google.com` certificate if it did. Pointing DNS at ourselves does not help: the probe
+then resolves to `192.168.4.1:443` and gets an RST instead of a DNS failure. Unvalidated either
+way.
+
+So the honest scoring: the DNS responder plus the probe table buys **iOS**, and the 5,168 B it
+costs on the first enable is spent on that. On Android the 90 s grace window is the **primary**
+defence against the phone wandering back to mobile data, not a backstop. Two mitigations that
+cost nothing: Android's prompt is per-SSID and answering "stay connected" is remembered, and the
+Windows probes (`/ncsi.txt`, `/connecttest.txt`) are HTTP-only like Apple's and should work.
+Retained rather than reverted because it is cheap, correct, and definitely helps one of the two
+platforms — but **test it on a real Android phone before any UI design commits to "reconnecting
+is rare".**
 
 **This is deliberately a lie, and it is recorded as one.** The device is telling the phone that a
 network with no route anywhere has working internet. The justification is that the user joined

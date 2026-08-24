@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "pairing.h"
 #include "qrfit.h"
 #include "wifiqr.h"
 
@@ -45,10 +46,18 @@ const char *PSK_GENERATED = "abcd-efgh-jkmnp";
 // AuthFmt::PSK_MAX == 63. Legal via `psk set`.
 const char *PSK_MAX_LENGTH = "aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffggg";
 
-// pairing.h's buffer, restated here rather than included: this suite is about
-// whether the two files AGREE on the bound, and importing the constant would
-// make that agreement true by construction instead of by test.
-constexpr size_t MAX_PAYLOAD = 224;
+// PAIRING.H'S ACTUAL BUFFER, not a copy of it. This was `constexpr size_t
+// MAX_PAYLOAD = 224;` under a comment claiming the restatement was what made
+// the agreement testable — and wifiqr.h claimed, on the strength of it, that
+// "a test asserts they agree". Neither was true: a third hardcoded literal
+// agrees with the other two only by coincidence, and lowering
+// Pairing::MAX_PAYLOAD left this suite entirely green.
+//
+// The agreement that matters is not "both files say 224". It is "the buffer
+// pairing.h publishes can hold the longest string this builder can produce for
+// any legal input", and that is asserted below, from the builder rather than
+// from arithmetic. See test_pairings_buffer_holds_the_worst_case_join_produces.
+constexpr size_t MAX_PAYLOAD = Pairing::MAX_PAYLOAD;
 
 }  // namespace
 
@@ -138,22 +147,38 @@ void test_a_passphrase_of_nothing_but_semicolons_is_the_worst_legal_case() {
   TEST_ASSERT_TRUE(strlen(out) <= MAX_PAYLOAD);
 }
 
-void test_the_worst_legal_case_of_all_still_fits_MAX_PAYLOAD() {
-  // pairing.h's stated worst case: a 23-character SSID (ssid_ is char[24])
-  // and a 63-character passphrase, both entirely metacharacters. 13 + 46 + 3
-  // + 126 + 2 = 190. This is the assertion that keeps MAX_PAYLOAD's 224 and
-  // wifiqr.h's arithmetic from drifting apart.
+void test_pairings_buffer_holds_the_worst_case_join_produces() {
+  // THE ASSERTION wifiqr.h's comment CLAIMS EXISTS, and until now did not.
+  //
+  // The bound is not a number to be agreed on in three places. It is a
+  // question about this builder: what is the longest string join() can emit for
+  // any input mod_http.cpp can hand it, and does Pairing::MAX_PAYLOAD hold it?
+  // The worst input is the largest legal SSID (ssid_ is char[24], so 23
+  // characters) and the longest legal WPA2 passphrase (AuthFmt::PSK_MAX, 63),
+  // both made entirely of metacharacters so every byte escapes to two.
+  //
+  // Computed by RUNNING the builder, so an edit to the envelope, to the escape
+  // set, or to escapedLen() moves this number and this test with it. Lowering
+  // Pairing::MAX_PAYLOAD below the answer now fails here — which is what the
+  // old restated literal could not do.
   char ssid[24];
   memset(ssid, ':', 23);
   ssid[23] = '\0';
   char psk[64];
   memset(psk, ':', 63);
   psk[63] = '\0';
-  TEST_ASSERT_EQUAL_size_t(190, WifiQr::joinLen(ssid, psk));
 
-  char out[MAX_PAYLOAD + 1];
-  TEST_ASSERT_TRUE(WifiQr::join(out, sizeof(out), ssid, psk));
-  TEST_ASSERT_EQUAL_size_t(190, strlen(out));
+  const size_t worst = WifiQr::joinLen(ssid, psk);
+  TEST_ASSERT_EQUAL_size_t(190, worst);  // 13 + 46 + 3 + 126 + 2, pairing.h's stated arithmetic
+  TEST_ASSERT_TRUE_MESSAGE(Pairing::MAX_PAYLOAD >= worst,
+                           "Pairing::MAX_PAYLOAD can no longer hold the longest payload WifiQr::join() can build");
+
+  // And that it is the WORST: one more character of either input is illegal
+  // input, but is still refused rather than truncated (covered below), and
+  // nothing at or under the legal bound exceeds it.
+  char maxOut[Pairing::MAX_PAYLOAD + 1];
+  TEST_ASSERT_TRUE(WifiQr::join(maxOut, sizeof(maxOut), ssid, psk));
+  TEST_ASSERT_EQUAL_size_t(worst, strlen(maxOut));
 }
 
 // ---- the refusal ---------------------------------------------------------
@@ -267,6 +292,38 @@ void test_a_63_character_passphrase_is_built_but_will_not_draw() {
   TEST_ASSERT_EQUAL_size_t(63, strlen(PSK_MAX_LENGTH));
 }
 
+void test_the_scannable_passphrase_budget_is_23_characters_not_63() {
+  // THE NUMBER `psk set` NOW REPORTS, pinned to the encoder that decides it.
+  //
+  // ARCHITECTURE.md §"QR pairing on the LCD" states the cliff — version 3 at
+  // ECC LOW holds 53 bytes, the envelope is 18 and this SSID is 12, so 23
+  // passphrase characters fit and 24 do not — and mod_http.cpp's actPsk()
+  // reports it per value as `qr_join_ok`. Both are prose about what
+  // qrcodegen_encodeText does; this is the assertion.
+  //
+  // If a future edit changes ECC, the version cap, boostEcl or the envelope,
+  // this fails and the two documents that quote "23" become findable.
+  char psk[64];
+  for (size_t n = 22; n <= 24; n++) {
+    memset(psk, 'a', n);
+    psk[n] = '\0';
+
+    char payload[Pairing::MAX_PAYLOAD + 1];
+    TEST_ASSERT_TRUE(WifiQr::join(payload, sizeof(payload), SSID, psk));
+    TEST_ASSERT_EQUAL_size_t(30 + n, strlen(payload));  // 18 envelope + 12 SSID
+
+    uint8_t tmp[QrFit::BUF_LEN];
+    uint8_t qr[QrFit::BUF_LEN];
+    QrFit::Fit f = QrFit::encode(payload, tmp, qr);
+    if (n <= 23) {
+      TEST_ASSERT_TRUE_MESSAGE(f.ok, "a passphrase inside the 23-character budget stopped fitting version 3");
+      TEST_ASSERT_EQUAL_INT(29, f.size);  // version 3
+    } else {
+      TEST_ASSERT_FALSE_MESSAGE(f.ok, "24 characters now fits; the budget psk set reports has moved");
+    }
+  }
+}
+
 void test_an_escaped_passphrase_can_push_a_shorter_key_off_the_panel_too() {
   // Not only length: escaping is a cost the user cannot see. A 40-character
   // passphrase of semicolons occupies 80 bytes in the payload and lands well
@@ -299,7 +356,7 @@ int main() {
   RUN_TEST(test_metacharacters_in_the_ssid_too);
   RUN_TEST(test_escapedLen_counts_two_for_each_metacharacter);
   RUN_TEST(test_a_passphrase_of_nothing_but_semicolons_is_the_worst_legal_case);
-  RUN_TEST(test_the_worst_legal_case_of_all_still_fits_MAX_PAYLOAD);
+  RUN_TEST(test_pairings_buffer_holds_the_worst_case_join_produces);
 
   RUN_TEST(test_over_length_refuses_and_leaves_out_empty);
   RUN_TEST(test_the_refusal_boundary_is_exact_at_MAX_PAYLOAD);
@@ -309,6 +366,7 @@ int main() {
 
   RUN_TEST(test_generated_form_encodes_at_version_three_and_is_drawable);
   RUN_TEST(test_a_63_character_passphrase_is_built_but_will_not_draw);
+  RUN_TEST(test_the_scannable_passphrase_budget_is_23_characters_not_63);
   RUN_TEST(test_an_escaped_passphrase_can_push_a_shorter_key_off_the_panel_too);
   return UNITY_END();
 }

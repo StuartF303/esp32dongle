@@ -127,17 +127,51 @@ void setup() {
   Led::begin();
 
   Serial.begin(115200);
-  // Serial is HWCDC here (ARDUINO_USB_MODE=1, native USB-Serial/JTAG). In
-  // Arduino-ESP32 3.3.11, HWCDC::write (cores/esp32/HWCDC.cpp:540-623) uses a
-  // 256-byte TX ring and, when full, retries xRingbufferSend up to 20 times
-  // at tx_timeout_ms (default 100ms) — so one write can block ~2s whenever a
-  // host is attached but not draining, which is normal while debugging.
+  // ---- THE TX TIMEOUT, AND WHY IT IS NOT THE SAME AT BOOT AND AT RUN ------
+  //
+  // STEADY STATE IS ZERO, and that is deliberate. Whichever CDC class Serial
+  // is, a nonzero timeout means a write can BLOCK when the host is attached
+  // and not draining, which is the normal state of a debug console sitting in
+  // a terminal nobody is looking at:
+  //
+  //   * MODE=0, TinyUSB (the default env). USBCDC::write
+  //     (cores/esp32/USBCDC.cpp:395-438) loops on tud_cdc_n_write_available()
+  //     and, at a nonzero timeout, spins until millis() passes it.
+  //   * MODE=1, HWCDC (the fallback env). HWCDC::write (HWCDC.cpp:540+) retries
+  //     xRingbufferSend into a 256-byte ring up to a consecutive-timeout cap,
+  //     so one write can block for cap x tx_timeout_ms.
+  //
   // Scheduler::run() runs tasks in registration order, so a blocked write in
-  // heartbeat.event would delay console.poll and the LED heartbeat behind
-  // it. Zero timeout makes the retry loop resolve in microseconds and drops
-  // bytes under sustained backpressure instead — the right trade for a
-  // debug console.
-  Serial.setTxTimeoutMs(0);
+  // heartbeat.event would delay console.poll and the LED heartbeat behind it.
+  // Zero resolves in microseconds and drops bytes under sustained backpressure
+  // instead — the right trade for a debug console, and unchanged.
+  //
+  // BOOT IS NOT STEADY STATE, and setting zero here cost us a real defect.
+  // With tx_timeout_ms == 0, USBCDC::write is explicitly non-blocking:
+  //
+  //     size_t space = tud_cdc_n_write_available(itf);
+  //     if (!space) { tud_cdc_n_write_flush(itf);
+  //                   if (non_blocking) { size = so_far; break; } ... }
+  //
+  // i.e. it returns a SHORT WRITE and the tail of the line is gone. The banner
+  // below is ~1.5 KB emitted back to back into a 64-byte TinyUSB FIFO that
+  // only drains when the host polls (1 ms USB full-speed frames), so it
+  // overruns immediately. Captured on this device over three reboots: one log
+  // was clean, one lost 7 bytes ("--- partition table (as read from flash at
+  // runti"), and one lost 97 bytes across three lines, including half the
+  // "====" rule under the title. It looked like a capture artefact and was
+  // not — the bytes never left the chip.
+  //
+  // So the banner gets a FINITE timeout and the scheduler gets zero back at the
+  // end of setup(). What that costs, stated rather than hidden: if a host has
+  // the port OPEN and has stopped reading, each write here can wait up to
+  // BOOT_TX_TIMEOUT_MS, and there are ~45 of them — call it 0.9 s of extra boot
+  // in that one case. It costs NOTHING when no host is attached, because both
+  // write() implementations return immediately when the CDC is not connected,
+  // and nothing when the host is draining normally, because a 64-byte packet
+  // clears in about one USB frame.
+  constexpr uint32_t BOOT_TX_TIMEOUT_MS = 20;
+  Serial.setTxTimeoutMs(BOOT_TX_TIMEOUT_MS);
   // Native USB-Serial/JTAG CDC: give the host a moment to enumerate before we
   // start printing, so the banner isn't lost off a fresh boot.
   uint32_t waitStart = millis();
@@ -258,6 +292,17 @@ void setup() {
 
   Serial.println();
   Serial.println("setup() complete — entering scheduler loop. Try: help");
+
+  // BACK TO NON-BLOCKING, and this line is the other half of the one at the
+  // top of setup(). From here on Serial is written from scheduler tasks, where
+  // a blocking write delays every task registered after it — see the long note
+  // up there for both classes' behaviour. Losing a byte of a heartbeat event is
+  // acceptable; stalling console.poll behind an unread terminal is not.
+  //
+  // AFTER the last banner line, deliberately: that line is the one a human
+  // waits for before typing, so it is the last that must not be clipped.
+  Serial.flush();
+  Serial.setTxTimeoutMs(0);
 }
 
 void loop() {

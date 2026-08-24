@@ -36,9 +36,15 @@ What changed that the design side needs to know about:
 - **`grace_ms`** (always present, 90000) and **`grace_active`** / **`grace_ms_left`** (only while a
   window is armed) are the reconnecting state made readable.
 - **`dns_up` / `dns_heap_bytes`** report the captive-probe DNS responder. The `424` in this capture
-  is the *second* enable of that boot: most of the cost (measured at `5168` on the first enable) is
-  a shared framework task created once and never freed, so the recurring figure is small and the
-  one-off is not.
+  is the *second* enable of that boot: most of the cost is a shared framework task created once and
+  never freed, so the recurring figure is small and the one-off is not.
+
+  **`dns_heap_bytes` is a jittery delta, not a fixed figure — do not put the number in a UI as if
+  it were one.** It is two `ESP.getFreeHeap()` samples with a construct-and-start between them, so
+  it picks up whatever else the allocator did in that window. Re-measured 2026-08-24: `5168` on
+  three consecutive cold boots (and `5388` once in an earlier session), then `204` **or** `424` on
+  later enables, alternating unpredictably across 48 disable/enable cycles. The *shape* — about
+  5 KB once, then a couple of hundred bytes — reproduces every time; the exact values do not.
 - **`modules-token.json` vs `modules.json` is still the pair to diff**, and it always was. The
   2026-08-17 files were the same *size* — 28,804 bytes each, which is a coincidence: `physical` →
   `token` loses three characters, `2` → `1` loses none, and `true` → `false` on three actions gains

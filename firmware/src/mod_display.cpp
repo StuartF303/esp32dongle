@@ -133,8 +133,10 @@ constexpr uint32_t DONE_LINGER_MS = 2500;
 // three ticks (120 ms) and is still visually instant.
 constexpr uint8_t MAX_DRAW_PER_TICK = 2;
 // Rows of the QR block pushed per SPI transaction. 8 rows of 80 px is 1,280
-// bytes of stack in drawQr(); see the measurement in the comment there for why
-// this is not 1.
+// bytes of stack in drawQr(). MEASURED 2026-08-24, THIS IS SLOWER THAN 1, not
+// faster — the comment in drawQr() carries both arms' numbers and why the
+// original reasoning was wrong. Left at 8 pending stuart's call rather than
+// changed quietly.
 constexpr int16_t QR_ROWS_PER_BAND = 8;
 
 // ===========================================================================
@@ -313,12 +315,41 @@ enum Screen : uint8_t {
   SCREEN_COUNT
 };
 
+// THE SELECTABLE VOCABULARY. Bounded by SCREEN_NAMED_COUNT, and that bound is
+// what makes "there is no `screen pair`" true rather than a convention — the
+// `screen` action's parse loop iterates THIS array.
 const char *SCREEN_NAME[SCREEN_NAMED_COUNT] = {"status", "diag"};
+
+// WHAT IS ON THE GLASS, which is a different question and used not to be
+// answerable. `display status` reported SCREEN_NAME[screen_] — the user's
+// SELECTION — so during pairing, with the pair screen actually being drawn, it
+// said "status". Anyone verifying this device over the console was told the
+// wrong thing about the one screen that matters most.
+//
+// SEPARATE ARRAY, NOT A LONGER SCREEN_NAME, and the separation is the point:
+// extending SCREEN_NAME to SCREEN_COUNT would put "pair" inside the loop the
+// `screen` action searches, and `screen pair` would start working. That must
+// not regress — the QR IS the PIN in a form a camera reads from across a room,
+// so an action that puts it on the panel is an action that leaks the pairing
+// secret to anyone who can send one. Reporting a state and selecting it are
+// different capabilities and now use different tables.
+const char *ACTIVE_SCREEN_NAME[SCREEN_COUNT] = {"status", "diag", "pair"};
+static_assert(SCREEN_NAMED_COUNT < SCREEN_COUNT, "the pair screen must stay outside the selectable range");
 
 // Status and diag share one table — that is the "the two screens cost no
 // extra" property, and it survives: what changed is that a THIRD screen now
 // exists which could not share it.
 constexpr const Rect *SCREEN_RECT[SCREEN_COUNT] = {STATUS_RECT, STATUS_RECT, PAIR_RECT};
+
+// SELECTED -> SHOWING, in one place. displayTick() decides what goes on the
+// glass with this, and the `screen` action answers with it, so a reply can
+// never contradict the panel it is describing. Extracted when `display status`
+// stopped reporting the selection and started reporting the truth: two copies
+// of this expression is two things to keep in step, and the whole defect being
+// fixed was two things that were not.
+uint8_t effectiveScreen(uint8_t selected) {
+  return (selected == SCREEN_STATUS && Pairing::visible()) ? (uint8_t)SCREEN_PAIR : selected;
+}
 
 const Rect &rectFor(uint8_t screen, uint8_t region) {
   return SCREEN_RECT[screen < SCREEN_COUNT ? screen : 0][region < REGION_COUNT ? region : 0];
@@ -986,9 +1017,12 @@ void drawWrapped(int16_t x, int16_t y, const char *s, uint16_t colour, size_t co
 //   * THE ENCODE WAS PAID PER DRAW. It is a pure function of the payload, so
 //     it now happens once per Pairing::seq() in ensureQrEncoded() and a
 //     repaint of unchanged pixels pays nothing for it.
-//   * THE BLIT WAS TWICE ITS FLOOR. 5,241 us against 2,560 us of actual
-//     transfer is per-transaction overhead, 80 times over. Rows are batched
-//     into bands now.
+//   * THE BLIT WAS ASSUMED TO BE TWICE ITS FLOOR — 5,241 us against 2,560 us
+//     of transfer at 40 MHz — and that gap was attributed to per-transaction
+//     overhead, 80 times over. Rows were batched into bands to close it.
+//     THAT DIAGNOSIS WAS WRONG. See the measurement in drawQr() below: the
+//     banding made it SLOWER, and the missing time is the 6,400
+//     qrcodegen_getModule() calls, not the SPI.
 //
 // What is left, and it is stated as a cost rather than hidden: the tick on
 // which the PIN rotates still pays encode + blit together. Nothing here splits
@@ -1015,10 +1049,34 @@ void drawQr(const Rect &q) {
     // lookup for a pixel outside the symbol yields false — qrcodegen_getModule
     // bounds-checks — which is what makes that work.
     //
-    // ROWS ARE BATCHED, and that is measured too. One writePixels() per row was
-    // 80 SPI transactions for 12,800 bytes and took 5,241 us, against a 2,560 us
-    // floor at 40 MHz — i.e. half the time was per-call overhead. A band of
-    // QR_ROWS_PER_BAND rows costs 1,280 bytes of stack and cuts it to 10 calls.
+    // ROWS ARE BATCHED, AND IT BOUGHT NOTHING. This comment used to claim that
+    // one writePixels() per row cost 5,241 us against a 2,560 us transfer floor
+    // and that banding "cuts it". MEASURED ON THE DEVICE, 2026-08-24, both
+    // arms built from this same source and flashed back to back, six
+    // `display refresh` repaints each, reading qr_blit_us off `display status`:
+    //
+    //     QR_ROWS_PER_BAND = 1  (80 writePixels calls)   5,478..5,494 us
+    //     QR_ROWS_PER_BAND = 8  (10 writePixels calls)   5,622..5,679 us
+    //
+    // Banding is about 175 us SLOWER — 3% the wrong way — and costs 1,280 bytes
+    // of stack for the band buffer. The blit writes all 6,400 pixels regardless
+    // of the symbol's version, so the two arms are like for like.
+    //
+    // THE COST IS THE MODULE LOOKUP, NOT THE TRANSPORT. 70 SPI transactions'
+    // difference is worth ~175 us, i.e. ~2.5 us per call — trivial. What is
+    // left is 6,400 qrcodegen_getModule() calls, each bounds-checking and
+    // extracting a bit, at roughly 0.8 us apiece. Anything that makes this
+    // faster has to attack that loop: at scale 2 each module covers a 2x2 pixel
+    // block, so 841 lookups would do the work of 6,400.
+    //
+    // NOT DONE HERE, deliberately. It is a real change to code that puts a
+    // machine-readable secret on glass, and this machine has no camera — a
+    // regression that smears or mirrors the symbol cannot be detected from
+    // here, only by stuart pointing a phone at the panel. It is also not worth
+    // much: the blit is 5.6 ms of a 40 ms tick, it happens on repaints minutes
+    // apart, and the encode beside it is 24 ms. Dropping the banding back to 1
+    // row is the free half of it and is stuart's call, not a quiet edit —
+    // the numbers above are here so he can make it.
     tft.startWrite();
     tft.setAddrWindow((uint16_t)q.x, (uint16_t)q.y, (uint16_t)q.w, (uint16_t)q.h);
     uint16_t band[QR_BLOCK * QR_ROWS_PER_BAND];
@@ -1285,8 +1343,7 @@ void displayTick() {
   // the same property REG_AUTH has carried since the PIN first appeared here
   // and the reason is unchanged: hiding the secret is a deliberate operator
   // action, reversible in one command; the reverse is not.
-  const uint8_t effective =
-      (screen_ == SCREEN_STATUS && Pairing::visible()) ? (uint8_t)SCREEN_PAIR : screen_;
+  const uint8_t effective = effectiveScreen(screen_);
   if (effective != activeScreen_) {
     // Same handling as a `screen` command, and for the same reason: the region
     // geometry changes completely, so the panel must be blanked rather than
@@ -1503,7 +1560,14 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
 
   if (strcmp(act, "status") == 0) {
     d["panel"] = up_;
-    d["screen"] = SCREEN_NAME[screen_ < SCREEN_NAMED_COUNT ? screen_ : 0];
+    // WHAT IS BEING DRAWN, not what was asked for. These differ for exactly one
+    // state — pairing — and that state is the one an operator most needs the
+    // truth about. `screen_selected` keeps the old value available, because
+    // "the operator chose diag and pairing is therefore hidden" and "the
+    // operator chose status and pairing is not showing" are different
+    // situations that `screen` alone can no longer distinguish.
+    d["screen"] = ACTIVE_SCREEN_NAME[activeScreen_ < SCREEN_COUNT ? activeScreen_ : 0];
+    d["screen_selected"] = SCREEN_NAME[screen_ < SCREEN_NAMED_COUNT ? screen_ : 0];
     d["width"] = W;
     d["height"] = H;
     d["backlight_on"] = blPct_ > 0;
@@ -1520,6 +1584,36 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
     d["worst_render_what"] = worstRenderWhat_;
     d["qr_encode_us"] = qrEncodeUs_;
     d["qr_blit_us"] = qrBlitUs_;
+    // ---- WHICH SYMBOL IS ON THE GLASS -----------------------------------
+    //
+    // ADDED BECAUSE THE VERIFICATION OF THIS FEATURE WAS AN ARGUMENT RATHER
+    // THAN A MEASUREMENT. With only qr_encode_us and qr_blit_us to go on,
+    // "the panel is showing the JOIN code" had to be inferred from a timing
+    // ratio — 24,377 us against 12,237 us for a known version-1 encode, i.e.
+    // 1.99, which excludes version 1 and points at version 3. That is a good
+    // inference and it is not a fact. These three make it one.
+    //
+    // THEY DISCLOSE NOTHING. A symbol's version is its SIZE, not its content:
+    // "29 modules" is derivable from the passphrase's LENGTH, which `psk`
+    // already reports (at AUTH_PHYSICAL) and which the panel itself shows to
+    // anyone who can see it. `qr_code` says JOIN or PAIR, which is the same
+    // bit `http status`'s `station_associated` already carries at this same
+    // auth level. The payload, the PIN and the passphrase remain unreachable
+    // from every transport — see the SECRETS block in mod_http.cpp.
+    //
+    // qr_ok false with a code published means THE TEXT FALLBACK IS ON THE
+    // GLASS: the payload encoded too large to draw at 2 px/module (qrfit.h),
+    // so the panel is printing the passphrase instead of a symbol. That is
+    // otherwise invisible from here, and it is the state an owner-set
+    // passphrase over ~23 characters silently puts the device into.
+    d["qr_code"] = Pairing::code() == Pairing::CODE_JOIN   ? "join"
+                   : Pairing::code() == Pairing::CODE_PAIR ? "pair"
+                                                           : "none";
+    d["qr_ok"] = qrCoded_ && qrFit_.ok;
+    // qrfit.h's sizeForVersion() inverted: 21, 25, 29 modules are versions 1..3.
+    d["qr_version"] = (uint32_t)(qrCoded_ && qrFit_.ok ? (qrFit_.size - 17) / 4 : 0);
+    d["qr_size"] = (uint32_t)(qrCoded_ && qrFit_.ok ? qrFit_.size : 0);
+    d["qr_scale"] = (uint32_t)(qrCoded_ && qrFit_.ok ? qrFit_.scale : 0);
     // Whether the PIN is on screen, NEVER the PIN itself: this response goes
     // out over the same WebSocket the PIN exists to avoid.
     d["pin_on_screen"] = Pairing::visible();
@@ -1593,7 +1687,14 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
           clearPending_ = true;
           memset(cache_, 0, sizeof(cache_));
         }
-        d["screen"] = SCREEN_NAME[i];
+        d["screen_selected"] = SCREEN_NAME[i];
+        // WHAT WILL ACTUALLY BE DRAWN, from the same expression displayTick()
+        // applies (within one 40 ms tick). Selecting "status" while pairing is
+        // visible puts the PAIR screen on the glass, and a reply that said
+        // "status" would be the same lie `display status` used to tell. The
+        // action's vocabulary is unchanged — this is a report, not a selection,
+        // and "pair" still cannot be asked for.
+        d["screen"] = ACTIVE_SCREEN_NAME[effectiveScreen(i)];
         return DISPATCH_OK;
       }
     }
@@ -1621,7 +1722,11 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
 
 void displayStatus(JsonObject d) {
   d["panel"] = up_;
-  d["screen"] = SCREEN_NAME[screen_ < SCREEN_NAMED_COUNT ? screen_ : 0];
+  // The SAME field name as `display status` and now the same meaning: what is
+  // on the glass. It said the selected screen here too, so `modules` and the
+  // panel disagreed during pairing exactly as the action did.
+  d["screen"] = ACTIVE_SCREEN_NAME[activeScreen_ < SCREEN_COUNT ? activeScreen_ : 0];
+  d["screen_selected"] = SCREEN_NAME[screen_ < SCREEN_NAMED_COUNT ? screen_ : 0];
   d["backlight_pct"] = blPct_;
   d["frames"] = frames_;
   d["region_writes"] = regionWrites_;

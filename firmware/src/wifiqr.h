@@ -59,9 +59,17 @@
 //                       ------
 //                        190  worst case, + 1 for the NUL
 //
-// which is exactly the number pairing.h sizes MAX_PAYLOAD (224) from. The two
-// files derive it independently and a test asserts they agree; if this comment
-// and that one ever disagree, the test is what settles it.
+// which is exactly the number pairing.h sizes MAX_PAYLOAD (224) from.
+//
+// WHAT THE TEST ACTUALLY ASSERTS, since this comment previously claimed
+// something it did not. It is NOT "the two files derive 224 independently and
+// agree" — test_wifiqr had a third hardcoded 224 of its own, so lowering
+// Pairing::MAX_PAYLOAD left the suite green and the claim was worth nothing.
+// test_pairings_buffer_holds_the_worst_case_join_produces now RUNS this
+// builder on the worst legal input and asserts Pairing::MAX_PAYLOAD holds the
+// result. That is the property the buffer exists for; the specific number is
+// not. If this comment and pairing.h's ever disagree, the test is what settles
+// it — and now it can.
 //
 // The REAL cases are much smaller and are the rows of ARCHITECTURE.md's
 // measured table:

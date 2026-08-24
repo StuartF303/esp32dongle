@@ -112,7 +112,34 @@ above `0x800000` will be rejected and `littlefs` will not work.
 | `error: no response within 3.0s` on the **first** command right after `-t upload` | Not a fault. The post-flash reset re-enumerates native USB, and the 3 s default is too tight while the host re-attaches | `sleep 5` after upload, or `--timeout 8` on the first call. It answers normally from then on |
 | `{"ok":false,"e":{"code":"ELINE","msg":"line too long, discarded"}}` on the first command after a **failed** upload | Not a fault — the console recovering correctly. esptool's SLIP sync frames were left in the device's RX buffer and parsed as one over-long line | Ignore it and re-issue the command. If it repeats indefinitely, something is genuinely spamming the port |
 | Device enumerates but console times out repeatedly, even with a long timeout and no heartbeat events on a passive listen | App wedged, or flashed a bad build | Hold **BOOT (GPIO 0)** while plugging in → ROM download mode, then reflash |
-| Console commands each take ~2 s; LED heartbeat stutters | `Serial.setTxTimeoutMs(0)` missing from `setup()`. `HWCDC::write` has a 256-byte TX ring and retries `xRingbufferSend` 20× at a 100 ms default when the host is attached but not draining — normal while debugging. Tasks run in registration order, so a blocked write in `heartbeat.event` delays `console.poll` | Restore `Serial.setTxTimeoutMs(0)` immediately after `Serial.begin()` |
+| Console commands each take ~2 s; LED heartbeat stutters | `Serial.setTxTimeoutMs(0)` missing from the END of `setup()`. `HWCDC::write` has a 256-byte TX ring and retries `xRingbufferSend` at the 100 ms default when the host is attached but not draining — normal while debugging. Tasks run in registration order, so a blocked write in `heartbeat.event` delays `console.poll` | Restore `Serial.setTxTimeoutMs(0)` at the end of `setup()`. It is deliberately **20 ms during the banner** and 0 from the scheduler onwards — see the block comment in `main.cpp` |
+| `tools/console.py --reset` "works" but the device never rebooted: it exits 0 and prints heartbeats whose `uptime_ms` keeps **rising** | **DTR/RTS reset does not exist on the TinyUSB build.** Under `ARDUINO_USB_MODE=0` the reset is implemented in firmware (the same reason `touch_reset.py` is needed to flash), so toggling the lines does nothing. The rising-uptime heartbeat stream reads exactly like a boot log and is not one — this cost a session | Reboot in band: `console.py reboot`, **tolerate the `SerialException`** as the port drops, then reopen in a poll loop (`/dev/ttyACM*` — it may come back on a different number). `scratchpad/bootcap.py` in a working session does this |
+| `info.build` reads the same date **before and after** a flash | Not a fault and not a stale image. That string is `esp_app_desc_t.date/time`, baked in by **arduino-lib-builder** when the framework was built, not by our compile. It will not move no matter what you flash | Never use `info.build` to prove which image is live. Use a **behavioural** field — a status key the new build adds, a value it changes — or the binary-identity method below |
+| After a hand-rolled `esptool ... --after hard-reset`, the descriptor is still `303a:1001` but the console is dead and nothing answers | **The board is sitting in ROM download mode.** Reproduced twice. `--after hard-reset` drives RTS, and under `ARDUINO_USB_MODE=0` the RTS reset path is firmware-side — unavailable precisely when the firmware is not running, which is the state esptool just left it in | Pass `--after watchdog-reset` instead; it recovers immediately. `pio run -t upload` is unaffected (it has `touch_reset.py` in front of it) |
+
+## Proving which image is actually on the device
+
+`info.build` cannot do it (see the table above). Two methods that can:
+
+**Behavioural, cheap, and usually enough.** Read a field the new build adds or changes —
+`display status`'s `qr_version`, a new status key, a changed help string. One console call.
+
+**Binary identity, when it has to be certain.** Read `app0` back and diff it against the local
+build:
+
+```bash
+uvx --from esptool esptool --port /dev/ttyACM0 --no-stub \
+    read-flash 0x20000 0x152000 /tmp/app0.bin       # ~90 s at ROM-loader speed
+cmp -l /tmp/app0.bin firmware/.pio/build/t-dongle-s3-tinyusb/firmware.bin | wc -l
+```
+
+Expect **near-identical, not identical**. A real match looks like 1,351,147 of 1,351,216 bytes
+the same, with the differences confined to three places: the app-elf SHA-256 in the image
+header, `__TIME__` inside the framework's own banner string, and the trailing image checksum.
+Anything beyond those three regions means it is a different build.
+
+Remember esptool holds the port exclusively — no console during the read — and **always
+`--no-stub`**.
 
 ## Recovery
 

@@ -164,12 +164,23 @@ captive-portal sheet, Android warns and may silently switch back to mobile data.
 mitigates this in two ways, and both change the shape of the pairing flow you are designing.
 
 **First, the device answers the platforms' connectivity probes as though the internet works.** It
-runs a DNS responder pointing everything at itself and returns the exact success responses Apple
-and Google's probes expect. The practical effect on your design: **no captive-portal sheet, no
-"no internet" warning, and the phone stays on the AP** instead of wandering back to mobile data.
-You are designing for an ordinary browser tab, not for a captive sheet. Note the honest edge of
-this — the page genuinely has no route to anywhere, so a link to any external URL is a dead end
-that will now *look* like it should work.
+runs a DNS responder pointing everything at itself and returns the success responses the probes
+expect. What that buys, stated honestly because it differs by platform:
+
+- **iOS — expected to work.** Apple's Captive Network Assistant decides on HTTP alone, so the
+  sheet should not appear. You are designing for an ordinary browser tab, not a captive sheet.
+- **Android — unverified, and probably not.** Android validates on an **HTTPS** probe that this
+  device cannot answer (it would need a valid `www.google.com` certificate). The likely outcome is
+  `PARTIAL_CONNECTIVITY`: the "Wi-Fi has limited connectivity, stay connected?" prompt, and mobile
+  data still preferred. Answering "stay connected" is remembered per network, so it should be a
+  one-time annoyance rather than a recurring one.
+
+**The design consequence: do not assume reconnecting is rare.** On Android the 90 s grace window
+of §4.2 is the primary defence against the phone wandering off mid-session, not a backstop, so the
+reconnecting state is a main-line state and deserves main-line design attention.
+
+Note the honest edge of the lie as well — the page genuinely has no route to anywhere, so a link
+to any external URL is a dead end that will now *look* like it should work.
 
 **Second, QR codes on its own LCD.**
 
