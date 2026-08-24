@@ -289,6 +289,70 @@ liability. Minimum viable: a per-device PIN shown on the LCD, exchanged for a se
 with the AP running WPA2 using a key derived at first boot. The LCD is a real security asset
 here — it gives us an out-of-band channel most IoT devices lack.
 
+#### Pairing model — decided 2026-08-24 with stuart
+
+The AP is **single-client** and there is **one session**; `AP_MAX_CLIENTS` and `MAX_SESSIONS`
+both go to 1. The pairing PIN drops from 8 digits to **4**, and stops being a stored credential:
+
+- **RAM only.** The NVS `pin` key goes away. A PIN that is regenerated on every boot has no
+  reason to survive one, and not writing it removes the flash-wear vector `ratelimit.h` warns
+  about.
+- **Minted on power-up, on session end, and on lockout.** Session end is 90 s after the single
+  AP client disassociates, or an explicit unpair. Lockout is the rate limiter's 10-failure trip.
+- **Consumed on use.** The `Pairing::shouldShow()` policy is unchanged and now describes the
+  whole lifetime: the PIN is on the LCD exactly while the device is pairable.
+
+**Why 4 digits is defensible and 4 digits alone would not be.** The limiter allows about 34
+guesses an hour (1, 2, 4, 8, 16, 30, 30… s, then 15 minutes), so a static 4-digit PIN falls in
+about six days of grinding — a bounded search, which is the objectionable part. Minting a new PIN
+on every lockout makes each 17.5-minute cycle cover 10/10⁴ of a *fresh* space: the attacker never
+accumulates progress. Single-client association is the second half — while the phone holds the
+one slot nobody else can associate at all, so the brute-force window exists only while the device
+is unpaired. The gain is legibility: 4 digits render at roughly twice the height on a 160×80
+panel that is often read at arm's length from behind a desktop machine.
+
+**What it costs.** An attacker in radio range can squat the single AP slot and deny pairing, with
+no recovery except USB. That DoS already existed under S3's public passphrase — a squatter
+grinding the PIN was already occupying a slot — so rotation on lockout adds no new exposure.
+
+**The lockout this design had to avoid**: single PIN plus single session plus consume-on-use means
+a phone that silently drops the AP leaves a session slot held by a token the browser no longer
+has, and no PIN left to re-pair with. The 90 s grace period is the fix, and it is only coherent
+because the AP is single-client: the association *is* the session boundary. Inside the window the
+page reconnects from `localStorage` with no user action; outside it, revoke and re-mint.
+
+#### QR pairing on the LCD
+
+Two codes, because no single QR can both join a network and open a page: a `WIFI:` join payload
+(needed once — the phone remembers the network) and a pair URL carrying the current PIN in a path
+segment, `HTTP://192.168.4.1/<pin>`.
+
+The path segment rather than a query string is deliberate: `?` and `=` are not in QR alphanumeric
+mode but `:` `/` `.` and uppercase are, so `HTTP://192.168.4.1/4821` (23 chars) encodes as
+**version 1, 21×21**, where a query-string form needs byte mode and version 2. Scheme case is
+irrelevant to every browser.
+
+Fit on the 160×80 panel — height is the only constraint, and the pitch is 0.136 mm (0.96 inch
+diagonal, 178.9 px across it):
+
+| payload | mode | version | +4-module quiet zone | at 2 px/module |
+|---|---|---|---|---|
+| `HTTP://192.168.4.1/4821` | alnum | 1 (21×21) | 29 | 58 px |
+| `http://192.168.4.1/?p=4821` | byte, ECC M | 2 (25×25) | 33 | 66 px |
+| `WIFI:T:WPA;S:...;P:...;;` (38 ch) | byte, ECC L | 3 (29×29) | 37 | 74 px |
+
+All three fit with a spec-compliant quiet zone. At 2 px/module a module is 0.27 mm, which a 12 MP
+phone at 10 cm resolves at ~8 camera pixels — far above the ~3 px threshold. Version 1 at 3
+px/module with a 2-module quiet zone is 75 px and gives 0.41 mm modules; that is the robust
+option if the panel turns out to smear adjacent modules. **Decide it by scanning both off the
+real glass, not by arithmetic** — the risks here are specular glare and ST7735 pixel bleed, not
+resolution.
+
+Security is unchanged by the QR: a camera needs line of sight to the screen, the same out-of-band
+property as reading the digits. The QR is therefore governed by the same `Pairing::shouldShow()`
+predicate and must never be reachable through `display.screen` over the wire. The page strips the
+PIN from the URL with `history.replaceState` on load, so a reload cannot re-pair.
+
 ### Tool modules
 
 | Module | Claims | Notes |

@@ -28,7 +28,8 @@ Be concrete and opinionated. "It depends" is not a deliverable.
 Real HTML/CSS, openable in a browser, not images. They do not need to be wired to a device — stub
 the data from `api-samples/`. Priority screens:
 
-- **pair** — PIN entry, unpaired state
+- **pair** — PIN entry, unpaired state. Show all four of it: typed entry, arrival by QR scan
+  with the PIN already supplied, reconnecting inside the grace window, and the lockout (§4.4)
 - **home** — whatever you decide the landing view is
 - **module detail** — the generic renderer, shown with `storage` (many actions, several parameter
   types) and with `hid` (dangerous, has a pending-restart state)
