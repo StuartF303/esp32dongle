@@ -14,11 +14,11 @@
             "registry": true,
             "essential": true,
             "console": true,
-            "uptime": false
+            "uptime": true
         },
-        "criteria_all_met": false,
-        "uptime_ms": 27873,
-        "ticks": 94,
+        "criteria_all_met": true,
+        "uptime_ms": 176165,
+        "ticks": 687,
         "window_ms": 180000,
         "window_remaining_s": 0,
         "verdict": "idle",

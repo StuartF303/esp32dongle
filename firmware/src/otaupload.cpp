@@ -380,6 +380,25 @@ bool run(const Params &p, ReadFn read, void *ctx, Report &rep) {
         }
         continue;
       }
+      if (rs == READ_UNAUTHORISED) {
+        // THE SESSION AUTHORISING THIS UPLOAD WENT AWAY MID-TRANSFER. Stopping
+        // here is the whole point: without it a revoked party's image finishes
+        // writing and, with ?select=1, still gets pointed at by otadata — and
+        // on this device an OTA image is arbitrary code (backlog S9), so a
+        // revocation that does not stop an upload in flight revokes nothing
+        // that matters.
+        //
+        // Same `break` as every other failure, so the teardown below runs
+        // esp_ota_abort() on the open handle and otadata is not touched. A
+        // distinct code and a 401 rather than ECONN/400: the client's remedy
+        // is to re-pair, not to retry.
+        fail(rep, "EREVOKED", 401,
+             "the session authorising this upload was revoked at %u of %u bytes; the slot was aborted and nothing "
+             "was selected",
+             (unsigned)written, (unsigned)p.declaredLen);
+        failCode = rep.code;
+        break;
+      }
       if (rs == READ_ERROR) {
         fail(rep, "ECONN", 400, "the transport failed at %u of %u bytes; the slot was aborted", (unsigned)written,
              (unsigned)p.declaredLen);
@@ -455,6 +474,30 @@ bool run(const Params &p, ReadFn read, void *ctx, Report &rep) {
              "SHA-256 mismatch: received %s. The slot was aborted and nothing was selected", rep.sha256);
         break;
       }
+    }
+
+    // ---- STILL AUTHORISED? Last chance, and the last place it is free ----
+    //
+    // The transfer is complete and the digest checks out, but nothing
+    // irreversible has happened yet: the handle is still open, otadata is
+    // untouched, and a `break` from here runs esp_ota_abort() in the teardown
+    // below. One line later esp_ota_end() finalises the image, and a few lines
+    // after that ?select=1 points the bootloader at it.
+    //
+    // So this is where a revocation that arrived in the last few hundred
+    // milliseconds gets caught. The reader's per-chunk check (READ_UNAUTHORISED)
+    // covers the transfer itself; it cannot cover the window after the final
+    // read, and that window is precisely when an operator watching an upload
+    // they did not authorise would be reaching for `sessions revoke all`.
+    //
+    // NOT a second authentication — the transport re-asks its own question.
+    // A nullptr means the transport has no notion of authorisation and there
+    // is nothing to ask.
+    if (p.stillAuthorised != nullptr && !p.stillAuthorised(ctx)) {
+      fail(rep, "EREVOKED", 401,
+           "the session authorising this upload was revoked before the image was finalised; the slot was aborted "
+           "and nothing was selected");
+      break;
     }
 
     // ---- finalise --------------------------------------------------------

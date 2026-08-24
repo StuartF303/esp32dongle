@@ -69,11 +69,38 @@ enum ReadStatus : uint8_t {
   READ_EOF,        // the peer closed / no more body is coming
   READ_TIMEOUT,    // nothing available right now
   READ_ERROR,      // socket error, or the transport is shutting down
+  // THE AUTHORISATION FOR THIS UPLOAD HAS GONE. Distinct from READ_ERROR on
+  // purpose: the socket is fine and the bytes are arriving, but the credential
+  // that permitted the transfer stopped being valid part-way through. run()
+  // turns this into EREVOKED / 401 rather than ECONN / 400, because "your
+  // session was revoked" and "the link failed" call for completely different
+  // things from the client, and a transport that could only say ECONN would
+  // send a phone into a reconnect loop over an unpair.
+  //
+  // Transport-agnostic despite sounding HTTP-specific: any transport that can
+  // authorise an upload can lose that authorisation mid-transfer.
+  READ_UNAUTHORISED,
 };
 
 // Pulls up to `cap` bytes. Never blocks longer than the transport's own recv
 // timeout, so the deadlines below stay meaningful.
 typedef ReadStatus (*ReadFn)(void *ctx, uint8_t *buf, size_t cap, size_t *got);
+
+// "Is this upload still authorised?" Called by run() at the point where the
+// answer stops being recoverable — immediately before esp_ota_end(), i.e.
+// before the image is finalised and before the optional boot-slot selection.
+// Optional: a nullptr means the transport has no such notion and run() skips
+// the check entirely.
+//
+// WHY BOTH THIS AND READ_UNAUTHORISED. They cover different windows and
+// neither subsumes the other. The reader's check runs per chunk, so a
+// revocation during the transfer is noticed within one 4 KB read and the slot
+// is abandoned early. This one runs once, AFTER the last byte, and closes the
+// window between "the final chunk was read" and "the image is selected" — a
+// window that is short in wall-clock terms and is exactly where an operator
+// typing `sessions revoke all` over USB to stop an upload they did not
+// authorise would land.
+typedef bool (*AuthFn)(void *ctx);
 
 struct Params {
   // DECLARED UP FRONT, and required. Knowing the size means esp_ota_begin()
@@ -86,6 +113,9 @@ struct Params {
   // request, never implied: see the trade-off note above the upload handler in
   // mod_http.cpp for why this is available to an AUTH_TOKEN session at all.
   bool select = false;
+  // Re-checked before the image is finalised and selected. nullptr == the
+  // transport does not authorise uploads and there is nothing to re-check.
+  AuthFn stillAuthorised = nullptr;
 };
 
 struct Report {

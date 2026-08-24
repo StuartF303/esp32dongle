@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <bootloader_random.h>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <new>
 
 #include "apgrace.h"
 #include "authfmt.h"
@@ -32,6 +34,7 @@
 #include "ratelimit.h"
 #include "registry.h"
 #include "webui.h"
+#include "wifiqr.h"
 
 namespace {
 
@@ -174,6 +177,65 @@ constexpr int AP_CHANNEL = 6;
 // the attacker one association instead of four.
 constexpr int AP_MAX_CLIENTS = 1;
 
+// ===========================================================================
+// THE CAPTIVE-NETWORK PROBES — AND YES, THIS IS A LIE
+// ===========================================================================
+//
+// Stuart's decision, 2026-08-24. ARCHITECTURE.md §"Answering the
+// captive-network probes" carries the reasoning and states plainly that it is
+// a deliberate lie; this is the implementation and the framing does not get
+// softened on the way down.
+//
+// WHAT THE DEVICE IS SAYING. Both phone platforms fetch a well-known URL the
+// instant they associate and decide from the answer whether the network has
+// internet. This AP routes NOWHERE — there is no station interface, no NAT, no
+// upstream of any kind. Answering these probes with the success responses
+// tells the phone the opposite of the truth.
+//
+// WHY IT IS THE RIGHT LIE ANYWAY. When the probe fails, iOS raises the Captive
+// Network Assistant sheet over whatever the user was doing, and Android marks
+// the network "no internet", warns, and MAY SILENTLY MOVE BACK TO MOBILE DATA.
+// That last one drops the association, and under the pairing model an
+// association ending is a session ending 90 seconds later (apgrace.h). The
+// grace window exists partly to survive that; not provoking it is better than
+// surviving it. The user joined this AP on purpose, to drive a tool, for a few
+// minutes — the OS warning is protecting against a case that does not exist
+// here, and the cost of it firing is a lost pairing.
+//
+// THE HONEST ALTERNATIVE WAS CONSIDERED AND REJECTED. A real captive portal
+// (redirect the probe to the pairing page) was rejected because the CNA sheet
+// is a restricted browser with no durable localStorage — the session token
+// would not survive it — and Android would still consider the network
+// internetless and still consider leaving. It optimises first contact, which
+// the pair QR already solves, at the cost of every reconnect after it.
+//
+// WHAT THESE RESPONSES MAY CONTAIN: nothing. They sit BELOW the auth gate —
+// any associated station reaches them with no token — so they are fixed
+// bytes with no device state in them, no counters, no build string, and no
+// header that names the device. An unauthenticated stranger learns from them
+// exactly what they would learn from any Wi-Fi network in the world: that the
+// probe succeeded.
+//
+// The exact bodies are what a WORKING connection returns. They are not
+// approximations: iOS parses the Apple body for the literal word Success and a
+// different body fails the check even with a 200.
+constexpr const char *PROBE_APPLE_BODY = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+// Windows' NCSI. Cheap to add — two more rows in the table below and no new
+// handler — and included for that reason: a Windows laptop joining this AP to
+// drive the device gets the same non-event as a phone, and the alternative is
+// the "no internet, open" flag in the taskbar plus an msftconnecttest sheet.
+// Not required by anything on the phone path, and stated here so it is not
+// mistaken for one.
+constexpr const char *PROBE_NCSI_BODY = "Microsoft NCSI";
+constexpr const char *PROBE_CONNECTTEST_BODY = "Microsoft Connect Test";
+
+// The DNS responder is REQUIRED, not optional: every probe above is fetched by
+// HOSTNAME, so without one they never reach this device at all and the answers
+// are moot. It answers every query with the softAP address (ARCHITECTURE.md
+// again: "a DNS responder that answers every query with 192.168.4.1" — derived
+// from the interface here rather than spelled).
+constexpr uint16_t DNS_PORT = 53;
+
 // The module tick: reaps expired sessions and services a deferred reboot.
 constexpr uint32_t TICK_MS = 250;
 // How long after the response goes out a `reboot` command actually restarts.
@@ -205,6 +267,45 @@ constexpr const char *NVS_KEY_PIN = "pin";
 httpd_handle_t server_ = nullptr;
 bool apUp_ = false;
 bool sinkRegistered_ = false;
+
+// ---- the DNS responder, and why it is a POINTER --------------------------
+//
+// HEAP-ALLOCATED AND DELETED, not a file-scope object, and that is the whole
+// mechanism by which it does not leak a socket across an enable/disable cycle.
+// Read the framework before assuming otherwise (Arduino-ESP32 3.3.11,
+// libraries/AsyncUDP/src/AsyncUDP.cpp):
+//
+//     void AsyncUDP::close() {
+//       if (_pcb != NULL) {
+//         if (_connected) { _udp_disconnect(_pcb); }
+//         _connected = false;
+//       }
+//     }
+//
+// DNSServer::stop() is nothing but `_udp.close()`, and close() does NOT free
+// the pcb and does NOT unbind the port: lwIP's udp_disconnect() clears the
+// REMOTE address and leaves local_port alone, so a stopped DNSServer is still
+// sitting in lwIP's udp_pcbs list bound to port 53 with a live recv callback
+// pointing into an object we consider dead. Only ~AsyncUDP() calls
+// udp_remove(), which is what actually unbinds and returns the pcb to
+// MEMP_NUM_UDP_PCB. So the destructor has to run, so it has to be `delete`.
+//
+// Deleting a DNSServer whose listen() never succeeded is safe: ~AsyncUDP()
+// passes a possibly-null _pcb to udp_recv() and udp_remove(), and both begin
+// with LWIP_ERROR("... invalid pcb", pcb != NULL, return) — a guard that is
+// compiled in regardless of LWIP_NOASSERT, because LWIP_ERROR always runs its
+// handler and only the diagnostic is conditional (lwIP src/core/udp.c).
+//
+// WHAT IS *NOT* RECLAIMED, stated because it is the number that matters on
+// this board: AsyncUDP's shared "async_udp" task (4 KB stack) and its 32-slot
+// queue are created on the first listen() and never destroyed — the library's
+// _udp_task_stop() is commented out in the source. So the first `enable http`
+// pays a permanent cost and every later enable/disable cycle pays nothing.
+// dnsHeapCost_ measures exactly that and status() reports it.
+DNSServer *dns_ = nullptr;
+// Free-heap delta measured across the DNS responder's construction and start,
+// in bytes, from the device rather than from arithmetic. Reported by status().
+int32_t dnsHeapCost_ = 0;
 
 char ssid_[24] = {0};
 // SECRETS. Both are AUTH_PHYSICAL-only and go to exactly two places: the `psk`
@@ -640,6 +741,24 @@ uint8_t revokeAllLocked() {
   return n;
 }
 
+// How many sessions are live. CALLER HOLDS authLock_.
+//
+// The locked half of liveSessionCount(), split out because httpTick() needs
+// the count from inside a scope that already holds the lock — authLock_ is a
+// PLAIN mutex (xSemaphoreCreateMutex, not recursive), so calling the locking
+// form there would deadlock the loop task on its first tick. It was open-coded
+// at that call site; there are two such sites now, and two hand-rolled copies
+// of a three-line loop over the session table is one more than is worth having.
+uint8_t liveCountLocked() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
+    if (sessions_[i].used) {
+      n++;
+    }
+  }
+  return n;
+}
+
 // The `pin regenerate:true` action: a new PIN, every session revoked, and a
 // clean limiter. Caller must NOT hold authLock_.
 //
@@ -753,6 +872,23 @@ bool touchSessionByIdLocked(uint32_t id, uint32_t now) {
 // the file's session-lifetime note calls out. Only an inbound frame refreshes.
 bool sessionLiveLocked(uint32_t id) { return sessionIndexLocked(id) >= 0; }
 
+// The same question with the lock taken for you, for callers that hold nothing
+// — the OTA upload path is the only one today.
+//
+// DELIBERATELY THE NON-REFRESHING FORM. An upload in flight is real inbound
+// traffic, so refreshing the idle timer would be defensible; it is not done,
+// for the same reason drainEvents() does not. TOTAL_TIMEOUT_MS is 300 s and
+// SESSION_IDLE_MS is 900 s, and authenticate() refreshed the session at the
+// start of the request, so no legitimate upload can age out inside itself —
+// which means refreshing here could only ever EXTEND a session, never save
+// one. A check that is asking "may this continue?" must not be able to change
+// the answer to its own question.
+bool sessionLive(uint32_t id) {
+  Lock l(authLock_);
+  reapLocked(millis());
+  return sessionLiveLocked(id);
+}
+
 // Mints a session. Returns 0 on failure (which can only be an RNG failure —
 // a full table evicts instead, see below).
 uint32_t createSession(char *tokenOut, size_t cap, uint32_t now, bool *evicted) {
@@ -836,13 +972,7 @@ uint8_t revokeAllSessions() {
 
 uint8_t liveSessionCount() {
   Lock l(authLock_);
-  uint8_t n = 0;
-  for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
-    if (sessions_[i].used) {
-      n++;
-    }
-  }
-  return n;
+  return liveCountLocked();
 }
 
 // ===========================================================================
@@ -1396,7 +1526,12 @@ bool rotateAfterRevocation(uint8_t revoked, uint32_t endedId) {
 // Handlers
 // ===========================================================================
 
-esp_err_t handlePage(httpd_req_t *req) {
+// The embedded page, sent from the two routes that serve it: `/` and the pair
+// URL's `/<digits>`. Factored out rather than having the wildcard handler call
+// handlePage(), so neither route can acquire a header the other lacks — the
+// CSP in particular, which is the only thing confining this page to the
+// device.
+esp_err_t sendWebUi(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html; charset=utf-8");
   setCommonHeaders(req);
   // Confines the page to this device: no third-party script, no off-device
@@ -1404,6 +1539,199 @@ esp_err_t handlePage(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Content-Security-Policy",
                      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'");
   return httpd_resp_send(req, WEBUI_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+esp_err_t handlePage(httpd_req_t *req) { return sendWebUi(req); }
+
+// ===========================================================================
+// THE CATCH-ALL: the pair URL's `/<pin>` route, the captive probes, and 404
+// ===========================================================================
+//
+// Registered as `/*` and REGISTERED LAST. Both halves of that matter and both
+// were verified against the pinned SDK rather than assumed — ESP-IDF v5.5.5,
+// components/esp_http_server/src/httpd_uri.c (the framework ships the
+// precompiled library, so this is the tagged source the binary was built
+// from; the header in framework-arduinoespressif32-libs/esp32s3 matches it).
+//
+// 1. LAST, BECAUSE THE FIRST MATCH WINS. httpd_find_uri_handler() walks
+//    hd->hd_calls[] in REGISTRATION ORDER and returns the first entry whose
+//    URI and method both match:
+//
+//        for (int i = 0; i < hd->config.max_uri_handlers; i++) {
+//            if (!hd->hd_calls[i]) break;
+//            if (hd->config.uri_match_fn ? ... ) {
+//                if (hd->hd_calls[i]->method == method || ... == HTTP_ANY) {
+//                    return hd->hd_calls[i];
+//
+//    So `/api/status` keeps its own handler only while it is registered ahead
+//    of `/*`. Registering `/*` first would ALSO break registration outright,
+//    not just routing: httpd_register_uri_handler() refuses a URI that an
+//    existing handler already matches ("This will also catch cases when a
+//    registered URI wildcard pattern already accounts for the new URI being
+//    registered"), so every later handler would come back
+//    ESP_ERR_HTTPD_HANDLER_EXISTS and startServer() would fail. The loop below
+//    registers URIS[] in array order, so the array order IS the routing order.
+//
+// 2. A TEMPLATE WITH NO TRAILING '*' STILL REQUIRES A FULL-LENGTH MATCH, so
+//    turning the wildcard matcher on does NOT loosen the exact routes.
+//    Verified, because "strncmp with a wildcard matcher" is exactly the shape
+//    of bug that would let `/api/statusXYZ` reach handleStatus. From
+//    httpd_uri_match_wildcard():
+//
+//        const bool asterisk = last == '*' || (prevlast == '*' && last == '?');
+//        const bool quest    = last == '?' || (prevlast == '?' && last == '*');
+//        ...
+//        if (!quest) {
+//            if (!asterisk && len != exact_match_chars) {
+//                /* no special characters and different length - strncmp would
+//                   return false */
+//                return false;
+//            }
+//            return (strncmp(template, uri, exact_match_chars) == 0);
+//        }
+//
+//    For `/api/status` both flags are false and exact_match_chars is the full
+//    template length, so a URI of any other length is rejected BEFORE the
+//    strncmp. That is the same length-then-compare rule the default matcher
+//    (httpd_uri_match_simple) applies, so the exact routes behave identically
+//    with the wildcard matcher installed. `match_upto` is the URI length up to
+//    the query string, so `/api/status?x=1` still matches and `/api/statusXYZ`
+//    still does not.
+//
+// ===========================================================================
+// THE PIN ROUTE IS NOT A PIN CHECK. THIS IS THE IMPORTANT PART.
+// ===========================================================================
+//
+// ARCHITECTURE.md §"QR pairing on the LCD" puts the PIN in a path segment so
+// the pair QR encodes at version 1: `HTTP://192.168.4.1/4821`. This handler
+// serves the page for that URL. It must serve the page for ANY path of exactly
+// AuthFmt::PIN_LEN digits — 0000 through 9999 — and it does not look at pin_,
+// does not compare anything, does not touch the rate limiter and does not
+// create a session.
+//
+// WHY, AT LENGTH, BECAUSE THE OPPOSITE IS THE OBVIOUS IMPLEMENTATION:
+//
+//   * IF THE WRONG PIN 404'd AND THE RIGHT ONE 200'd, THIS ROUTE WOULD BE A
+//     PIN ORACLE. An attacker on the AP walks /0000 .. /9999 with plain GETs.
+//     Ten thousand requests over a SoftAP at a couple of milliseconds each is
+//     well under a minute, and the one that answers 200 is the PIN. They then
+//     spend ONE POST /api/session and pair. The whole credential falls in a
+//     single pass with a single failed attempt recorded — or none at all.
+//
+//   * IT WOULD BYPASS THE ONE CONTROL THAT MAKES 10^4 DEFENSIBLE. ratelimit.h
+//     and authfmt.h both state the argument: 4 digits is a small space, and
+//     what makes it hold is the limiter (about 34 guesses an hour), the PIN
+//     being minted afresh on every lockout, and the single-client AP. A GET
+//     that answers "is this the PIN?" is not rate-limited by any of that,
+//     because the limiter lives in handleSessionCreate() and this is not that
+//     handler. The rotation defence would be worthless too: rotation only
+//     helps because an attacker cannot accumulate progress across lockouts,
+//     and an oracle needs no lockouts.
+//
+//   * IT WOULD LEAK THROUGH TIMING EVEN IF THE STATUS CODES MATCHED. Which is
+//     why the answer is not "return the same status but do the comparison" —
+//     the comparison is not performed at all. There is nothing here to time,
+//     nothing to cache and nothing to get subtly wrong later.
+//
+// SO: EVERY PIN-SHAPED PATH GETS THE SAME PAGE. /0000 and /4821 are
+// byte-for-byte identical responses. The PIN in the path is NOT
+// authentication — it is a convenience for the browser, which reads it out of
+// location.pathname, replaceStates it away so a reload cannot re-pair, and
+// POSTs it to /api/session like any other attempt, taking the limiter with it.
+// The only thing this route decides is "does this look like a pair URL, so
+// should I serve the app rather than a 404".
+//
+// A path of the right SHAPE but the wrong pin still reaches the page and the
+// page's POST still fails with EPIN and a decremented attempts_remaining, so
+// the attacker has gained nothing over typing it into the box.
+//
+// ===========================================================================
+// The captive-network probes live here too
+// ===========================================================================
+//
+// One handler rather than six registrations. It keeps max_uri_handlers where
+// it is, it puts the ENTIRE unauthenticated surface of this server in one
+// function where it can be read in one go, and it makes the ordering question
+// disappear — a probe path is checked before the PIN shape, and no probe path
+// is PIN_LEN digits, so the two cannot collide.
+//
+// Everything about the bodies, and the fact that answering them at all is a
+// deliberate lie, is at PROBE_APPLE_BODY near the top of this file. Read that
+// before changing a byte of them.
+struct Probe {
+  const char *path;
+  const char *status;
+  const char *type;  // nullptr: leave httpd's default, there is no body anyway
+  const char *body;  // nullptr: empty body
+};
+
+// Apple hits captive.apple.com/hotspot-detect.html and, on some releases,
+// /library/test/success.html. Android hits /generate_204 on
+// connectivitycheck.gstatic.com, clients3.google.com and www.google.com, and
+// /gen_204 on some builds. Windows hits /ncsi.txt and /connecttest.txt. The
+// HOST is irrelevant here — the DNS responder sends every name to this device,
+// so all that survives is the path.
+constexpr Probe PROBES[] = {
+    {"/hotspot-detect.html", "200 OK", "text/html", PROBE_APPLE_BODY},
+    {"/library/test/success.html", "200 OK", "text/html", PROBE_APPLE_BODY},
+    {"/generate_204", "204 No Content", nullptr, nullptr},
+    {"/gen_204", "204 No Content", nullptr, nullptr},
+    {"/ncsi.txt", "200 OK", "text/plain", PROBE_NCSI_BODY},
+    {"/connecttest.txt", "200 OK", "text/plain", PROBE_CONNECTTEST_BODY},
+};
+
+esp_err_t sendProbe(httpd_req_t *req, const Probe &p) {
+  httpd_resp_set_status(req, p.status);
+  if (p.type != nullptr) {
+    httpd_resp_set_type(req, p.type);
+  }
+  // The ONLY header these get, and it is not about this device: a cached
+  // "the internet works" is an answer we cannot withdraw when the phone moves
+  // to a network where it is false. Deliberately NOT setCommonHeaders() —
+  // nothing here should acquire a header by inheritance, and the response must
+  // stay byte-comparable with what a real captive-free network returns.
+  // esp_http_server adds only "HTTP/1.1 <status>", Content-Type and
+  // Content-Length (httpd_txrx.c: `httpd_hdr_str`); there is no Server header
+  // and nothing names the device.
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, p.body != nullptr ? p.body : "", p.body != nullptr ? HTTPD_RESP_USE_STRLEN : 0);
+}
+
+esp_err_t handleWildcard(httpd_req_t *req) {
+  // req->uri carries the query string; the matcher was given the length up to
+  // it, so compare on the same basis. strcspn rather than strchr so a URI with
+  // no '?' needs no second branch.
+  const char *uri = req->uri;
+  const size_t n = strcspn(uri, "?");
+
+  for (size_t i = 0; i < sizeof(PROBES) / sizeof(PROBES[0]); i++) {
+    if (strlen(PROBES[i].path) == n && strncmp(uri, PROBES[i].path, n) == 0) {
+      return sendProbe(req, PROBES[i]);
+    }
+  }
+
+  // The pair URL. SHAPE ONLY — see the block above. `n == PIN_LEN + 1` counts
+  // the leading slash, so this matches "/dddd" and nothing longer: "/48211"
+  // and "/4821/x" both fall through to the 404, because a path that merely
+  // starts with the right digits is not a pair URL.
+  if (n == (size_t)AuthFmt::PIN_LEN + 1 && uri[0] == '/') {
+    bool allDigits = true;
+    for (size_t i = 1; i < n; i++) {
+      if (uri[i] < '0' || uri[i] > '9') {
+        allDigits = false;
+        break;
+      }
+    }
+    if (allDigits) {
+      return sendWebUi(req);
+    }
+  }
+
+  // Everything else. ONE message for every unmatched path, with nothing in it
+  // derived from the path: a 404 that echoed the URI would be a reflection
+  // point in a page that holds a session token, and a 404 that varied by
+  // reason would be the discrimination the PIN route refuses to provide.
+  return sendErr(req, "404 Not Found", "ENOTFOUND", "no such path on this device");
 }
 
 // The ONLY authenticated-free JSON endpoint besides POST /api/session. What an
@@ -1500,15 +1828,105 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
     return sendErr(req, "400 Bad Request", "EARGS", msg);
   }
 
+  // ---- ONE ACQUISITION FROM check() TO afterAttempt() -------------------
+  //
+  // PinPolicy::afterAttempt()'s precondition is "RateLimit::check() returned
+  // ALLOW for THIS attempt" (pinpolicy.h), and until 2026-08-24 that was
+  // enforced by a comment: check() ran in one authLock_ scope, the lock was
+  // dropped, the response was considered, and the count happened in a second
+  // scope. Between those two acquisitions the limiter was unguarded.
+  //
+  // IT WAS ATOMIC ONLY BY ACCIDENT — one httpd task, so no second caller could
+  // interleave. That is exactly the assumption the threading note at the top
+  // of this file contemplates losing ("If a second httpd instance is ever
+  // started, or IDF gains a worker-per-socket mode..."), and the failure it
+  // would produce is not a crash: two attempts both see ALLOW, both call
+  // afterAttempt(), and the escalation counts one guess instead of two. The
+  // limiter is the control 10^4 rests on (authfmt.h, ratelimit.h), so a
+  // half-priced guess is the one bug here worth paying for structurally.
+  //
+  // So the check, the compare, the transition and the lockout mint are now ONE
+  // critical section, and the precondition is enforced by the `if` rather than
+  // by prose. The rest of the handler — building the 429 body, the 401 body,
+  // creating the session — stays outside it.
+  //
+  // WHAT THAT COSTS, since it does force the constant-time compare inside the
+  // lock: authLock_ is held across CT::equalStr() over PIN_LEN + 1 == 5 bytes.
+  // That is a fixed handful of instructions on a 240 MHz core — call it under
+  // a microsecond — added to a critical section that already contained
+  // RateLimit::check(), RateLimit::fail() and, on the tenth failure,
+  // AuthFmt::makePin() drawing from esp_random(). The mint dominates it by
+  // orders of magnitude and was always inside the lock. The other task that
+  // contends for authLock_ is the loop task's httpTick() every 250 ms, which
+  // can now wait that extra microsecond. It does NOT weaken the compare: the
+  // compare is constant-time in its own right, and holding a mutex across it
+  // does not make its duration depend on the PIN.
+  //
+  // `attemptsLeft` is captured BEFORE the attempt because it is only used by
+  // the 429 branch, which by definition did not make one. `left` and `wait`
+  // are captured AFTER, for the 401 branch, which did — and folding that read
+  // in here removes the second RateLimit::check() call that used to live in
+  // its own scope purely to fetch a retry delay, a call that MUTATES the state
+  // it is being asked about.
   uint32_t now = millis();
   RateLimit::Decision decision;
   uint32_t retryMs = 0;
   uint8_t attemptsLeft = 0;
+  bool ok = false;
+  bool rotated = false;
+  bool mintOnSuccess = false;
+  uint8_t left = 0;
+  uint32_t wait = 0;
   {
     Lock l(authLock_);
     decision = RateLimit::check(pinLimit_, now, &retryMs);
     attemptsLeft = RateLimit::remaining(pinLimit_);
+
+    if (decision == RateLimit::ALLOW) {
+      // Constant time, and it runs whatever the candidate looks like — an early
+      // return on a wrong-length PIN is a timing signal too.
+      ok = CT::equalStr(pin_, candidate, AuthFmt::PIN_LEN + 1);
+
+      // ---- MINT TRIGGERS 2 AND 4, DECIDED IN ONE PLACE (pinpolicy.h) ----
+      //
+      // The limiter transition and the mint decision used to be open-coded
+      // here, interleaved with the compare above and the session table below.
+      // They are now one call, for one reason: the invariant they encode — THE
+      // LOCKOUT MINTS A NEW PIN AND MUST NOT CLEAR THE LIMITER — is what makes
+      // 10^4 defensible (authfmt.h), and it could not be tested from this
+      // repository while it lived in a .cpp the native env excludes. It has a
+      // host suite of its own now (test_pinpolicy), which is the only coverage
+      // it can ever have here: this handler is registered on the softAP
+      // listener and the build machine has no radio to reach it with.
+      PinPolicy::Outcome out = PinPolicy::afterAttempt(pinLimit_, ok, now);
+
+      if (!ok && out.mint) {
+        // Trigger 4: the tenth consecutive failure. The 15-minute lockout
+        // stands — pinpolicy.h is what guarantees that, and its test asserts
+        // check() still returns LOCKED for the full duration afterwards.
+        //
+        // A failed mint leaves the OLD PIN in place, which is the safe
+        // direction: the lockout still stands, and the next trip (or enable, or
+        // session end) mints again. Reported on the event rather than
+        // swallowed.
+        char rerr[128];
+        rotated = mintPinLocked(rerr, sizeof(rerr));
+      }
+
+      // Trigger 2 is DEFERRED, not skipped — see below. The policy decides
+      // WHETHER the successful attempt spends the PIN; this handler decides
+      // WHEN, and the answer is "once a session actually exists".
+      mintOnSuccess = ok && out.mint;
+
+      if (!ok) {
+        // Post-attempt figures for the 401 body, read while the state that
+        // produced them is still under this same acquisition.
+        left = RateLimit::remaining(pinLimit_);
+        RateLimit::check(pinLimit_, now, &wait);
+      }
+    }
   }
+
   if (decision != RateLimit::ALLOW) {
     char msg[160];
     snprintf(msg, sizeof(msg), "%s; retry in %u ms",
@@ -1541,58 +1959,7 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
     return sendJsonDoc(req, "429 Too Many Requests", doc);
   }
 
-  bool ok;
-  bool rotated = false;
-  bool mintOnSuccess = false;
-  {
-    Lock l(authLock_);
-    // Constant time, and it runs whatever the candidate looks like — an early
-    // return on a wrong-length PIN is a timing signal too.
-    ok = CT::equalStr(pin_, candidate, AuthFmt::PIN_LEN + 1);
-
-    // ---- MINT TRIGGERS 2 AND 4, DECIDED IN ONE PLACE (pinpolicy.h) ------
-    //
-    // The limiter transition and the mint decision used to be open-coded here,
-    // interleaved with the compare above and the session table below. They are
-    // now one call, for one reason: the invariant they encode — THE LOCKOUT
-    // MINTS A NEW PIN AND MUST NOT CLEAR THE LIMITER — is what makes 10^4
-    // defensible (authfmt.h), and it could not be tested from this repository
-    // while it lived in a .cpp the native env excludes. It has a host suite of
-    // its own now (test_pinpolicy), which is the only coverage it can ever have
-    // here: this handler is registered on the softAP listener and the build
-    // machine has no radio to reach it with.
-    //
-    // afterAttempt() performs the limiter transition itself and returns what to
-    // do about the PIN. Its precondition is satisfied above: check() returned
-    // ALLOW, so this attempt is one the limiter agreed to count.
-    PinPolicy::Outcome out = PinPolicy::afterAttempt(pinLimit_, ok, now);
-
-    if (!ok && out.mint) {
-      // Trigger 4: the tenth consecutive failure. The 15-minute lockout stands
-      // — pinpolicy.h is what guarantees that, and its test asserts check()
-      // still returns LOCKED for the full duration afterwards.
-      //
-      // A failed mint leaves the OLD PIN in place, which is the safe direction:
-      // the lockout still stands, and the next trip (or enable, or session end)
-      // mints again. Reported on the event rather than swallowed.
-      char rerr[128];
-      rotated = mintPinLocked(rerr, sizeof(rerr));
-    }
-
-    // Trigger 2 is DEFERRED, not skipped — see below. The policy decides
-    // WHETHER the successful attempt spends the PIN; this handler decides WHEN,
-    // and the answer is "once a session actually exists".
-    mintOnSuccess = ok && out.mint;
-  }
-
   if (!ok) {
-    uint8_t left;
-    uint32_t wait = 0;
-    {
-      Lock l(authLock_);
-      left = RateLimit::remaining(pinLimit_);
-      RateLimit::check(pinLimit_, now, &wait);
-    }
     char msg[192];
     if (left == 0) {
       // The attempt that tripped the lockout. Saying "0 attempt(s) before a
@@ -2074,9 +2441,40 @@ esp_err_t handleWs(httpd_req_t *req) {
 // one recv timeout (5 s).
 constexpr size_t MAX_OTA_QUERY = 160;
 
+// ---- THE SESSION IS RE-CHECKED FOR THE WHOLE LENGTH OF THE UPLOAD --------
+//
+// THE BUG THIS EXISTS TO FIX. authenticate() ran once, at entry, and was never
+// asked again. The body then streamed for up to TOTAL_TIMEOUT_MS (300 s) and,
+// with ?select=1, ended by pointing otadata at the new image. A session
+// revoked from the USB console mid-upload — `sessions revoke all`, or a `psk
+// set`, or an unpair from the phone itself — changed nothing about the
+// transfer: it completed, it validated, and it SELECTED. On this device an OTA
+// image is arbitrary code (backlog S9), so that is the one place where "the
+// session is gone" failing to take effect matters most.
+//
+// It is the same class of bug as the WebSocket gate further up this file, and
+// it has the same fix: ask the question repeatedly rather than cache the
+// answer. The session id from authenticate() is carried in the read context
+// and re-checked per chunk, and once more in otaStillAuthorised() immediately
+// before the image is finalised and selected.
+//
+// FIXED HERE RATHER THAN AT THE REVOKE SITES, for the same reason: there are
+// four paths that end a session and a fifth will be added, and none of them
+// should have to know an upload exists.
+//
+// COST PER CHUNK: one uncontended mutex take/give, a reap over MAX_SESSIONS
+// (1) and a scan of the same. Once per OtaUpload::BUF_SIZE (4096) bytes, so
+// about 320 times for a 1.25 MB image — lost in the noise of the flash write
+// each one authorises.
 struct OtaReadCtx {
   httpd_req_t *req;
+  uint32_t sessionId;
 };
+
+bool otaStillAuthorised(void *ctx) {
+  OtaReadCtx *c = (OtaReadCtx *)ctx;
+  return sessionLive(c->sessionId);
+}
 
 OtaUpload::ReadStatus otaRead(void *ctx, uint8_t *buf, size_t cap, size_t *got) {
   *got = 0;
@@ -2085,6 +2483,13 @@ OtaUpload::ReadStatus otaRead(void *ctx, uint8_t *buf, size_t cap, size_t *got) 
     // The transport is going down. Give up now rather than holding the teardown
     // for the rest of the transfer; otaupload.cpp aborts the slot.
     return OtaUpload::READ_ERROR;
+  }
+  if (!sessionLive(c->sessionId)) {
+    // Checked BEFORE the recv, not after: a revoked session must not have one
+    // more chunk written on its behalf while we wait up to 5 s for it.
+    // otaupload.cpp turns this into EREVOKED and runs esp_ota_abort(), so the
+    // slot is left partial and unselected and otadata is untouched.
+    return OtaUpload::READ_UNAUTHORISED;
   }
   int n = httpd_req_recv(c->req, (char *)buf, cap);
   if (n > 0) {
@@ -2139,7 +2544,11 @@ esp_err_t otaReject(httpd_req_t *req, const char *status, const char *code, cons
 }
 
 esp_err_t handleOta(httpd_req_t *req) {
-  if (authenticate(req) == 0) {
+  // KEPT, not discarded. See the block above OtaReadCtx: this id is what the
+  // per-chunk reader and the pre-select check re-ask about, so that a
+  // revocation part-way through an upload actually stops it.
+  const uint32_t sessionId = authenticate(req);
+  if (sessionId == 0) {
     // No body has been read, and a stranger's is not going to be drained on our
     // task either.
     send401(req);
@@ -2215,7 +2624,9 @@ esp_err_t handleOta(httpd_req_t *req) {
     return otaReject(req, "503 Service Unavailable", "ESTOPPING", "the Wi-Fi transport is shutting down");
   }
 
-  OtaReadCtx rctx = {req};
+  params.stillAuthorised = otaStillAuthorised;
+
+  OtaReadCtx rctx = {req, sessionId};
   OtaUpload::Report rep;
   OtaUpload::run(params, otaRead, &rctx, rep);
   exitRegistry();
@@ -2235,6 +2646,14 @@ esp_err_t handleOta(httpd_req_t *req) {
   switch (rep.httpStatus) {
     case 400:
       status = "400 Bad Request";
+      break;
+    case 401:
+      // EREVOKED. Deliberately NOT send401(): that sets WWW-Authenticate and a
+      // generic "POST /api/session with the device PIN" message, which would
+      // discard the report — how many bytes landed, in which slot, and that
+      // nothing was selected. The client needs all of that, and the code in
+      // the envelope already says what happened.
+      status = "401 Unauthorized";
       break;
     case 408:
       status = "408 Request Timeout";
@@ -2307,7 +2726,14 @@ bool startServer(char *err, size_t errCap) {
   // storage.delete over /api/cmd.
   cfg.stack_size = 10240;
   cfg.max_open_sockets = MAX_OPEN_SOCKETS;
-  cfg.max_uri_handlers = 8;
+  cfg.max_uri_handlers = 9;
+  // WILDCARD ROUTING, for the pair URL's `/<pin>` path and the captive probes.
+  // See the long block above handleWildcard() for the two properties this
+  // depends on and where they were verified in the pinned SDK: first match
+  // wins in registration order, and a template with no trailing '*' still
+  // requires a FULL-LENGTH match, so `/api/status` cannot start matching
+  // `/api/statusXYZ`.
+  cfg.uri_match_fn = httpd_uri_match_wildcard;
   cfg.lru_purge_enable = true;  // a stuck client must not hold a socket forever
   cfg.recv_wait_timeout = 5;
   cfg.send_wait_timeout = 5;
@@ -2344,8 +2770,23 @@ bool startServer(char *err, size_t errCap) {
       // PING with a PONG itself, on the same task, so no send can interleave.
       {.uri = "/ws", .method = HTTP_GET, .handler = handleWs, .user_ctx = nullptr,
        .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = nullptr},
+      // ---- LAST, AND IT HAS TO BE LAST ---------------------------------
+      //
+      // The catch-all. It serves the pair URL (`/<PIN_LEN digits>`, ANY
+      // digits — it is not a PIN check, see the block above handleWildcard()),
+      // answers the captive-network probes, and 404s everything else. The
+      // probe paths are NOT registered individually and will not be found by
+      // grepping this array: they are a table inside that handler.
+      //
+      // The loop below registers in array order and httpd_find_uri_handler()
+      // returns the FIRST match, so moving this row up would swallow every
+      // route beneath it — and would in fact make startServer() fail outright,
+      // because httpd_register_uri_handler() refuses to register a URI an
+      // existing wildcard already accounts for.
+      {.uri = "/*", .method = HTTP_GET, .handler = handleWildcard, .user_ctx = nullptr,
+       .is_websocket = false, .handle_ws_control_frames = false, .supported_subprotocol = nullptr},
   };
-  static_assert(sizeof(URIS) / sizeof(URIS[0]) <= 8, "max_uri_handlers must cover every registered URI");
+  static_assert(sizeof(URIS) / sizeof(URIS[0]) <= 9, "max_uri_handlers must cover every registered URI");
 
   for (size_t i = 0; i < sizeof(URIS) / sizeof(URIS[0]); i++) {
     e = httpd_register_uri_handler(server_, &URIS[i]);
@@ -2356,6 +2797,72 @@ bool startServer(char *err, size_t errCap) {
       return false;
     }
   }
+  return true;
+}
+
+// ===========================================================================
+// The DNS responder — required, not optional
+// ===========================================================================
+//
+// ARCHITECTURE.md §"Answering the captive-network probes": "The DNS responder
+// is required, not optional: the probes are fetched BY HOSTNAME, so without
+// one they never reach this device at all and the answer is moot." A phone
+// that has just associated resolves captive.apple.com or
+// connectivitycheck.gstatic.com against the DHCP-supplied DNS server — which
+// is this device, because esp_netif's DHCP server hands out the softAP address
+// as option 6 — and gets nothing back unless something is listening on 53.
+//
+// EVERY QUERY IS ANSWERED WITH THE SOFTAP ADDRESS. DNSServer's captive mode
+// (an empty domain name, spelled "*" in the three-argument start()) does
+// exactly that: an A/ANY query gets the address, anything else gets an empty
+// authoritative answer rather than a refusal. So the probe hosts resolve here,
+// and so does every other name the phone asks for — which is honest about what
+// this network is, in the sense that there is nowhere else for a name to go.
+//
+// The IP is read from the interface rather than spelled: ARCHITECTURE.md's
+// prose says 192.168.4.1 because that is esp_netif's softAP default, not
+// because it is a constant of the design.
+//
+// COST. Measured on the device rather than estimated, because on a board with
+// no PSRAM this is the number that decides whether F1 (BLE, ~40 KB) still
+// fits. dnsHeapCost_ is the free-heap delta across construction and start, and
+// status() reports it as `dns_heap_bytes`. Most of it is AsyncUDP's shared
+// "async_udp" task (4 KB stack) and its 32-slot queue, which are created on
+// the first listen() and NEVER destroyed — the library's _udp_task_stop() is
+// commented out in AsyncUDP.cpp. So the first enable pays and later
+// enable/disable cycles do not, and a delta measured on a second enable will
+// be much smaller than the first. That is a property of the framework, not a
+// leak of ours: see the note beside dns_ for what stopDns() does reclaim.
+void stopDns() {
+  if (dns_ == nullptr) {
+    return;
+  }
+  dns_->stop();
+  // AND THEN DELETE IT. stop() is only _udp.close(), which disconnects but
+  // does not unbind and does not free the pcb; only ~AsyncUDP() calls
+  // udp_remove(). Without the delete, port 53 stays bound with a recv callback
+  // pointing at an object we have stopped maintaining, and the next enable
+  // would rebind on top of it. See the block comment beside dns_.
+  delete dns_;
+  dns_ = nullptr;
+  dnsHeapCost_ = 0;
+}
+
+bool startDns() {
+  stopDns();  // idempotent; there should never be one here, but a leaked pcb is
+              // not the thing to discover from a second enable
+  const uint32_t before = ESP.getFreeHeap();
+  dns_ = new (std::nothrow) DNSServer();
+  if (dns_ == nullptr) {
+    return false;
+  }
+  // "*" is DNSServer's spelling for captive mode: it clears _domainName, and
+  // an empty _domainName is what makes _handleUDP() answer every name.
+  if (!dns_->start(DNS_PORT, "*", WiFi.softAPIP())) {
+    stopDns();
+    return false;
+  }
+  dnsHeapCost_ = (int32_t)before - (int32_t)ESP.getFreeHeap();
   return true;
 }
 
@@ -2445,6 +2952,15 @@ bool httpEnable(const char **errMsg) {
     return false;
   }
 
+  // AFTER the server, so the failure path above has nothing of ours to unwind.
+  // A DNS responder that will not start is NOT fatal to enable(): the AP, the
+  // page, the API and the USB console all still work, and what is lost is only
+  // the captive-probe answer — i.e. the phone sees the "no internet" warning
+  // it would have seen anyway before this existed. Refusing to bring the whole
+  // transport up over it would be a worse trade. It IS reported: status()
+  // carries `dns_up`, so the condition is visible rather than silent.
+  (void)startDns();
+
   // Registered once for the life of the image: Bus has no removeSink() (see
   // bus.h), so the sink stays and goes quiet when ring_ is null.
   if (!sinkRegistered_) {
@@ -2472,6 +2988,12 @@ void teardownNow() {
     httpd_stop(server_);
     server_ = nullptr;
   }
+  // BEFORE the AP: the responder exists to answer stations on this interface,
+  // so it stops when they stop being reachable, and the pcb is removed while
+  // the netif it was bound against is still there. stopDns() deletes the
+  // object, which is the only thing that actually unbinds port 53 — see the
+  // block comment beside dns_.
+  stopDns();
   if (apUp_) {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_OFF);
@@ -2575,13 +3097,26 @@ void httpTick() {
   // a call it does not control. fillApStatus() reads it the same way.
   uint8_t stations = apUp_ ? (uint8_t)WiFi.softAPgetStationNum() : 0;
 
-  uint32_t endedId = 0;
-  bool graceExpired = false;
-  bool rotated = false;
+  // THE SOFTAP'S OWN ADDRESS, read here for the same reason and with the same
+  // rule: WiFi.softAPIP() goes into esp_netif and must not be called with
+  // authLock_ held. It is needed by the CODE_PAIR payload below, which
+  // ARCHITECTURE.md requires be built from the ACTUAL address rather than from
+  // the literal 192.168.4.1 that appears in its prose — the netif's IP is
+  // configurable and a hardcoded one becomes a QR that opens nothing the day
+  // someone changes it.
+  char apIp[16] = {0};
+  if (apUp_) {
+    IPAddress ip = WiFi.softAPIP();
+    snprintf(apIp, sizeof(apIp), "%u.%u.%u.%u", (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3]);
+  }
 
-  // SCOPED, so the bus event at the bottom is emitted with authLock_ RELEASED.
-  // The sink takes ringLock_, and no path in this file takes authLock_ while
-  // holding ringLock_; keeping it that way means the two never have to have a
+  uint32_t endedId = 0;
+  uint8_t graceRevoked = 0;
+
+  // SCOPED, so the rotate-and-emit below runs with authLock_ RELEASED.
+  // rotateAfterRevocation() takes that lock itself, and the bus sink it then
+  // pokes takes ringLock_; no path in this file takes authLock_ while holding
+  // ringLock_, and keeping it that way means the two never have to have a
   // documented order at all.
   {
     Lock l(authLock_);
@@ -2593,15 +3128,10 @@ void httpTick() {
     // minutes ago must not keep a grace clock armed.
     reapLocked(now);
 
-    // Counted inline rather than via liveSessionCount(): authLock_ is a PLAIN
-    // mutex (xSemaphoreCreateMutex, not recursive) and is already held here, so
-    // calling that function would deadlock the loop task on its first tick.
-    uint8_t live = 0;
-    for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
-      if (sessions_[i].used) {
-        live++;
-      }
-    }
+    // liveCountLocked(), not liveSessionCount(): authLock_ is a PLAIN mutex
+    // (xSemaphoreCreateMutex, not recursive) and is already held here, so
+    // calling the locking form would deadlock the loop task on its first tick.
+    uint8_t live = liveCountLocked();
 
     if (!apUp_) {
       // The radio is down (a failed enable, or a teardown in flight). No
@@ -2614,16 +3144,35 @@ void httpTick() {
       // 90 seconds with a live session and nobody associated. The phone is not
       // coming back, so the token it holds must stop working and the device
       // must become pairable again — which means BOTH halves: revoke, and
-      // mint. Revoking alone would put the PIN that the departed client
-      // already used back on the LCD, and that PIN is spent by definition
-      // (trigger 2 consumed it at pairing).
+      // mint.
+      //
+      // THIS BRANCH NO LONGER PERFORMS THE MINT OR THE EVENT. It used to, and
+      // that was a second implementation of a rule that already has one:
+      // rotateAfterRevocation() below. The duplication was invisible because
+      // the two agreed — the same mintPinLocked(), the same
+      // AuthEvt{"session_ended", ...} — and it was the WORST possible one to
+      // have, because this is the MOST COMMON path in normal use (a phone
+      // locks its screen and drops the AP) while the shared function served
+      // the three rarer ones. Any future change to the rule would have applied
+      // to unpair, `sessions revoke` and `psk set`, and silently not to the
+      // path that actually runs.
+      //
+      // It could not simply call the function before, for a structural reason
+      // rather than an aesthetic one: rotateAfterRevocation() takes authLock_
+      // itself, and this code ran inside a scope that already held it — a
+      // plain FreeRTOS mutex, so the call would have deadlocked the loop task.
+      // The fix is to make this branch record WHAT HAPPENED (how many sessions
+      // it revoked, and which one ended) and let the single implementation act
+      // on it once the lock is released.
       //
       // `live > 0` is the arming condition, not just a filter: a station that
       // associates and leaves WITHOUT pairing arms nothing at all. See the
       // long note at ApGrace::update() for why — the short version is that
       // rotating in that case defends against nobody (the PIN is on the LCD in
       // plain sight anyway) and breaks the flow of someone mid-way through
-      // reading or scanning it.
+      // reading or scanning it. It is also why graceRevoked cannot come back
+      // 0 here: update() returns EXPIRED only while sessionLive is true, and
+      // `live` was counted under this same acquisition.
       //
       // The id is captured BEFORE the revoke so the event can name what ended;
       // with MAX_SESSIONS == 1 there is at most one.
@@ -2637,42 +3186,129 @@ void httpTick() {
           break;
         }
       }
-      revokeAllLocked();
-      live = 0;
-      char rerr[128];
-      rotated = mintPinLocked(rerr, sizeof(rerr));
-      graceExpired = true;
-    }
-
-    // ---- the pairing PIN's out-of-band channel (pairing.h) ----------------
-    //
-    // Evaluated here, every TICK_MS, because both inputs move on their own: a
-    // session can expire in reapLocked() above, and the last one being revoked
-    // has to put the PIN back on the LCD without anyone asking.
-    //
-    // This is also the only place pin_ leaves this file, and it goes to a
-    // buffer with no JSON representation and no transport — never into
-    // status(), which is wire-visible. publish() is itself a no-op unless
-    // `display` has subscribed, so with the LCD off the PIN never leaves this
-    // file at all.
-    //
-    // shouldShow() is what keeps a PIN minted at pairing (trigger 2) off the
-    // screen: `live` is 1 at that moment, so the branch below withdraws rather
-    // than publishing, and the fresh PIN stays in RAM until the session ends.
-    if (Pairing::shouldShow(apUp_, live)) {
-      Pairing::publish(pin_);
-    } else {
-      Pairing::withdraw();
+      graceRevoked = revokeAllLocked();
     }
   }
 
-  // The revoke is visible on the console and to every WebSocket client, in the
-  // same shape as every other auth outcome (fillAuthEvent). It carries what
-  // ENDED and whether the PIN rotated — never the PIN, and never the token that
-  // just stopped working. Emitted outside the lock; see the scope note above.
-  if (graceExpired) {
-    AuthEvt ev{"session_ended", 0, 0, endedId, false, rotated};
-    Bus::emit("http.auth", fillAuthEvent, &ev);
+  // ---- THE ONE ROTATE-AND-EMIT, shared with the other three end-of-session
+  // paths (DELETE /api/session, `sessions revoke`, the cull inside `psk set`).
+  // A no-op when graceRevoked is 0, which is the guard living in the signature
+  // exactly as its own block comment describes.
+  //
+  // ORDER MATTERS AND IS THE REASON THE PUBLISH MOVED BELOW IT. The panel must
+  // never show a spent PIN: mint first, publish second. Doing the publish in
+  // the same locked scope as the revoke — as it was — would have put the old
+  // PIN on the glass for one TICK_MS after the grace window closed, which is
+  // precisely the "looks like a valid pairing code and fails silently" failure
+  // rotateAfterRevocation()'s comment exists to prevent.
+  (void)rotateAfterRevocation(graceRevoked, endedId);
+
+  // ---- the pairing secrets' out-of-band channel (pairing.h) --------------
+  //
+  // Evaluated every TICK_MS, because every input moves on its own: a session
+  // can expire in reapLocked() above, the last one being revoked has to put a
+  // PIN back on the LCD without anyone asking, and a station associating or
+  // leaving switches which of the two QR codes is the useful one.
+  //
+  // This is the only place pin_ and psk_ leave this file, and they go to a
+  // buffer with no JSON representation and no transport — never into status(),
+  // which is wire-visible. publish() is itself a no-op unless `display` has
+  // subscribed, so with the LCD off neither secret leaves this file at all.
+  //
+  // shouldShow() is what keeps a PIN minted at pairing (trigger 2) off the
+  // screen: `live` is 1 at that moment, so the branch below withdraws rather
+  // than publishing, and the fresh PIN stays in RAM until the session ends.
+  //
+  // ---- WHICH CODE, AND WHY THE PRODUCER DECIDES ------------------------
+  //
+  // ARCHITECTURE.md §"QR pairing on the LCD" needs two codes because no single
+  // QR can both join a network and open a page. The choice between them is
+  // made HERE and not in mod_display.cpp, and that division is load-bearing
+  // rather than tidy: deciding it needs the association count AND both
+  // secrets, so a renderer that decided would need the PSK and the station
+  // list, and the passphrase would then live in two modules instead of one.
+  // pairing.h says the same thing from the other side.
+  //
+  //   NO STATION ASSOCIATED  -> CODE_JOIN. The phone is not on the network
+  //                             yet, so the useful thing to scan is the
+  //                             `WIFI:` payload that joins it. The pair URL
+  //                             would be useless here: 192.168.4.1 is not
+  //                             routable from a phone that is still on its
+  //                             mobile data.
+  //   A STATION IS ASSOCIATED -> CODE_PAIR. Joined but not paired, so the
+  //                             useful thing is the URL that opens the page
+  //                             with the PIN already in hand.
+  //
+  // Both are governed by the same shouldShow() predicate, so neither survives
+  // a session existing; the PIN is published alongside both, because manual
+  // entry has to keep working when the camera cannot be used.
+  //
+  // A SECOND ACQUISITION, taken after the rotate rather than shared with the
+  // block above. It costs one uncontended mutex take/give per 250 ms tick and
+  // it is what lets the mint happen between the revoke and the publish.
+  {
+    Lock l(authLock_);
+    if (!Pairing::shouldShow(apUp_, liveCountLocked())) {
+      Pairing::withdraw();
+    } else if (stations == 0) {
+      // ---- CODE_JOIN --------------------------------------------------
+      //
+      // The payload CONTAINS THE AP PASSPHRASE IN CLEAR. pairing.h's "THE JOIN
+      // PAYLOAD IS A SECRET. ALL OF IT." applies in full: it is psk_ in a
+      // different wrapper, so it is wiped off the stack below exactly as the
+      // PIN is.
+      //
+      // The FALLBACK is the passphrase ALONE, with no SSID and no label. Two
+      // reasons, both deliberate:
+      //   * the panel already draws the SSID beside the block — mod_display.cpp
+      //     takes it from this module's own status() (`ssid`), so repeating it
+      //     inside the fallback would spend a third of an 80 px column saying
+      //     the same thing twice;
+      //   * MAX_FALLBACK is 64, sized for a 63-character WPA2 passphrase and
+      //     its NUL with nothing to spare. Anything prefixed to it would make
+      //     the worst legal passphrase over-length, and pairing.h REFUSES an
+      //     over-length fallback rather than truncating it — so the screen
+      //     would go blank for exactly the passphrase that needs the text
+      //     fallback most.
+      //
+      // WifiQr::join() returns false only when the escaped result would not
+      // fit MAX_PAYLOAD. That cannot happen for a legal SSID/passphrase pair
+      // (the worst case is 190 of 224 — test_wifiqr asserts it), but it is
+      // handled rather than asserted: on false the payload is published EMPTY
+      // and the panel draws the passphrase as text, which is the same place a
+      // payload too big to DRAW ends up. An empty payload is a legitimate
+      // state in pairing.h, not an error.
+      char payload[Pairing::MAX_PAYLOAD + 1];
+      if (!WifiQr::join(payload, sizeof(payload), ssid_, psk_)) {
+        payload[0] = '\0';
+      }
+      Pairing::publish(Pairing::CODE_JOIN, pin_, payload, psk_);
+      memset(payload, 0, sizeof(payload));  // it carried the passphrase
+    } else {
+      // ---- CODE_PAIR ----------------------------------------------------
+      //
+      // `HTTP://192.168.4.1/4821`, built from apIp above.
+      //
+      // THE UPPERCASE SCHEME IS NOT A TYPO AND MUST NOT BE "TIDIED". Measured
+      // through the vendored encoder and recorded in ARCHITECTURE.md's table:
+      // uppercase keeps every character of the URL inside QR ALPHANUMERIC MODE
+      // (0-9 A-Z $%*+-./: ) and the 23-character string encodes at VERSION 1,
+      // 21x21. The lowercase spelling contains characters outside that set,
+      // falls back to BYTE mode, and needs version 2 — a whole version, and a
+      // bigger symbol on an 80-pixel panel, for nothing. URL schemes are
+      // case-insensitive to every browser (RFC 3986 section 3.1), so this
+      // costs the user precisely nothing. test_qrfit asserts the version.
+      //
+      // The PIN goes in a PATH SEGMENT rather than a query string for the same
+      // reason: `?` and `=` are not in the alphanumeric set, `/` and `.` and
+      // `:` are.
+      //
+      // The buffer carries the PIN, so it is wiped on the way out.
+      char url[48];
+      snprintf(url, sizeof(url), "HTTP://%s/%s", apIp[0] != '\0' ? apIp : "192.168.4.1", pin_);
+      Pairing::publish(Pairing::CODE_PAIR, pin_, url, "");
+      memset(url, 0, sizeof(url));
+    }
   }
 }
 
@@ -2730,6 +3366,20 @@ void fillApStatus(JsonObject d) {
   // the three being missing while the others are present.
   d["station_associated"] = apUp_ && WiFi.softAPgetStationNum() > 0;
   d["server_up"] = server_ != nullptr;
+  // The captive-network DNS responder (ARCHITECTURE.md §"Answering the
+  // captive-network probes"). Reported because startDns() failing is NOT fatal
+  // to enable() — the transport comes up without it and the only symptom is
+  // the phone's "no internet" warning coming back, which is a symptom nobody
+  // would attribute to this device without being told.
+  //
+  // `dns_heap_bytes` is the MEASURED free-heap delta across its construction
+  // and start, not an estimate: on a board with no PSRAM the heap is the
+  // budget every later feature is drawn from, and most of this figure is
+  // AsyncUDP's shared task, which is created once and never freed. A second
+  // enable in the same boot therefore reports a much smaller number, and that
+  // difference is real rather than a measurement error.
+  d["dns_up"] = dns_ != nullptr && dns_->isUp();
+  d["dns_heap_bytes"] = dnsHeapCost_;
   // A PASSPHRASE was minted by this enable — a virgin NVS, or a stored one that
   // failed its validator. That is the one credential an operator has to go and
   // read over USB, so it is the one worth flagging. It is NOT "both secrets"
@@ -2768,10 +3418,18 @@ void fillApStatus(JsonObject d) {
   d["grace_ms"] = (uint32_t)ApGrace::GRACE_MS;
   {
     Lock l(authLock_);
-    // grace_ is written only by httpTick() on the loop task, under this same
-    // lock. This function usually runs on the HTTP task, so the lock is what
-    // makes the pair of reads below consistent with each other rather than
-    // straddling a tick.
+    // grace_ has TWO writers, both under this same lock, and the claim that
+    // used to be here — "written only by httpTick() on the loop task" — was
+    // wrong: createSession() calls ApGrace::reset(grace_) from the HTTP task,
+    // and has since the single-session model landed. The LOCKING was right
+    // either way, so nothing was broken; the comment was, and a concurrency
+    // claim that is written down gets believed by the next person deciding
+    // whether they may drop a lock.
+    //
+    // What the lock buys here is unchanged: this function usually runs on the
+    // HTTP task, and holding authLock_ across the pair of reads below is what
+    // makes `grace_active` and `grace_ms_left` consistent with each other
+    // rather than straddling a tick or a pairing.
     bool armed = ApGrace::armed(grace_);
     d["grace_active"] = armed;
     if (armed) {
@@ -3173,17 +3831,32 @@ DispatchResult httpDispatch(const CmdContext &ctx, const char *act, JsonObjectCo
     }
     Lock l(authLock_);
     d["pin"] = (const char *)pin_;
-    // Whether this same value is ALSO on the 160x80 ST7735 right now. It was a
-    // hardcoded `false` with a note saying "when W5 lands"; W5 has landed, and
-    // a field that always says false is worse than no field — an operator on
-    // the cable would conclude the out-of-band channel is not working. The
-    // out-of-band channel is the security asset ARCHITECTURE.md section 4
-    // counts on, and when this reads true there was no need to come over USB
-    // for the PIN at all.
+    // "THIS PIN HAS BEEN PUBLISHED TO THE PANEL" — and that is the whole of
+    // what it claims. Not "the digits are on the glass right now".
     //
-    // Pairing::visible() reports the LCD's copy, not the policy: it is false
-    // when `display` is disabled (nothing ever subscribed, so publish() stored
-    // nothing) and false when the device is already paired.
+    // Pairing::visible() is true from the moment publish() stores a record
+    // until withdraw() clears it. What it does NOT know is what the display
+    // module is currently drawing: `display` has other screens, and while the
+    // operator is looking at `diag` (or any screen the pair screen is not
+    // overriding) the PIN is published, visible() is true, and there is
+    // nothing on the panel to read. The honest reading of a true here is
+    // "the out-of-band channel is armed and the PIN will be on screen when the
+    // panel is showing the pairing screen", not "go and look, it is there".
+    //
+    // THE FIELD THAT MEANS "ACTUALLY DRAWN" IS THE DISPLAY MODULE'S OWN
+    // `pin_on_screen`, in its status(). Ask `display` for that; this module
+    // deliberately does not, because reaching into another module's render
+    // state to answer a question about a secret it owns would couple `http` to
+    // `display` in exactly the direction pairing.h's one-way rendezvous exists
+    // to prevent. (`display` names its field the same way this one is now
+    // described, which is its own inaccuracy to fix if it wants to — this file
+    // is not the place to work around it.)
+    //
+    // It is still worth reporting. False when `display` is disabled — nothing
+    // ever subscribed, so publish() stored nothing — and false when the device
+    // is already paired, and both of those are things an operator on the cable
+    // wants to know: the first says the out-of-band channel is not available
+    // at all, and the second says nobody needs it.
     //
     // NOT a leak of the PIN through a second route: this action is
     // AUTH_PHYSICAL, which has just handed the caller the PIN itself on the

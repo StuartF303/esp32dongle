@@ -12,6 +12,7 @@
 #include "activity.h"
 #include "modauth.h"
 #include "pairing.h"
+#include "qrfit.h"
 #include "screenfmt.h"
 #include "scheduler.h"
 
@@ -104,6 +105,15 @@ constexpr uint16_t C_OK = ST77XX_GREEN;
 constexpr uint16_t C_WARN = ST77XX_YELLOW;
 constexpr uint16_t C_ALERT = ST77XX_RED;
 constexpr uint16_t C_INFO = ST77XX_CYAN;
+// The QR's own two colours, and they are not part of the palette above on
+// purpose: a QR decoder wants DARK MODULES ON A LIGHT FIELD, including the
+// quiet zone. Inverting it (white modules on the black UI background) decodes
+// on some readers and not others, and "works on my phone" is not a property
+// worth having in the one path that exists to make pairing reliable. So the
+// block is a white square on an otherwise dark screen, which is also the
+// highest-contrast thing this panel can produce.
+constexpr uint16_t C_QR_DARK = ST77XX_BLACK;
+constexpr uint16_t C_QR_LIGHT = ST77XX_WHITE;
 
 // ---- timing -------------------------------------------------------------
 //
@@ -122,6 +132,10 @@ constexpr uint32_t DONE_LINGER_MS = 2500;
 // leaves the cooperative scheduler its budget. A full repaint therefore takes
 // three ticks (120 ms) and is still visually instant.
 constexpr uint8_t MAX_DRAW_PER_TICK = 2;
+// Rows of the QR block pushed per SPI transaction. 8 rows of 80 px is 1,280
+// bytes of stack in drawQr(); see the measurement in the comment there for why
+// this is not 1.
+constexpr int16_t QR_ROWS_PER_BAND = 8;
 
 // ===========================================================================
 // Screen layout
@@ -134,6 +148,7 @@ enum Region : uint8_t {
   REG_AUTH,    // THE PIN, or the session state — see pairing.h for the policy
   REG_MODS,    // enabled modules, with hid called out
   REG_FOOT,    // heap/uptime, or the activity indicator while one is running
+  REG_QR,      // the pairing QR block. EMPTY on every screen but SCREEN_PAIR.
   REGION_COUNT
 };
 
@@ -141,43 +156,173 @@ struct Rect {
   int16_t x, y, w, h;
 };
 
+// A region that does not exist on this screen. Not drawn, not built, not
+// dirtied — see rectFor() and the empty-rect guards in buildRegion/drawRegion.
+// This is what lets one region ID mean "the QR block" on one screen and
+// "nothing at all" on another, without a second dirty tracker.
+constexpr Rect NO_RECT = {0, 0, 0, 0};
+
+constexpr bool rectEmpty(const Rect &a) { return a.w <= 0 || a.h <= 0; }
+
+constexpr bool rectInPanel(const Rect &a) {
+  return a.x >= 0 && a.y >= 0 && a.x + a.w <= W && a.y + a.h <= H;
+}
+
+constexpr bool rectsOverlap(const Rect &a, const Rect &b) {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+// ---- the tiling proof, generalised -------------------------------------
+//
+// The old proof was six hand-written "region N ends where region N+1 begins"
+// asserts, and it worked because BOTH screens were the same stack of
+// full-width horizontal stripes. The pairing screen is not: it is a square QR
+// block beside a narrow column, so "ends where the next one begins" is not
+// even the right question about it.
+//
+// Rather than weaken the guarantee to fit the new layout, this states the
+// property the stripe asserts were really proving — every pixel of the panel
+// belongs to exactly one region — in a form that holds for any arrangement:
+//
+//     no rect leaves the panel  +  no two rects overlap  +  areas sum to W*H
+//         =>  exact tiling, no gap and no overlap
+//
+// A gap would be a stripe of stale pixels that nothing ever redraws; an
+// overlap would be one region silently corrupting its neighbour, which the
+// dirty tracker would never notice because it believes the neighbour is clean.
+// Both are compile-time errors here. Empty rects are skipped: they contribute
+// no area and cover no pixel, so a screen that omits a region still has to
+// account for every pixel with the ones it keeps.
+constexpr bool tilesPanelExactly(const Rect (&r)[REGION_COUNT]) {
+  int32_t area = 0;
+  for (size_t i = 0; i < REGION_COUNT; i++) {
+    if (rectEmpty(r[i])) {
+      continue;
+    }
+    if (!rectInPanel(r[i])) {
+      return false;
+    }
+    area += (int32_t)r[i].w * (int32_t)r[i].h;
+    for (size_t j = i + 1; j < REGION_COUNT; j++) {
+      if (!rectEmpty(r[j]) && rectsOverlap(r[i], r[j])) {
+        return false;
+      }
+    }
+  }
+  return area == (int32_t)W * (int32_t)H;
+}
+
+// ---- screen 1 and 2: the stripe layout, unchanged ----------------------
+//
 // constexpr, not const: the static_asserts below read these members at compile
 // time, which is only a constant expression for a constexpr object.
-constexpr Rect REGION_RECT[REGION_COUNT] = {
+constexpr Rect STATUS_RECT[REGION_COUNT] = {
     {0, 0, W, 12},   // REG_ID
     {0, 12, W, 11},  // REG_WIFI
     {0, 23, W, 11},  // REG_NET
     {0, 34, W, 18},  // REG_AUTH — 18 px so the PIN can be size 2 (16 px tall)
     {0, 52, W, 11},  // REG_MODS
     {0, 63, W, 17},  // REG_FOOT
+    NO_RECT,         // REG_QR — status and diag never show one
 };
-// Partition arithmetic, done by hand and then checked by the compiler: the
-// regions must tile the panel exactly, with no gap (a stripe of stale pixels
-// nothing ever redraws) and no overlap (one region silently corrupting its
-// neighbour, which the dirty tracker would never notice).
-static_assert(REGION_RECT[0].y == 0, "first region must start at the top");
-static_assert(REGION_RECT[0].y + REGION_RECT[0].h == REGION_RECT[1].y, "gap/overlap: ID -> WIFI");
-static_assert(REGION_RECT[1].y + REGION_RECT[1].h == REGION_RECT[2].y, "gap/overlap: WIFI -> NET");
-static_assert(REGION_RECT[2].y + REGION_RECT[2].h == REGION_RECT[3].y, "gap/overlap: NET -> AUTH");
-static_assert(REGION_RECT[3].y + REGION_RECT[3].h == REGION_RECT[4].y, "gap/overlap: AUTH -> MODS");
-static_assert(REGION_RECT[4].y + REGION_RECT[4].h == REGION_RECT[5].y, "gap/overlap: MODS -> FOOT");
-static_assert(REGION_RECT[5].y + REGION_RECT[5].h == H, "regions do not reach the bottom of the panel");
+// The original per-boundary asserts are kept alongside the general one above.
+// They are redundant as proofs and are not redundant as ERROR MESSAGES: a
+// failing tilesPanelExactly() says only "these no longer tile", where these
+// name the boundary that moved.
+static_assert(STATUS_RECT[0].y == 0, "first region must start at the top");
+static_assert(STATUS_RECT[0].y + STATUS_RECT[0].h == STATUS_RECT[1].y, "gap/overlap: ID -> WIFI");
+static_assert(STATUS_RECT[1].y + STATUS_RECT[1].h == STATUS_RECT[2].y, "gap/overlap: WIFI -> NET");
+static_assert(STATUS_RECT[2].y + STATUS_RECT[2].h == STATUS_RECT[3].y, "gap/overlap: NET -> AUTH");
+static_assert(STATUS_RECT[3].y + STATUS_RECT[3].h == STATUS_RECT[4].y, "gap/overlap: AUTH -> MODS");
+static_assert(STATUS_RECT[4].y + STATUS_RECT[4].h == STATUS_RECT[5].y, "gap/overlap: MODS -> FOOT");
+static_assert(STATUS_RECT[5].y + STATUS_RECT[5].h == H, "regions do not reach the bottom of the panel");
 // Every region draws a size-1 line at y+2, so it needs CHAR_H + 2 rows before
 // the next region starts. REG_AUTH needs more (size-2 text, 16 px, at y+1) and
 // gets 18.
-static_assert(REGION_RECT[0].h >= CHAR_H + 2 && REGION_RECT[1].h >= CHAR_H + 2 && REGION_RECT[2].h >= CHAR_H + 2 &&
-                  REGION_RECT[4].h >= CHAR_H + 2 && REGION_RECT[5].h >= CHAR_H + 2,
+static_assert(STATUS_RECT[0].h >= CHAR_H + 2 && STATUS_RECT[1].h >= CHAR_H + 2 && STATUS_RECT[2].h >= CHAR_H + 2 &&
+                  STATUS_RECT[4].h >= CHAR_H + 2 && STATUS_RECT[5].h >= CHAR_H + 2,
               "a text region is too short for a size-1 line at y+2");
-static_assert(REGION_RECT[3].h >= 2 * CHAR_H + 1, "REG_AUTH is too short for the size-2 PIN");
+static_assert(STATUS_RECT[3].h >= 2 * CHAR_H + 1, "REG_AUTH is too short for the size-2 PIN");
+static_assert(tilesPanelExactly(STATUS_RECT), "the status/diag regions no longer tile the panel exactly");
+
+// ---- screen 3: pairing -------------------------------------------------
+//
+// 160 px of width splits into the QR block on the left and a narrow column on
+// the right. The block is SQUARE AND PANEL-HEIGHT because that is what bounds
+// the QR version (qrfit.h): a square symbol on a 160x80 panel is constrained
+// by the short side, so 80 px of height is 80 px of block, and the width the
+// code cannot use is width the digits can.
+constexpr int16_t QR_BLOCK = (int16_t)QrFit::BLOCK_PX;
+static_assert(QrFit::BLOCK_PX == H, "qrfit sizes the code to the panel HEIGHT; the two have diverged");
+
+constexpr int16_t PAIR_COL_X = QR_BLOCK;
+constexpr int16_t PAIR_COL_W = W - QR_BLOCK;  // 80
+
+// Region order here is by ID, not by position — REG_AUTH sits between REG_WIFI
+// and REG_NET on the glass. The IDs keep their MEANING across screens (AUTH is
+// always the PIN, NET is always the address or the equivalent hint), which is
+// what lets drawRegion keep one switch instead of gaining a second one.
+constexpr Rect PAIR_RECT[REGION_COUNT] = {
+    {PAIR_COL_X, 0, PAIR_COL_W, 12},   // REG_ID   — what to DO, as a title bar
+    {PAIR_COL_X, 12, PAIR_COL_W, 12},  // REG_WIFI — the SSID (join) or the IP (pair)
+    {PAIR_COL_X, 68, PAIR_COL_W, 12},  // REG_NET  — one-line hint, at the bottom
+    {PAIR_COL_X, 24, PAIR_COL_W, 44},  // REG_AUTH — "PIN" over four LARGE digits
+    NO_RECT,                           // REG_MODS — no room, and not what this screen is for
+    NO_RECT,                           // REG_FOOT — likewise; see the note below
+    {0, 0, QR_BLOCK, H},               // REG_QR
+};
+// WHAT THE PAIR SCREEN GIVES UP, said plainly: the module list and the
+// activity/heap footer. 80 px of column cannot carry them next to digits this
+// size, and this screen only exists while the device is unpaired and idle —
+// there is no activity to indicate, because nothing has authenticated yet to
+// start one. It is also transient: the moment a session exists, Pairing
+// withdraws and the status screen (which has both) comes back.
+static_assert(tilesPanelExactly(PAIR_RECT), "the pairing regions no longer tile the panel exactly");
+static_assert(PAIR_RECT[REG_QR].w == QR_BLOCK && PAIR_RECT[REG_QR].h == H,
+              "the QR block must be the full panel height; qrfit's scale arithmetic assumes it");
 static_assert(REGION_COUNT <= Dirty::MAX_REGIONS, "more regions than the dirty bitmask holds");
+
+// SPENDING THE LEGIBILITY GAIN. The whole justification for dropping the PIN
+// from 8 digits to 4 (ARCHITECTURE.md, "Pairing model") was that four digits
+// can be drawn about twice as tall — and until now nothing had collected it:
+// the status screen still draws the PIN at size 2 in an 18 px stripe, so the
+// change had cost 10^8 -> 10^4 of search space and bought nothing.
+//
+// Size 3 is 18x24 per character. Four digits is 72 px, which fits the 80 px
+// column; size 4 would be 24x32, i.e. 96 px, which does not. The second
+// assert is the one that matters — it fails if a future layout change ever
+// makes a LARGER size fit, so this stays the biggest the panel will take
+// rather than quietly staying at 3 forever.
+constexpr uint8_t PAIR_PIN_SIZE = 3;
+static_assert(4 * CHAR_W * PAIR_PIN_SIZE <= PAIR_COL_W, "the PIN at this text size no longer fits beside the QR");
+static_assert(4 * CHAR_W * (PAIR_PIN_SIZE + 1) > PAIR_COL_W, "a larger PIN text size would now fit; use it");
+static_assert(PAIR_RECT[REG_AUTH].h >= CHAR_H + 2 + PAIR_PIN_SIZE * CHAR_H,
+              "the pair screen's PIN region is too short for a size-1 label over size-3 digits");
 
 enum Screen : uint8_t {
   SCREEN_STATUS = 0,
   SCREEN_DIAG = 1,
+  // The whole vocabulary of the `screen` action. Everything at or above this
+  // is firmware-selected and cannot be named over the wire.
+  SCREEN_NAMED_COUNT,
+  // THE PAIRING SCREEN IS DELIBERATELY UNNAMEABLE. It appears on its own while
+  // Pairing::visible() and vanishes when pairing withdraws; there is no
+  // `screen pair`, and there must not be. See the comment in displayTick where
+  // it is selected, and the REG_AUTH note about `diag`.
+  SCREEN_PAIR = SCREEN_NAMED_COUNT,
   SCREEN_COUNT
 };
 
-const char *SCREEN_NAME[SCREEN_COUNT] = {"status", "diag"};
+const char *SCREEN_NAME[SCREEN_NAMED_COUNT] = {"status", "diag"};
+
+// Status and diag share one table — that is the "the two screens cost no
+// extra" property, and it survives: what changed is that a THIRD screen now
+// exists which could not share it.
+constexpr const Rect *SCREEN_RECT[SCREEN_COUNT] = {STATUS_RECT, STATUS_RECT, PAIR_RECT};
+
+const Rect &rectFor(uint8_t screen, uint8_t region) {
+  return SCREEN_RECT[screen < SCREEN_COUNT ? screen : 0][region < REGION_COUNT ? region : 0];
+}
 
 // ===========================================================================
 // State
@@ -187,7 +332,14 @@ Adafruit_ST7735 tft(&SPI, PIN_CS, PIN_DC, PIN_RST);
 
 bool up_ = false;          // panel initialised and being driven
 uint8_t blPct_ = 0;        // backlight 0..100
+// SELECTED vs SHOWING, and they are not the same thing since the pairing
+// screen landed. screen_ is what the operator chose and is always one of the
+// NAMED screens; activeScreen_ is what is on the glass this tick and may be
+// SCREEN_PAIR, which nobody can choose. displayTick derives the second from
+// the first — every rect lookup, build and draw goes through activeScreen_,
+// and `screen`/`status` report screen_.
 uint8_t screen_ = SCREEN_STATUS;
+uint8_t activeScreen_ = SCREEN_STATUS;
 char devName_[20] = {0};   // "tdongle-a9d8"
 
 // What the world looked like at the last sample. Rebuilt every SAMPLE_MS;
@@ -234,6 +386,46 @@ uint32_t regionWrites_ = 0;
 uint32_t fullClears_ = 0;
 uint32_t lastRenderUs_ = 0;
 uint32_t worstRenderUs_ = 0;
+// WHAT THE WORST TICK CONTAINED. worstRenderUs_ on its own says a tick was
+// slow; on a screen with four different expensive things in it that is not
+// enough to act on, and guessing the decomposition from arithmetic was tried
+// and got it wrong. Bit 0 full clear, bit 1 QR encode, bit 2 QR blit, bit 3
+// world sample, high nibble the region count drawn.
+constexpr uint8_t TICK_CLEAR = 0x01;
+constexpr uint8_t TICK_ENCODE = 0x02;
+constexpr uint8_t TICK_BLIT = 0x04;
+constexpr uint8_t TICK_SAMPLE = 0x08;
+uint8_t tickWhat_ = 0;
+uint8_t worstRenderWhat_ = 0;
+// The QR block, split into its two halves, for the same reason worstRenderUs_
+// exists: this is the one region that can plausibly eat the tick budget, and
+// "it got slow" is not actionable without knowing WHICH half got slow. The
+// encode is CPU (mask selection is the expensive part); the blit is SPI.
+uint32_t qrEncodeUs_ = 0;
+uint32_t qrBlitUs_ = 0;
+
+// ---- the encoded pairing QR --------------------------------------------
+//
+// THE SYMBOL IS CACHED, AND THE MEASUREMENT IS WHY. Encoding inside drawQr()
+// was tried first, because it kept the code out of .bss entirely; on the
+// device it cost 12,237 us per draw against 5,241 us for the blit, and a draw
+// happens on every full clear (enable, `refresh`, screen change) as well as on
+// every payload change. Paying 12 ms of mask selection to repaint pixels that
+// had not changed is not defensible, so the symbol is now built once per
+// Pairing::seq() and repainted from the buffer.
+//
+// The hygiene argument for NOT caching turned out to be thin: pairing.h
+// already holds the same secret in .bss as PLAIN TEXT for exactly as long,
+// which is strictly more readable than a masked QR bitstream. So this adds no
+// new exposure class — but it does add a second thing that must be wiped, and
+// qrForget() is that. It is called wherever the pair screen goes away.
+uint8_t qrCode_[QrFit::BUF_LEN] = {0};
+QrFit::Fit qrFit_ = {false, 0, 0, 0, 0};
+uint32_t qrCodedSeq_ = 0;  // the Pairing::seq() qrCode_ was built from
+bool qrCoded_ = false;     // qrCode_/qrFit_ describe the current record
+// Set by ensureQrEncoded() when it actually did the ~12 ms of work, consumed by
+// displayTick to yield the rest of that tick. See the comment there.
+bool qrJustEncoded_ = false;
 
 // ===========================================================================
 // Backlight
@@ -347,8 +539,13 @@ void sampleWorld() {
 // dirty-tracking machinery.
 
 // aux encodings, one per region that needs one.
+//
+// AUX_AUTH_PIN (== 1) used to sit between these two and is gone with the
+// status screen's PIN branch — see buildStatus's REG_AUTH. The values of the
+// survivors are deliberately NOT renumbered: aux is compared against the
+// previous tick's cached value, never persisted or sent anywhere, so a gap
+// costs nothing and renumbering would be a change with no reader.
 constexpr uint32_t AUX_AUTH_BLANK = 0;
-constexpr uint32_t AUX_AUTH_PIN = 1;
 constexpr uint32_t AUX_AUTH_PAIRED = 2;
 // REG_MODS's aux is a ScreenFmt::HidBadge (screenfmt.h) — OFF / LIVE / ARMED.
 // It is in the cache key, so arming `hid` from a phone dirties the region and
@@ -362,8 +559,32 @@ uint8_t animFrame(uint32_t now) { return (uint8_t)((now / ANIM_MS) & 3u); }
 constexpr size_t COLS_X2 = (size_t)((W - 2) / CHAR_W);          // a line starting at x=2
 constexpr size_t COLS_ID = COLS_X2 - 3;                         // less the "AP" badge on the right
 constexpr size_t COLS_MODS_HID = COLS_X2 - 4;                   // less the HID badge on the right
-constexpr size_t COLS_PIN = (size_t)((W - 26) / (CHAR_W * 2));  // size-2 text starting at x=26
 constexpr size_t COLS_ACT = (size_t)((W - 34) / CHAR_W);        // right of the chevrons
+
+// Pair screen. The right-hand column starts 3 px in from the QR block, which
+// leaves 12 columns — exactly the width of "tdongle-a9d8", the SSID this
+// device generates, and the reason the margin is 3 rather than 2 or 4.
+constexpr int16_t PAIR_TEXT_X = PAIR_COL_X + 3;
+constexpr size_t COLS_PAIR = (size_t)((PAIR_COL_W - 3) / CHAR_W);
+static_assert(COLS_PAIR == 12, "the pair column's text budget moved; re-check every string on that screen");
+// The title bar gives up the same 22 px the status screen's REG_MODS does, to
+// the same HID badge. See buildPair's REG_ID for why that badge follows the
+// user onto this screen instead of being dropped with the module list.
+constexpr size_t COLS_PAIR_TITLE = (size_t)((PAIR_COL_W - 3 - 22) / CHAR_W);
+static_assert(COLS_PAIR_TITLE >= 9, "the pair title no longer fits beside the HID badge");
+// The digits, at PAIR_PIN_SIZE. Derived the same way as everything else here
+// so that raising the text size cannot leave a stale column count behind.
+constexpr size_t COLS_PAIR_PIN = (size_t)(PAIR_COL_W / (CHAR_W * PAIR_PIN_SIZE));
+static_assert(COLS_PAIR_PIN >= 4, "the pair screen can no longer show a 4-digit PIN");
+// The text fallback inside the QR block, 2 px in on each side.
+constexpr size_t COLS_QR_TEXT = (size_t)((QR_BLOCK - 4) / CHAR_W);
+constexpr uint8_t LINES_QR_TEXT = (uint8_t)((H - 6) / CHAR_H);
+// Two of those lines go to the "key:" label and the gap under it, so the
+// budget that has to hold AuthFmt::PSK_MAX is the remainder — assert what is
+// actually passed to drawWrapped, not the whole block.
+constexpr uint8_t LINES_QR_KEY = (uint8_t)(LINES_QR_TEXT - 2);
+static_assert(COLS_QR_TEXT * LINES_QR_KEY >= 63,
+              "the fallback block can no longer hold a 63-character passphrase");
 
 // printf into a COLUMN budget rather than a byte budget. Every string on this
 // panel goes through here or through ScreenFmt::fit directly: Adafruit_GFX
@@ -423,14 +644,24 @@ void buildStatus(uint8_t region, uint32_t now, char *out, size_t cap, uint32_t *
       // it, which is a deliberate operator action and reversible in one
       // command; the reverse (a diag screen that leaks the PIN to anyone who
       // sends `screen`) is not.
-      char pin[Pairing::MAX_PIN + 1];
-      if (Pairing::get(pin, sizeof(pin)) > 0) {
-        // COLS_PIN, not COLS_X2: this one is drawn at text size 2, so a
-        // character is 12 px wide and only 11 of them fit. AuthFmt::PIN_LEN is
-        // 8 today, but the budget is derived rather than assumed.
-        ScreenFmt::fit(out, cap, pin, COLS_PIN);
-        *aux = AUX_AUTH_PIN;
-      } else if (world_.apUp && world_.sessions > 0) {
+      //
+      // THAT PROPERTY NOW COVERS THE QR TOO, and it had to: a QR is the PIN in
+      // a form a camera reads faster than a person. It is enforced in
+      // displayTick, where SCREEN_PAIR is only selected while
+      // screen_ == SCREEN_STATUS — read the comment there before changing
+      // either condition.
+      //
+      // WHAT USED TO BE HERE AND WHY IT IS GONE. This branch drew the PIN at
+      // text size 2 in an 18 px stripe. It is now UNREACHABLE, and deleting it
+      // rather than leaving it as a fallback is deliberate: displayTick
+      // switches the whole panel to SCREEN_PAIR whenever
+      // (screen_ == SCREEN_STATUS && Pairing::visible()), which is exactly the
+      // condition this branch tested. The two remaining cases are the ones
+      // below — and `diag`, which reaches buildDiag instead and shows neither.
+      //
+      // The digits themselves did not disappear; they moved to buildPair at
+      // size 3, which is the legibility the 8->4 digit change was for.
+      if (world_.apUp && world_.sessions > 0) {
         boundedf(out, cap, COLS_X2, "paired  %u session%s", (unsigned)world_.sessions,
                  world_.sessions == 1 ? "" : "s");
         *aux = AUX_AUTH_PAIRED;
@@ -522,12 +753,144 @@ void buildFoot(uint32_t now, char *out, size_t cap, uint32_t *aux) {
   *aux = 0;
 }
 
+// Drop the encoded symbol. Called wherever the pair screen goes away, so the
+// machine-readable copy of the PIN (or the passphrase) does not outlive the
+// screen that needed it — the same discipline pairing.h applies to the text.
+void qrForget() {
+  memset(qrCode_, 0, sizeof(qrCode_));
+  qrFit_ = QrFit::Fit{false, 0, 0, 0, 0};
+  qrCoded_ = false;
+  qrCodedSeq_ = 0;
+}
+
+// Build the symbol for the current record, if it is not already built. Costs
+// ~12 ms on this chip (measured, qr_encode_us) and therefore runs exactly once
+// per Pairing::seq() rather than once per repaint.
+void ensureQrEncoded(uint32_t seq) {
+  if (qrCoded_ && qrCodedSeq_ == seq) {
+    return;
+  }
+  qrForget();
+  qrCodedSeq_ = seq;
+  qrCoded_ = true;  // "we have tried"; qrFit_.ok says whether it worked
+
+  Pairing::Snapshot s;
+  if (Pairing::get(s)) {
+    // Scratch is stack; only the finished symbol is kept.
+    uint8_t tmp[QrFit::BUF_LEN];
+    uint32_t t0 = micros();
+    qrFit_ = QrFit::encode(s.payload, tmp, qrCode_);
+    qrEncodeUs_ = micros() - t0;
+    qrJustEncoded_ = true;
+    tickWhat_ |= TICK_ENCODE;
+    memset(tmp, 0, sizeof(tmp));
+  }
+  memset(&s, 0, sizeof(s));
+}
+
+// ---- the pairing screen -------------------------------------------------
+//
+// THIS FUNCTION HOLDS NO POLICY ABOUT WHICH CODE IS SHOWING. Pairing::code()
+// is read and rendered; the decision between JOIN and PAIR belongs to
+// mod_http.cpp, which owns the association count and both secrets. Keeping
+// that division is the whole reason this module can stay a renderer — see the
+// block comment in pairing.h.
+void buildPair(uint8_t region, char *out, size_t cap, uint32_t *aux) {
+  const Pairing::Code code = Pairing::code();
+  // The code is in every aux on this screen: it changes the words, and a
+  // JOIN->PAIR switch has to repaint the column even when the PIN did not move.
+  *aux = (uint32_t)code;
+
+  switch (region) {
+    case REG_ID: {
+      // An imperative, because this screen arrives unprompted in front of
+      // someone who did not ask for it and has a phone in their hand. Both
+      // strings are 9 columns or fewer, which is what COLS_PAIR_TITLE leaves
+      // once the badge has its 22 px.
+      //
+      // THE HID BADGE FOLLOWS THE USER HERE, and that is not decoration. This
+      // screen owns the whole panel for as long as the device is pairable —
+      // potentially hours, sitting in the front of a machine — and BRIEF.md
+      // section 5 asks that "is this thing currently a keyboard?" never
+      // require navigation to answer. Dropping the module list on an 80 px
+      // column is fine; dropping the one indicator that says keystrokes can be
+      // injected into the host PC right now is not.
+      ScreenFmt::HidBadge badge = ScreenFmt::hidBadge(world_.hidArmed, world_.hidLive);
+      ScreenFmt::fit(out, cap, code == Pairing::CODE_JOIN ? "JOIN WIFI" : "PAIR NOW", COLS_PAIR_TITLE);
+      *aux = (uint32_t)code | ((uint32_t)badge << 8);
+      break;
+    }
+
+    case REG_WIFI:
+      if (code == Pairing::CODE_JOIN) {
+        // THE SSID, because the user is about to pick this network out of a
+        // list of every AP in the building. Falls back to devName_ (the same
+        // MAC-derived string, built here from the eFuse) if `http` has not
+        // reported yet, so this line is never blank at the moment it matters.
+        ScreenFmt::fit(out, cap, world_.ssid[0] != '\0' ? world_.ssid : devName_, COLS_PAIR);
+      } else {
+        // Already joined. The address is what a user needs if the camera is
+        // the thing that is not working.
+        ScreenFmt::fit(out, cap, world_.ip[0] != '\0' ? world_.ip : "192.168.4.1", COLS_PAIR);
+      }
+      break;
+
+    case REG_AUTH: {
+      // The PIN, large. Read through the Snapshot rather than a narrower
+      // accessor so there is exactly one way into this header (pairing.h's
+      // THREADING note), and wiped off the stack on the way out.
+      Pairing::Snapshot s;
+      if (Pairing::get(s)) {
+        ScreenFmt::fit(out, cap, s.pin, COLS_PAIR_PIN);
+      }
+      memset(&s, 0, sizeof(s));
+      break;
+    }
+
+    case REG_NET:
+      ScreenFmt::fit(out, cap, code == Pairing::CODE_JOIN ? "scan to join" : "scan or type", COLS_PAIR);
+      break;
+
+    default:
+      break;
+  }
+}
+
 void buildRegion(uint8_t region, uint32_t now, char *out, size_t cap, uint32_t *aux) {
+  out[0] = '\0';
+  *aux = 0;
+
+  // A region that does not exist on this screen builds nothing, so it never
+  // goes dirty and never consumes one of the MAX_DRAW_PER_TICK slots. Without
+  // this the footer's animation frame would dirty REG_FOOT eight times a
+  // second on the pair screen, where REG_FOOT is NO_RECT and draws nothing.
+  if (rectEmpty(rectFor(activeScreen_, region))) {
+    return;
+  }
+
+  if (region == REG_QR) {
+    // The QR's cache key is Pairing::seq() and NOTHING ELSE. The payload is up
+    // to 224 bytes and is a secret (it carries either the passphrase or the
+    // PIN); copying it into cache_[].text would be a third copy of it in RAM,
+    // and cache_[].text is 48 bytes anyway. seq() moves on every real change
+    // to the record, which is exactly when the symbol has to be rebuilt.
+    *aux = Pairing::seq();
+    // Encoding happens HERE, not in drawQr, and this is still "no drawing in
+    // build": it is pure CPU over a payload, touching no SPI. Doing it on the
+    // cache pass rather than the draw pass is what stops a repaint of
+    // unchanged pixels from paying for mask selection again.
+    ensureQrEncoded(*aux);
+    return;
+  }
+  if (activeScreen_ == SCREEN_PAIR) {
+    buildPair(region, out, cap, aux);
+    return;
+  }
   if (region == REG_FOOT) {
     buildFoot(now, out, cap, aux);
     return;
   }
-  if (screen_ == SCREEN_DIAG) {
+  if (activeScreen_ == SCREEN_DIAG) {
     buildDiag(region, now, out, cap, aux);
   } else {
     buildStatus(region, now, out, cap, aux);
@@ -572,10 +935,223 @@ void drawChevrons(int16_t x, int16_t y, uint8_t frame, uint16_t on, uint16_t off
   }
 }
 
+// Chunk-wrap, not word-wrap. The only string this ever draws is a WPA2
+// passphrase, which has no words to break on, and breaking one at a space
+// would hide whether the space is part of it (0x20 is a legal passphrase
+// character — authfmt.h).
+void drawWrapped(int16_t x, int16_t y, const char *s, uint16_t colour, size_t cols, uint8_t maxLines) {
+  char line[32];
+  size_t n = strlen(s);
+  for (uint8_t ln = 0; ln < maxLines; ln++) {
+    size_t off = (size_t)ln * cols;
+    if (off >= n) {
+      break;
+    }
+    size_t take = n - off;
+    if (take > cols) {
+      take = cols;
+    }
+    if (take > sizeof(line) - 1) {
+      take = sizeof(line) - 1;
+    }
+    memcpy(line, s + off, take);
+    line[take] = '\0';
+    drawText(x, (int16_t)(y + (int16_t)ln * CHAR_H), line, colour, 1);
+  }
+  memset(line, 0, sizeof(line));  // it was a passphrase
+}
+
+// ===========================================================================
+// The pairing QR block
+// ===========================================================================
+//
+// ---- THE DRAWING BUDGET, MEASURED RATHER THAN ASSUMED ------------------
+//
+// MAX_DRAW_PER_TICK exists to bound SPI per tick, and the comment above it
+// prices two 160x18 stripes at ~5,760 bytes / ~1.2 ms at 40 MHz. This block is
+// 80x80 = 6,400 pixels = 12,800 bytes, which on paper is ~2.56 ms — already
+// enough to blow that budget in ONE region.
+//
+// ON PAPER WAS WRONG, AND BY A LOT. The first working version encoded and drew
+// inside this function, and the device reported:
+//
+//     qr_encode_us  12,237      qrcodegen_encodeText, mask AUTO, version 1
+//     qr_blit_us     5,241      80 writePixels() calls, 12,800 bytes
+//     worst_render_us 17,499    i.e. THE QR REGION WAS THE WORST TICK
+//
+// 17.5 ms of a 40 ms tick, on every repaint, is not a bounded one-off — it is
+// 44% of the interval every time the screen is cleared. Two things were wrong
+// and both are fixed rather than justified:
+//
+//   * THE ENCODE WAS PAID PER DRAW. It is a pure function of the payload, so
+//     it now happens once per Pairing::seq() in ensureQrEncoded() and a
+//     repaint of unchanged pixels pays nothing for it.
+//   * THE BLIT WAS TWICE ITS FLOOR. 5,241 us against 2,560 us of actual
+//     transfer is per-transaction overhead, 80 times over. Rows are batched
+//     into bands now.
+//
+// What is left, and it is stated as a cost rather than hidden: the tick on
+// which the PIN rotates still pays encode + blit together. Nothing here splits
+// those across ticks — that would need sub-region state the dirty tracker does
+// not have — and a PIN rotation is minutes apart, so it is one slow tick in a
+// cooperative 40 ms schedule rather than a steady-state load. The evidence is
+// qr_encode_us / qr_blit_us / worst_render_us on `display status`, not this
+// comment.
+//
+// THE MASK IS DELIBERATELY LEFT ON AUTO. qrcodegen_Mask_AUTO is most of the
+// 12 ms: it encodes eight times and scores each for decoder-hostile patterns.
+// Forcing one mask would cut that by roughly 8x and is the obvious next lever
+// — and it is NOT taken here, because mask choice affects how a real camera
+// copes with a real symbol on real glass, and nothing on this machine can test
+// that. It is stuart's call, after scanning.
+//
+// NOT fillRect PER MODULE. A 29x29 code is 841 rectangles, i.e. 841 address
+// windows and 841 transactions to move 12,800 bytes.
+void drawQr(const Rect &q) {
+  if (qrCoded_ && qrFit_.ok) {
+    const uint32_t t0 = micros();
+    // ONE ADDRESS WINDOW over the whole block; every pixel of it is written,
+    // so the quiet zone paints itself and there is no separate fill. Module
+    // lookup for a pixel outside the symbol yields false — qrcodegen_getModule
+    // bounds-checks — which is what makes that work.
+    //
+    // ROWS ARE BATCHED, and that is measured too. One writePixels() per row was
+    // 80 SPI transactions for 12,800 bytes and took 5,241 us, against a 2,560 us
+    // floor at 40 MHz — i.e. half the time was per-call overhead. A band of
+    // QR_ROWS_PER_BAND rows costs 1,280 bytes of stack and cuts it to 10 calls.
+    tft.startWrite();
+    tft.setAddrWindow((uint16_t)q.x, (uint16_t)q.y, (uint16_t)q.w, (uint16_t)q.h);
+    uint16_t band[QR_BLOCK * QR_ROWS_PER_BAND];
+    int16_t filled = 0;
+    for (int16_t y = 0; y < q.h; y++) {
+      const int my = (y - (int16_t)qrFit_.offset) / qrFit_.scale - QrFit::QUIET_MODULES;
+      uint16_t *row = band + (size_t)filled * (size_t)q.w;
+      for (int16_t x = 0; x < q.w; x++) {
+        const int mx = (x - (int16_t)qrFit_.offset) / qrFit_.scale - QrFit::QUIET_MODULES;
+        row[x] = qrcodegen_getModule(qrCode_, mx, my) ? C_QR_DARK : C_QR_LIGHT;
+      }
+      filled++;
+      // Flush on a full band, and on the last row whether or not it is full —
+      // 80 is a multiple of 8 today, but that is layout, not a law.
+      if (filled == QR_ROWS_PER_BAND || y == q.h - 1) {
+        tft.writePixels(band, (uint32_t)filled * (uint32_t)q.w);
+        filled = 0;
+      }
+    }
+    tft.endWrite();
+    qrBlitUs_ = micros() - t0;
+    tickWhat_ |= TICK_BLIT;
+    return;
+  }
+
+  // THE FALLBACK, AND IT IS A REAL CASE. qrfit.h explains which payload reaches
+  // it: a `WIFI:` join code carrying a 63-character owner-set passphrase needs
+  // version 5, which would be 1 px per module — 0.14 mm, below what any phone
+  // can resolve. An unreadable QR is worse than no QR because it looks like it
+  // should work, so the block becomes text.
+  //
+  // WHAT THIS COSTS: 12 columns. The passphrase wraps into five short lines
+  // instead of the ~26-column ones a full-width layout would give. Making it
+  // full width needs a THIRD rect table selected on the fit result, and that
+  // was judged not worth the machinery for a case only an owner-set 63-char
+  // passphrase reaches — `psk` regenerates a 15-character one that encodes at
+  // version 3.
+  //
+  // The Snapshot is taken ONLY on this path: the common path repaints from
+  // qrCode_ and never puts the payload on the stack at all.
+  tft.fillRect(q.x, q.y, q.w, q.h, C_BG);
+  Pairing::Snapshot s;
+  // Relative to the region, not to the panel: this block is at x == 0 today,
+  // but a hardcoded x is exactly the kind of thing that survives a layout
+  // change and draws into the neighbouring column.
+  const int16_t tx = (int16_t)(q.x + 2);
+  if (Pairing::get(s) && s.fallback[0] != '\0') {
+    drawText(tx, (int16_t)(q.y + 3), "key:", C_DIM, 1);
+    drawWrapped(tx, (int16_t)(q.y + 3 + CHAR_H + 2), s.fallback, C_WARN, COLS_QR_TEXT, LINES_QR_KEY);
+  } else {
+    // No payload at all, or one that will not encode and no text to show
+    // instead. Say so rather than leaving a black square that looks like a
+    // panel fault.
+    drawText(tx, (int16_t)(q.y + 3), "no QR", C_DIM, 1);
+  }
+  memset(&s, 0, sizeof(s));  // it held the passphrase
+}
+
+// The pair screen's own drawing. Same region IDs, different geometry and one
+// much larger text size — see PAIR_PIN_SIZE for why the digits are size 3.
+void drawPairRegion(uint8_t r, const Rect &q, const char *text, uint32_t aux) {
+  const Pairing::Code code = (Pairing::Code)(aux & 0xFFu);
+
+  switch (r) {
+    case REG_ID: {
+      tft.fillRect(q.x, q.y, q.w, q.h, C_BAR);
+      drawText(PAIR_TEXT_X, (int16_t)(q.y + 2), text, C_WARN, 1);
+      // Same badge, same 22 px, same two states as REG_MODS on the status
+      // screen — solid red for LIVE, hollow yellow for ARMED. Kept identical
+      // on purpose: a safety indicator that changes shape between screens is
+      // a safety indicator nobody learns.
+      ScreenFmt::HidBadge badge = (ScreenFmt::HidBadge)((aux >> 8) & 0xFFu);
+      if (badge == ScreenFmt::HID_LIVE) {
+        tft.fillRect((int16_t)(W - 22), q.y, 22, q.h, C_ALERT);
+        drawText((int16_t)(W - 20), (int16_t)(q.y + 2), "HID", ST77XX_BLACK, 1);
+      } else if (badge == ScreenFmt::HID_ARMED) {
+        tft.drawRect((int16_t)(W - 22), q.y, 22, q.h, C_WARN);
+        drawText((int16_t)(W - 20), (int16_t)(q.y + 2), "HID", C_WARN, 1);
+      }
+      break;
+    }
+
+    case REG_WIFI:
+      tft.fillRect(q.x, q.y, q.w, q.h, C_BG);
+      drawText(PAIR_TEXT_X, (int16_t)(q.y + 2), text, code == Pairing::CODE_JOIN ? C_TEXT : C_INFO, 1);
+      break;
+
+    case REG_AUTH: {
+      tft.fillRect(q.x, q.y, q.w, q.h, C_BG);
+      // Vertically centred: an 8 px label, 2 px, then 24 px of digits is 34 px
+      // of content in a 44 px region.
+      constexpr int16_t content = CHAR_H + 2 + PAIR_PIN_SIZE * CHAR_H;
+      const int16_t top = (int16_t)(q.y + (q.h - content) / 2);
+      drawText(PAIR_TEXT_X, top, "PIN", C_DIM, 1);
+      // Centred horizontally in the column at the drawn width, so a PIN that
+      // is ever not 4 digits still sits under its label rather than running
+      // off the edge.
+      const int16_t pinW = (int16_t)(strlen(text) * CHAR_W * PAIR_PIN_SIZE);
+      const int16_t pinX = (int16_t)(PAIR_COL_X + (PAIR_COL_W - pinW) / 2);
+      drawText(pinX, (int16_t)(top + CHAR_H + 2), text, C_WARN, PAIR_PIN_SIZE);
+      break;
+    }
+
+    case REG_NET:
+      tft.fillRect(q.x, q.y, q.w, q.h, C_BG);
+      drawText(PAIR_TEXT_X, (int16_t)(q.y + 2), text, C_DIM, 1);
+      break;
+
+    default:
+      break;
+  }
+}
+
 void drawRegion(uint8_t r) {
-  const Rect &q = REGION_RECT[r];
+  const Rect &q = rectFor(activeScreen_, r);
   const char *text = cache_[r].text;
   const uint32_t aux = cache_[r].aux;
+
+  // Not on this screen. buildRegion already refuses to dirty it, so this is
+  // belt and braces — but a stray Dirty::markAll() must not be able to make
+  // fillRect paint a zero-width rect at the top-left corner.
+  if (rectEmpty(q)) {
+    return;
+  }
+
+  if (r == REG_QR) {
+    drawQr(q);
+    return;
+  }
+  if (activeScreen_ == SCREEN_PAIR) {
+    drawPairRegion(r, q, text, aux);
+    return;
+  }
 
   switch (r) {
     case REG_ID:
@@ -597,14 +1173,13 @@ void drawRegion(uint8_t r) {
       break;
 
     case REG_AUTH:
+      // The size-2 PIN that used to be drawn here has moved to the pairing
+      // screen at size 3 (drawPairRegion). The 18 px this region still gets is
+      // now more than "paired  1 session" needs; it is left alone rather than
+      // reclaimed, because shrinking it would move every boundary below it for
+      // no visible gain.
       tft.fillRect(q.x, q.y, q.w, q.h, C_BG);
-      if (aux == AUX_AUTH_PIN) {
-        // Size 2 (12x16 per character): an 8-digit PIN is 96 px, and it is
-        // meant to be readable at arm's length from a dongle in the front of a
-        // PC. That is the whole justification for an 18 px region.
-        drawText(2, (int16_t)(q.y + 5), "PIN", C_DIM, 1);
-        drawText(26, (int16_t)(q.y + 1), text, C_WARN, 2);
-      } else if (aux == AUX_AUTH_PAIRED) {
+      if (aux == AUX_AUTH_PAIRED) {
         drawText(2, (int16_t)(q.y + 5), text, C_OK, 1);
       }
       break;
@@ -672,10 +1247,12 @@ void displayTick() {
   }
   uint32_t now = millis();
   uint32_t t0 = micros();
+  tickWhat_ = 0;
 
   if (lastSampleMs_ == 0 || (uint32_t)(now - lastSampleMs_) >= SAMPLE_MS) {
     lastSampleMs_ = now;
     sampleWorld();
+    tickWhat_ |= TICK_SAMPLE;
   }
 
   // A finished job lingers, then the footer goes back to being a diagnostic
@@ -694,35 +1271,92 @@ void displayTick() {
     activitySeenSeq_ = Activity::seq();
   }
 
-  refreshCache(now);
-
-  if (clearPending_) {
-    // Full repaint: one 25,600-byte transfer, ~5.1 ms at 40 MHz. It happens on
-    // enable, on `refresh` and on a screen change — never on a state change —
-    // so it is a bounded one-off rather than something in the steady-state
-    // path. All six regions then repaint over the next three ticks
-    // (REGION_COUNT / MAX_DRAW_PER_TICK), i.e. 120 ms.
-    tft.fillScreen(C_BG);
-    clearPending_ = false;
-    fullClears_++;
-    Dirty::markAll(dirty_);
+  // ---- which screen is actually showing --------------------------------
+  //
+  // The pairing screen appears BY ITSELF while Pairing::visible() and vanishes
+  // when the record is withdrawn. There is no `screen pair`, no action that
+  // can request it, and no way to ask for it over the wire — because the QR IS
+  // THE PIN, in a form a camera reads faster and from further away than a
+  // person reads digits, and an action that puts it on the panel would be an
+  // action that leaks the pairing secret to anyone who can send one.
+  //
+  // AND `diag` STILL HIDES IT. The condition is screen_ == SCREEN_STATUS, so
+  // an operator who has selected `diag` sees diag — no QR, no digits. That is
+  // the same property REG_AUTH has carried since the PIN first appeared here
+  // and the reason is unchanged: hiding the secret is a deliberate operator
+  // action, reversible in one command; the reverse is not.
+  const uint8_t effective =
+      (screen_ == SCREEN_STATUS && Pairing::visible()) ? (uint8_t)SCREEN_PAIR : screen_;
+  if (effective != activeScreen_) {
+    // Same handling as a `screen` command, and for the same reason: the region
+    // geometry changes completely, so the panel must be blanked rather than
+    // painted over. Without the cache reset, a region whose text happens to
+    // match its previous screen's would never be marked dirty and would keep
+    // the old screen's pixels.
+    activeScreen_ = effective;
+    clearPending_ = true;
+    memset(cache_, 0, sizeof(cache_));
+    if (effective != SCREEN_PAIR) {
+      // Leaving the pair screen — because pairing withdrew, or because an
+      // operator switched to `diag`. Either way the encoded symbol is a
+      // machine-readable copy of a secret that nothing is going to draw, so it
+      // goes now rather than sitting in .bss until the next pairing attempt.
+      qrForget();
+    }
   }
 
-  uint8_t drawn = 0;
-  while (drawn < MAX_DRAW_PER_TICK) {
-    uint8_t r = Dirty::takeNext(dirty_);
-    if (r >= REGION_COUNT) {
-      break;
+  refreshCache(now);
+
+  // ---- yield the tick that just encoded a QR ----------------------------
+  //
+  // MEASURED, and the reason this branch exists at all. Encoding is ~12.2 ms
+  // (qr_encode_us) and it happens in refreshCache above. Without this, the tick
+  // that enters the pairing screen paid for the encode AND the full clear AND
+  // the 5.4 ms blit in one go — 26,595 us of a 40 ms interval, worse than the
+  // naive version this was supposed to improve on.
+  //
+  // So a tick that encoded does nothing else. Everything stays dirty and paints
+  // 40 ms later, which is one frame and invisible; the peak drops to the clear
+  // plus the blit. This is the "bands across ticks" idea from the design note,
+  // applied at the seam that actually costs — between CPU and SPI — rather than
+  // by slicing the symbol, which would have needed sub-region state the dirty
+  // tracker does not have.
+  if (qrJustEncoded_) {
+    qrJustEncoded_ = false;
+  } else {
+    if (clearPending_) {
+      // Full repaint: one 25,600-byte transfer, ~10 ms measured on this panel
+      // (the ~5.1 ms this comment used to claim was the transfer time alone and
+      // ignored per-pixel cost). It happens on enable, on `refresh` and on a
+      // screen change — never on a state change — so it is a bounded one-off
+      // rather than something in the steady-state path. All seven regions then
+      // repaint over the next four ticks (REGION_COUNT / MAX_DRAW_PER_TICK),
+      // i.e. 160 ms — one more tick than before, since REG_QR joined the set.
+      tft.fillScreen(C_BG);
+      tickWhat_ |= TICK_CLEAR;
+      clearPending_ = false;
+      fullClears_++;
+      Dirty::markAll(dirty_);
     }
-    drawRegion(r);
-    drawn++;
-    regionWrites_++;
+
+    uint8_t drawn = 0;
+    while (drawn < MAX_DRAW_PER_TICK) {
+      uint8_t r = Dirty::takeNext(dirty_);
+      if (r >= REGION_COUNT) {
+        break;
+      }
+      drawRegion(r);
+      drawn++;
+      regionWrites_++;
+    }
+    tickWhat_ |= (uint8_t)(drawn << 4);
   }
 
   frames_++;
   lastRenderUs_ = micros() - t0;
   if (lastRenderUs_ > worstRenderUs_) {
     worstRenderUs_ = lastRenderUs_;
+    worstRenderWhat_ = tickWhat_;
   }
 }
 
@@ -789,11 +1423,13 @@ bool displayEnable(const char **errMsg) {
   activityDoneMs_ = 0;
 
   memset(cache_, 0, sizeof(cache_));
+  qrForget();
   Dirty::init(dirty_, REGION_COUNT);
   Dirty::markAll(dirty_);
   lastSampleMs_ = 0;
   clearPending_ = false;
   screen_ = SCREEN_STATUS;
+  activeScreen_ = SCREEN_STATUS;
 
   // BLANK BEFORE LIGHTING. The ST7735's own frame RAM holds whatever was in it
   // at power-on, and the first tick is up to TICK_MS away — so turning the
@@ -827,7 +1463,8 @@ bool displayDisable(const char **errMsg) {
   // buffer nobody is going to clear), blank the glass, kill the backlight,
   // then give the bus back.
   Activity::subscribe(false);
-  Pairing::subscribe(false);  // also wipes the PIN out of pairing.h's buffer
+  Pairing::subscribe(false);  // also wipes the PIN and the QR payload out of pairing.h's buffers
+  qrForget();                 // and the encoded symbol out of ours
 
   tft.fillScreen(C_BG);
   backlightOffHard();
@@ -866,7 +1503,7 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
 
   if (strcmp(act, "status") == 0) {
     d["panel"] = up_;
-    d["screen"] = SCREEN_NAME[screen_ < SCREEN_COUNT ? screen_ : 0];
+    d["screen"] = SCREEN_NAME[screen_ < SCREEN_NAMED_COUNT ? screen_ : 0];
     d["width"] = W;
     d["height"] = H;
     d["backlight_on"] = blPct_ > 0;
@@ -880,6 +1517,9 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
     d["full_clears"] = fullClears_;
     d["last_render_us"] = lastRenderUs_;
     d["worst_render_us"] = worstRenderUs_;
+    d["worst_render_what"] = worstRenderWhat_;
+    d["qr_encode_us"] = qrEncodeUs_;
+    d["qr_blit_us"] = qrBlitUs_;
     // Whether the PIN is on screen, NEVER the PIN itself: this response goes
     // out over the same WebSocket the PIN exists to avoid.
     d["pin_on_screen"] = Pairing::visible();
@@ -942,7 +1582,11 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
       cmdErrorf(err, "EARGS", "missing p.name (\"status\" or \"diag\")");
       return DISPATCH_FAIL;
     }
-    for (uint8_t i = 0; i < SCREEN_COUNT; i++) {
+    // SCREEN_NAMED_COUNT, not SCREEN_COUNT: SCREEN_PAIR sits above it and is
+    // firmware-selected. This loop IS the vocabulary of the action, so the
+    // bound is what makes "there is no `screen pair`" true rather than a
+    // convention.
+    for (uint8_t i = 0; i < SCREEN_NAMED_COUNT; i++) {
       if (strcmp(name, SCREEN_NAME[i]) == 0) {
         if (screen_ != i) {
           screen_ = i;
@@ -977,7 +1621,7 @@ DispatchResult displayDispatch(const CmdContext &ctx, const char *act, JsonObjec
 
 void displayStatus(JsonObject d) {
   d["panel"] = up_;
-  d["screen"] = SCREEN_NAME[screen_ < SCREEN_COUNT ? screen_ : 0];
+  d["screen"] = SCREEN_NAME[screen_ < SCREEN_NAMED_COUNT ? screen_ : 0];
   d["backlight_pct"] = blPct_;
   d["frames"] = frames_;
   d["region_writes"] = regionWrites_;
@@ -997,7 +1641,9 @@ const ModuleParam BACKLIGHT_PARAMS[] = {
 };
 
 const ModuleParam SCREEN_PARAMS[] = {
-    ModParam::choice("name", true, "which firmware-defined screen to show. `diag` also HIDES the pairing PIN.",
+    ModParam::choice("name", true,
+                     "which firmware-defined screen to show. `diag` also HIDES the pairing PIN and its QR code. "
+                     "The pairing screen itself is not selectable — it appears on its own while the device is pairable.",
                      "status,diag"),
 };
 

@@ -140,12 +140,18 @@ progress{width:100%;height:12px}
 <h1 id="hd">T-Dongle-S3</h1>
 <div id="login">
 <p class="mut" id="who"></p>
-<div class="row"><input id="pin" type="password" inputmode="numeric" autocomplete="one-time-code" placeholder="PIN" maxlength="8">
+<!-- NO maxlength HERE, ON PURPOSE. It is set from GET /api/status's pin_len
+     when the status arrives. A literal in this attribute is exactly how the
+     wrong number survives a change: the 8 that used to sit here outlived the
+     move to a 4-digit PIN, in a file nothing recompiles when AuthFmt::PIN_LEN
+     moves. pin_len was added to that endpoint for this and had no consumer. -->
+<div class="row"><input id="pin" type="password" inputmode="numeric" autocomplete="one-time-code" placeholder="PIN">
 <button class="p" id="go">Unlock</button></div>
 <p id="msg" class="mut"></p>
+<p id="pinnote" class="mut"></p>
 </div>
 <div id="app" hidden>
-<div class="row"><button id="rf">Refresh</button><button id="lo">Log out</button><span class="mut" id="st"></span></div>
+<div class="row"><button id="rf">Refresh</button><button id="lo">Log out</button><span class="mut" id="conn"></span><span class="mut" id="st"></span></div>
 <div class="card" id="ota">
 <div class="row"><strong>Firmware update</strong><code class="mut">POST /api/ota</code></div>
 <div class="mut" id="ost">reading OTA state...</div>
@@ -161,7 +167,74 @@ progress{width:100%;height:12px}
 <h2>Events</h2><pre id="log"></pre>
 </div>
 <script>
-var T=sessionStorage.getItem("tk"),ws=null;
+// ---- ARRIVING WITH A PIN IN THE PATH -----------------------------------
+// THE FIRST THING THIS SCRIPT DOES, and the order inside it is the point:
+// read the path, STRIP IT, and only then consider using it.
+//
+// The pair QR on the LCD encodes HTTP://192.168.4.1/4821 (ARCHITECTURE.md
+// "QR pairing on the LCD"), so the common way to reach this page is already
+// holding the PIN. Landing already-pairing is the happy path -- the user
+// should watch it complete, not be handed an empty box.
+//
+// replaceState RUNS BEFORE ANYTHING ELSE CAN THROW OR AWAIT. If the PIN
+// survived in the URL, a reload -- or a phone restoring the tab, or the back
+// button -- would re-POST it. The PIN is single-use (mod_http.cpp mint trigger
+// 2) so the retry would fail, spend an attempt against the rate limiter, and
+// land the user on an error for doing nothing but refreshing. After the strip,
+// a reload lands on /, which is ordinary PIN entry.
+//
+// The device serves the page for ANY path of pin_len digits and never
+// compares -- see handleWildcard() in mod_http.cpp for why that is deliberate
+// and not laziness -- so the digits here are a claim, not a credential. They
+// go to POST /api/session and take the limiter like anything else.
+var ARRIVED=(function(){
+  var m=/^\/(\d+)$/.exec(location.pathname);
+  if(!m)return "";
+  try{history.replaceState(null,"","/")}catch(e){}
+  return m[1]})();
+// ---- localStorage, NOT sessionStorage ----------------------------------
+// ARCHITECTURE.md's grace-window story says localStorage, and the difference
+// is exactly where the window matters. sessionStorage survives a screen lock
+// but NOT a tab close and not an iOS tab eviction under memory pressure. After
+// one of those the token is gone from the page while the DEVICE still holds
+// the session for up to 90 s -- and because the device is not unpaired, there
+// is no PIN on the LCD to re-pair with. The user is locked out of their own
+// device until the grace window closes, which is precisely the lockout the
+// whole single-session design exists to prevent, arriving through the other
+// door. localStorage survives both, so the page comes back holding the token
+// the device is still honouring.
+var T=localStorage.getItem("tk"),ws=null;
+// From GET /api/status. 0 until it answers; nothing hardcodes 4.
+var PINLEN=0;
+// ---- the WebSocket keepalive -------------------------------------------
+// The page used to send the auth frame on open and NOTHING afterwards.
+// esp_http_server answers a browser's ping/pong itself, on its own task, and
+// that reply never reaches our code -- so a paired phone that is only WATCHING
+// events (which is the normal state) never refreshed its session and was
+// reaped at SESSION_IDLE_MS, 15 minutes, mid-use. Only an inbound frame
+// refreshes, by design: mod_http.cpp's sessionLiveLocked() note explains why
+// receiving a push deliberately does not count as activity.
+//
+// So the page sends a real command frame. `uptime` is the cheapest built-in at
+// AUTH_TOKEN (cmdauth.h) and its response is a few dozen bytes.
+//
+// WHY THIS IS NOT JUST DEFEATING THE IDLE TIMEOUT, which is the honest
+// question to ask of any keepalive: a locked or backgrounded phone SUSPENDS
+// JS timers. So a phone in a pocket stops sending these and still ages out at
+// 15 minutes, which is the case the timeout was written for; what survives is
+// a page someone is actually looking at on a bench, which is the case it was
+// never meant to kill. And both are still bounded by SESSION_ABSOLUTE_MS -- 4
+// hours, refreshed by nothing -- so no amount of keepalive holds a session
+// open indefinitely.
+//
+// 60 s is comfortably inside 15 minutes with room for a phone that suspends
+// timers for a minute or two and comes back.
+var KA=null,KA_MS=60000;
+// ---- reconnect state ---------------------------------------------------
+// GRACE is ApGrace::GRACE_MS, learned from the device (`http status`.grace_ms)
+// rather than assumed; 90000 is only the value to use before the first
+// successful read.
+var RC=null,RCN=0,DOWN=0,GRACE=90000;
 var $=function(i){return document.getElementById(i)};
 function el(t,c,x){var e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
 function log(s){var p=$("log");p.textContent=(new Date().toLocaleTimeString()+" "+s+"\n")+p.textContent.slice(0,4000)}
@@ -172,25 +245,52 @@ function api(path,opt){
   return fetch(path,opt).then(function(r){
     return r.text().then(function(t){
       var j=null;try{j=JSON.parse(t)}catch(e){}
-      if(r.status===401){logout("session expired or rejected");throw new Error("401")}
+      // A 401 from ANY endpoint means the token is dead: the grace window is
+      // irrelevant once the device has actually rejected it.
+      if(r.status===401){sessionOver("the session token was rejected -- pair again");throw new Error("401")}
       if(!j)throw new Error("HTTP "+r.status);
       return j})})}
 function cmd(body){return api("/api/cmd",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})}
 function errText(j){return j&&j.e?(j.e.code+": "+j.e.msg):"failed"}
+function conn(s,bad){var c=$("conn");c.textContent=s;c.className=bad?"err":"mut"}
+function pinNote(s){$("pinnote").textContent=s||""}
+// The PIN the user is holding -- typed, or scanned off the LCD -- has been
+// spent or replaced. Stop offering it. Every path that learns this learns it
+// from the device: `pin_rotated` on the /api/session response, on the DELETE
+// response, and on the http.auth event.
+function pinRotated(why){
+  $("pin").value="";
+  ARRIVED="";
+  pinNote(why||"the PIN on the device's screen has changed -- read the new one")}
 function logout(why){
-  T=null;sessionStorage.removeItem("tk");
+  T=null;localStorage.removeItem("tk");
+  kaStop();rcStop();conn("");
   if(ws){try{ws.close()}catch(e){}ws=null}
   $("app").hidden=true;$("login").hidden=false;say(why||"","")}
-function unlock(){
-  var p=$("pin").value;say("checking...");
+// The grace window has closed (or the token was rejected outright). This is
+// design/BRIEF.md 4.2's "session over": say so plainly and route to pairing.
+// Distinct from logout() only in what it tells the user and in clearing the
+// PIN, because a session ending on the device ALWAYS rotates the PIN
+// (mod_http.cpp rotateAfterRevocation), so whatever they were holding is dead.
+function sessionOver(why){
+  logout(why);
+  pinRotated("the session ended, so the device has put a NEW PIN on its screen")}
+function unlock(auto){
+  var p=$("pin").value;say(auto?"pairing...":"checking...");pinNote("");
   fetch("/api/session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pin:p})})
   .then(function(r){return r.json().then(function(j){return{s:r.status,j:j}})})
   .then(function(x){
-    if(x.s===200&&x.j.ok){T=x.j.d.token;sessionStorage.setItem("tk",T);$("pin").value="";say("");start();return}
+    if(x.s===200&&x.j.ok){
+      T=x.j.d.token;localStorage.setItem("tk",T);$("pin").value="";ARRIVED="";say("");pinNote("");start();return}
     var d=x.j.d||{},extra="";
     if(d.attempts_remaining!==undefined)extra=" ("+d.attempts_remaining+" attempts left)";
     if(d.retry_after_ms!==undefined)extra=" (wait "+Math.ceil(d.retry_after_ms/1000)+"s)";
-    say(errText(x.j)+extra,1)})
+    say(errText(x.j)+extra,1);
+    // ELOCKED and the tenth failure both rotate. The device says which.
+    if(d.pin_rotated)pinRotated();
+    // A PIN that came from the URL is not something the user typed, so leaving
+    // it in the box for them to correct helps nobody -- it is spent or wrong.
+    else if(auto)$("pin").value=""})
   .catch(function(e){say("network error: "+e.message,1)})}
 function opt(s,v,t){var o=document.createElement("option");o.value=v;o.textContent=t;s.appendChild(o);return o}
 // One labelled control for one descriptor parameter. Returns {p,ctl,boxes}.
@@ -389,7 +489,7 @@ function oSend(f,sha){
   x.send(f)}
 function oDone(x){
   var j=null;try{j=JSON.parse(x.responseText)}catch(e){}
-  if(x.status===401){logout("session expired or rejected");return}
+  if(x.status===401){sessionOver("the session token was rejected -- pair again");return}
   var r=oRes();
   if(!j){oLine(r,"err","HTTP "+x.status+" and the body was not JSON: "+(x.responseText||"").slice(0,120));oState();return}
   log("ota -> HTTP "+x.status+" "+(j.ok?"ok":JSON.stringify(j.e||{})));
@@ -466,28 +566,135 @@ function load(){
     var b=j.d.boot||{};
     $("st").textContent="nvs:"+b.nvs+" restored:"+((b.restored||[]).length)+" skipped:"+((b.skipped||[]).length)})
    .catch(function(e){log(e.message)})}
+// ---- keepalive ----------------------------------------------------------
+// A distinctive id so the response can be dropped from the event log: fifteen
+// lines an hour of "uptime -> ok" would bury the events the log exists for.
+var KA_ID=9901;
+function kaStop(){if(KA){clearInterval(KA);KA=null}}
+function kaStart(){
+  kaStop();
+  KA=setInterval(function(){
+    if(ws&&ws.readyState===1){try{ws.send(JSON.stringify({id:KA_ID,act:"uptime"}))}catch(e){}}},KA_MS)}
+// ---- the reconnecting state (design/BRIEF.md 4.2) ----------------------
+// THREE STATES, AND THE MIDDLE ONE IS NOT AN ERROR:
+//   live          - socket open, events arriving
+//   reconnecting  - inside the grace window, token still good, retrying. The
+//                   user is NOT thrown back to a PIN box here. A phone drops a
+//                   Wi-Fi network without saying so, and this is the state the
+//                   user will actually hit, repeatedly, without knowing why.
+//   session over  - the window closed. The token in localStorage is worthless;
+//                   say so and route to pairing.
+//
+// HOW THE THIRD IS DISTINGUISHED FROM THE SECOND, which is the whole problem:
+// the socket dying tells us nothing on its own. So each retry first asks the
+// DEVICE over REST (`http status`, which is the only thing that carries
+// grace_ms / grace_active / grace_ms_left):
+//   * it answers      -> the AP is reachable and the token is alive. Whatever
+//                        killed the socket, the session is fine. Keep retrying
+//                        quietly and show the real countdown if one is armed.
+//   * 401             -> the token is dead. api() routes that to sessionOver().
+//   * unreachable     -> the phone is off the AP. Count down from GRACE, which
+//                        was learned from the device rather than assumed, and
+//                        call it over when it runs out.
+// The last case is a local clock rather than the device's, necessarily: we
+// cannot ask a device we cannot reach. It is the same 90 s the device is
+// counting, started at most one retry interval later, so it errs towards
+// saying "over" slightly after the device does -- which is the safe direction,
+// because the alternative is telling the user to go and read a PIN that is not
+// on the screen yet.
+function rcStop(){if(RC){clearTimeout(RC);RC=null}RCN=0;DOWN=0}
+function rcArm(){
+  if(RC||!T)return;
+  if(!DOWN)DOWN=Date.now();
+  // 1, 2, 4, then 5 s. Fast enough that a screen-unlock reconnects while the
+  // user is still looking at the page, slow enough not to hammer a device that
+  // is not there.
+  var d=Math.min(1000*Math.pow(2,RCN),5000);RCN++;
+  RC=setTimeout(rcTick,d)}
+function rcTick(){
+  RC=null;
+  if(!T)return;
+  cmd({mod:"http",act:"status"}).then(function(j){
+    var d=(j&&j.ok&&j.d)||null;
+    if(d){
+      if(d.grace_ms)GRACE=d.grace_ms;
+      if(d.grace_active&&d.grace_ms_left!==undefined)
+        conn("reconnecting - "+Math.ceil(d.grace_ms_left/1000)+"s of grace left");
+      else conn("reconnecting - device reachable")}
+    openWs()})
+  .catch(function(){
+    // api() turned a 401 into sessionOver(), which cleared T. Nothing to add.
+    if(!T)return;
+    var left=GRACE-(Date.now()-DOWN);
+    if(left<=0){
+      sessionOver("the session is over: the device was unreachable for longer than its "+
+        Math.round(GRACE/1000)+"s grace window");return}
+    conn("reconnecting - "+Math.ceil(left/1000)+"s of grace left");
+    rcArm()})}
 function openWs(){
   if(!T)return;
-  try{ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws")}catch(e){log("ws: "+e.message);return}
+  if(ws&&(ws.readyState===0||ws.readyState===1))return;
+  try{ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws")}
+  catch(e){log("ws: "+e.message);ws=null;rcArm();return}
   ws.onopen=function(){ws.send(JSON.stringify({id:1,act:"auth",p:{token:T}}));log("ws open")};
   ws.onmessage=function(ev){
     var j=null;try{j=JSON.parse(ev.data)}catch(e){log("ws: "+ev.data);return}
-    if(j.ev)log("ev "+j.ev+" "+JSON.stringify(j.d||{}));else log("ws "+ev.data)};
-  ws.onclose=function(){log("ws closed");ws=null};
+    // The auth frame's own reply. A rejection here means the token is dead --
+    // the device closes the socket straight after -- so resolve it now instead
+    // of waiting for onclose to discover it the long way round.
+    if(j.id===1&&j.ok===false&&j.e&&j.e.code==="EAUTH"){
+      sessionOver("this session is no longer valid: "+j.e.msg);return}
+    if(j.id===1&&j.ok){rcStop();conn("live");return}
+    if(j.id===KA_ID)return;  // keepalive round trip, deliberately silent
+    if(j.ev){
+      // The device says the PIN has been replaced. Whatever the page or the
+      // user is still holding -- a typed value, a scanned one -- is void.
+      if(j.d&&j.d.pin_rotated)pinRotated();
+      log("ev "+j.ev+" "+JSON.stringify(j.d||{}));return}
+    log("ws "+ev.data)};
+  ws.onclose=function(){
+    ws=null;log("ws closed");
+    if(T){conn("reconnecting...");rcArm()}};
   ws.onerror=function(){log("ws error")}}
-function start(){$("login").hidden=true;$("app").hidden=false;load();oState();openWs()}
-$("go").onclick=unlock;
-$("pin").addEventListener("keydown",function(e){if(e.key==="Enter")unlock()});
+function start(){
+  $("login").hidden=true;$("app").hidden=false;
+  rcStop();conn("connecting...");
+  load();oState();openWs();kaStart()}
+$("go").onclick=function(){unlock(false)};
+$("pin").addEventListener("keydown",function(e){if(e.key==="Enter")unlock(false)});
 $("rf").onclick=function(){load();oState()};
 $("ofile").onchange=oPick;
 $("oup").onclick=oGo;
 $("ocry").textContent=SUB
  ?"crypto.subtle is available: a SHA-256 is computed here and sent as ?sha256 for the device to verify before it installs the image."
  :"crypto.subtle is NOT available — a plain-HTTP page is not a secure context — so ?sha256 is omitted: integrity is not verified in transit. Compare the digest the device reports below with `sha256sum firmware.bin`.";
-$("lo").onclick=function(){api("/api/session",{method:"DELETE"}).catch(function(){}).then(function(){logout("logged out")})};
+// UNPAIR, and it is honest about what it does: DELETE /api/session revokes the
+// session AND rotates the PIN (mod_http.cpp mint trigger 3), so the device puts
+// a new one on its screen. The response says whether it actually did.
+$("lo").onclick=function(){
+  api("/api/session",{method:"DELETE"}).then(function(j){
+    var rot=j&&j.d&&j.d.pin_rotated;
+    logout("logged out");
+    if(rot)pinRotated("unpaired: a NEW PIN is on the device's screen")})
+   .catch(function(){logout("logged out")})};
 fetch("/api/status").then(function(r){return r.json()}).then(function(j){
-  if(j.ok){$("hd").textContent=j.d.name;$("who").textContent=j.d.fw+" · built "+j.d.build}})
+  if(!j.ok)return;
+  $("hd").textContent=j.d.name;$("who").textContent=j.d.fw+" · built "+j.d.build;
+  // THE PIN LENGTH COMES FROM THE DEVICE. pin_len was added to this endpoint
+  // (2026-08-24) for exactly this and had no consumer until now; the input
+  // carries no maxlength in the markup, so there is nowhere for a stale 4 -- or
+  // a stale 8 -- to hide. The endpoint is unauthenticated on purpose: the
+  // pairing page needs this before there is any session to authenticate with,
+  // and the FORMAT of a credential is public while its VALUE is not.
+  if(j.d.pin_len){
+    PINLEN=j.d.pin_len;
+    var i=$("pin");i.maxLength=PINLEN;i.placeholder=PINLEN+"-digit PIN"}})
  .catch(function(){});
+// The three ways this page starts, in priority order.
 if(T)start();
+// Arrived from the pair QR with a PIN in the path (already stripped from the
+// URL at the top of this script). This is the happy path: pair without asking
+// the user for anything.
+else if(ARRIVED){$("pin").value=ARRIVED;unlock(true)}
 </script></body></html>
 )HTML";

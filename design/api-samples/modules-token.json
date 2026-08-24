@@ -66,7 +66,7 @@
                 ],
                 "status": {
                     "mode": "heartbeat",
-                    "rgb": "140c00"
+                    "rgb": "000000"
                 }
             },
             {
@@ -471,7 +471,7 @@
                     },
                     {
                         "act": "psk",
-                        "help": "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping every session and client. USB console only (auth >= physical), both ways",
+                        "help": "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping every session and client and rotating the pairing PIN. USB console only (auth >= physical), both ways",
                         "min_auth": "physical",
                         "allowed": false,
                         "params": [
@@ -479,7 +479,7 @@
                                 "name": "set",
                                 "type": "string",
                                 "required": false,
-                                "help": "omit to READ the current passphrase. 8..63 printable ASCII replaces it, restarts the AP and drops every session, client and WebSocket."
+                                "help": "omit to READ the current passphrase. 8..63 printable ASCII replaces it, restarts the AP and drops every session, client and WebSocket. Ending a session rotates the pairing PIN, so the LCD will show a new one."
                             }
                         ]
                     },
@@ -518,15 +518,18 @@
                     "ssid": "tdongle-a9d8",
                     "channel": 6,
                     "security": "wpa2-psk/ccmp",
-                    "max_clients": 4,
+                    "max_clients": 1,
                     "ip": "192.168.4.1",
                     "clients": 0,
+                    "station_associated": false,
                     "server_up": true,
+                    "dns_up": true,
+                    "dns_heap_bytes": 424,
                     "credentials_new": false,
                     "teardown_pending": false,
                     "in_registry": 0,
                     "sessions": 0,
-                    "max_sessions": 4,
+                    "max_sessions": 1,
                     "ws_clients": 0,
                     "max_ws_clients": 3,
                     "max_line": 4096,
@@ -538,6 +541,8 @@
                     "ws_rejected": 0,
                     "events_sent": 0,
                     "events_dropped": 0,
+                    "grace_ms": 90000,
+                    "grace_active": false,
                     "pin_fails": 0,
                     "pin_lockouts": 0,
                     "pin_locked": false,
@@ -598,7 +603,7 @@
                                 "name": "name",
                                 "type": "enum",
                                 "required": true,
-                                "help": "which firmware-defined screen to show. `diag` also HIDES the pairing PIN.",
+                                "help": "which firmware-defined screen to show. `diag` also HIDES the pairing PIN and its QR code. The pairing screen itself is not selectable \u2014 it appears on its own while the device is pairable.",
                                 "enum": [
                                     "status",
                                     "diag"
@@ -618,9 +623,9 @@
                     "panel": true,
                     "screen": "status",
                     "backlight_pct": 100,
-                    "frames": 549,
-                    "region_writes": 28,
-                    "worst_render_us": 10585,
+                    "frames": 4287,
+                    "region_writes": 29,
+                    "worst_render_us": 25624,
                     "pin_on_screen": true
                 }
             }

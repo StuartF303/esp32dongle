@@ -40,6 +40,22 @@ from a build that no longer exists, the value opens nothing, and the design prop
 no new PIN is ever written to flash — holds regardless. Recorded so the next person to dump the
 partition finds an explanation instead of a live-looking credential.
 
+**S11. A WebSocket may sit unauthenticated for as long as it likes, and there are only three.**
+`mod_http.cpp` writes `wsClients_[].openedMs` in `wsAdd()` and **nothing ever reads it**. There is
+therefore no handshake timeout: a socket that completes the HTTP upgrade and then never sends the
+`auth` frame stays in the table indefinitely, `authed == false`, holding one of `MAX_WS_CLIENTS`
+(3) slots. Three such sockets and the owner's own page cannot open one — `wsAdd()` returns false,
+the client gets `EMAXWS` and is closed. It is a denial of the event channel only (REST and
+`/api/cmd` are unaffected, and an unauthenticated socket can execute nothing — the gate above
+`wsSessionStillLive()` sees to that), and it is reachable only by a party that already holds the
+single AP slot, which under `AP_MAX_CLIENTS == 1` means they are already denying pairing to
+everyone by squatting it. So it adds no exposure that S3's public passphrase does not already
+carry. **The fix is small and deliberately not taken here:** reap `used && !authed &&
+now - openedMs > N` from `httpTick()`, which needs a value for N — long enough for a phone on a
+slow link to complete a handshake and an `auth` frame, short enough to matter — and that is a
+number stuart should pick rather than one to invent mid-pass. Recorded because the field exists
+and looks like the timeout is implemented.
+
 ---
 
 ## Correctness and robustness
@@ -99,6 +115,23 @@ station MAC** — captured at pairing from `esp_wifi_ap_get_sta_list()` and comp
 than counted — which is a design decision about identifying a client by MAC, not a tweak, so it is
 stuart's call rather than something to do quietly. Note the same list call would also make
 `station_associated` mean "the holder is here" rather than "someone is here".
+
+**C12. `httpd_sess_trigger_close()`'s return value is ignored at all seven call sites.**
+`mod_http.cpp` calls it from `drainEvents()` (2 — the dead-session drop and the failed send),
+`handleWs()` (4 — `EMAXWS`, the over-long frame, the rejected `auth` frame and the no-live-session
+gate) and `dropAllWsClients()` (1), and every one discards the `esp_err_t`. (Counted, not
+estimated: the pass-A review said five.) It queues the close onto the server
+task by writing to esp_http_server's control socket, and that write can fail — a full control
+socket returns an error rather than blocking, which is the same non-blocking property
+`httpd_queue_work()` relies on and the same one the event ring is written around. When it fails
+the close never happens and the fd leaks until the peer drops the connection or `lru_purge_enable`
+reclaims it. **No capability is retained**: `wsRemove()` has already cleared the entry, so the
+socket is out of `wsClients_`, receives no events, and any frame arriving on it fails the gate at
+`wsSessionStillLive()` — what leaks is a file descriptor, not an authorisation. The bound is
+`max_open_sockets` (6) and LRU purge, and the trigger is a control socket full enough to reject a
+write, which needs sustained event pressure. Fixing it properly means deciding what to DO on
+failure — retry from the tick, force `close(fd)` from the wrong task, or accept it — and the
+middle option races the server task, so this is a design decision rather than a missing `if`.
 
 ---
 
