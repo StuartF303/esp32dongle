@@ -1,0 +1,9 @@
+{
+  "name": "qrcodegen",
+  "version": "1.8.0",
+  "description": "Nayuki QR Code generator, C port. Vendored and pinned - see PROVENANCE.md.",
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": { "srcFilter": ["+<*.c>"] }
+}

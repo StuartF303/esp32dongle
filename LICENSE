@@ -39,4 +39,9 @@ It does **not** apply to:
   repository.
 
 - **Third-party libraries** pulled in at build time (Arduino-ESP32, ESP-IDF, ArduinoJson,
-  Adafruit GFX/ST7735 and others). Each carries its own licence; none are vendored here.
+  Adafruit GFX/ST7735 and others). Each carries its own licence.
+
+- **`firmware/lib/qrcodegen/`** — Nayuki's QR Code generator, C port, vendored unmodified and
+  pinned to an upstream commit. MIT licensed, copyright Project Nayuki; the notice is in the
+  header of both source files and the provenance is in `firmware/lib/qrcodegen/PROVENANCE.md`.
+  The MIT terms above are this repository's own grant and do not extend to it.
