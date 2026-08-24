@@ -37,7 +37,7 @@ UI renders itself from those descriptors, so a new module needs no front-end cha
 ```bash
 pio run -d firmware              # build
 pio run -d firmware -t upload    # flash (this REPARTITIONS a stock device)
-pio test -e native               # 229 host tests, no hardware needed
+pio test -e native               # 259 host tests, no hardware needed
 ```
 
 Then talk to it:

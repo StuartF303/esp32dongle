@@ -26,12 +26,28 @@
 //   1. WPA2-PSK with a random 100-bit passphrase generated at first enable and
 //      persisted in NVS. NEVER derived from the MAC — the MAC is in every
 //      beacon frame the device transmits.
-//   2. A random 8-digit PIN, also persisted, exchanged at POST /api/session for
-//      a 192-bit session token. Rate-limited with escalating delay and a
-//      lockout; compared in constant time.
+//   2. A random 4-digit PIN, exchanged at POST /api/session for a 192-bit
+//      session token. Rate-limited with escalating delay and a lockout;
+//      compared in constant time.
 // Both secrets are readable ONLY at AUTH_PHYSICAL (i.e. over the USB cable),
 // and neither ever appears in a log line, an error message, or any response
 // below AUTH_TOKEN.
+//
+// ---- THE PIN IS NOT A STORED CREDENTIAL (stuart, 2026-08-24) ------------
+//
+// It was 8 digits and persisted in NVS. It is now 4 digits and RAM-ONLY: there
+// is no `pin` key any more, and enable() erases any left behind by an older
+// build rather than reading it. A fresh PIN is minted on power-up/AP enable, ON
+// USE (single-use: pairing spends it), on session end, and on every
+// rate-limiter lockout — that last one is what makes 10^4 defensible, because
+// it denies an attacker any accumulated progress. The
+// PSK is unchanged and IS still persisted; the two credentials no longer have
+// the same lifetime and the code no longer pretends they do.
+//
+// The AP is single-client and there is exactly ONE session, so the Wi-Fi
+// association is the session boundary: 90 s after the station disassociates
+// the session is revoked and the PIN rotates. See ARCHITECTURE.md "Pairing
+// model" and the constants block in mod_http.cpp.
 //
 // `AUTH_PHYSICAL` is never granted to a network client, whatever it presents.
 // That level means "is holding the cable", and a token cannot prove that.

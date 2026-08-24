@@ -36,11 +36,38 @@ namespace AuthFmt {
 
 // ---- formats -------------------------------------------------------------
 
-// 8 digits: 10^8 combinations. On its own that is weak — it is only meaningful
-// alongside the rate limiter in ratelimit.h (escalating delay + lockout) and
-// the WPA2 PSK, which an attacker must get past first. 6 was the stated floor;
-// 8 costs the user two keystrokes and buys 100x.
-constexpr size_t PIN_LEN = 8;
+// 4 digits: 10^4 combinations. SAY IT PLAINLY — 4 digits ALONE WOULD BE
+// INDEFENSIBLE. 10,000 is a space a script walks in seconds if it is allowed to
+// walk it, and nothing in this header makes that better. Stuart's decision,
+// 2026-08-24 (ARCHITECTURE.md, "Pairing model"); what makes it hold is three
+// other properties, none of which live here:
+//
+//   * THE LIMITER (ratelimit.h). 1, 2, 4, 8, 16, 30, 30... seconds between
+//     guesses, then a 15-minute lockout at 10 failures: about 34 guesses an
+//     hour. Against a STATIC 4-digit PIN that is still only ~6 days to walk
+//     10^4 — a bounded search, and the bounded part is the objectionable part.
+//   * SINGLE-USE ROTATION, which is what removes the bound. mod_http.cpp mints
+//     a fresh PIN on power-up, ON USE, on session end, AND on every lockout, so
+//     each 17.5-minute cycle spends its 10 guesses against a FRESH 10^4 space.
+//     The attacker accumulates no progress at all; expected effort stops being
+//     a search and becomes an unbounded sequence of independent 1-in-1000
+//     draws. "On use" is what makes single-use literal rather than a figure of
+//     speech: a PIN that has opened a session cannot open a second one.
+//   * SINGLE-CLIENT ASSOCIATION. AP_MAX_CLIENTS is 1, so while the owner's
+//     phone holds the slot nobody else can associate to guess at all. The
+//     brute-force window exists only while the device is unpaired.
+//
+// So the PIN length is not the control; the rotation and the limiter are, and
+// removing either one turns this constant into a real weakness rather than a
+// tolerable one. If PIN_LEN ever grows again, note that nothing here depends on
+// it being 4 — the buffers and the display budget are all derived.
+//
+// WHAT THE FOUR DIGITS BUY: glyph height. The PIN is read off a 160x80 ST7735,
+// usually at arm's length, from a dongle in the front of a desktop machine, in
+// whatever light the room has. Halving the character count roughly doubles the
+// height each character can be drawn at. That is the entire gain, and it is a
+// legibility gain, not a security one.
+constexpr size_t PIN_LEN = 4;
 
 // ---- WPA2 passphrase bounds ----------------------------------------------
 //
@@ -166,9 +193,9 @@ inline bool makePin(char *out, size_t cap, RandomBytesFn rng) {
   // Rejection sampling. 250 == 25 * 10, so bytes 0..249 map onto 0..9 exactly
   // evenly and 250..255 are thrown away.
   size_t got = 0;
-  // Bounded: 8 refills of 32 bytes is 256 draws for 8 digits. Reaching the end
-  // of that means the RNG is returning >= 250 essentially always, i.e. it is
-  // broken — and a broken RNG must fail loudly, not fall back to `% 10`.
+  // Bounded: 8 refills of 32 bytes is 256 draws for PIN_LEN digits. Reaching
+  // the end of that means the RNG is returning >= 250 essentially always, i.e.
+  // it is broken — and a broken RNG must fail loudly, not fall back to `% 10`.
   for (uint8_t refill = 0; refill < 8 && got < PIN_LEN; refill++) {
     uint8_t raw[32];
     rng(raw, sizeof(raw));

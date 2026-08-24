@@ -206,6 +206,19 @@ void test_is_generated_psk() {
 }
 
 // ---- PIN -----------------------------------------------------------------
+//
+// PIN_LEN went 8 -> 4 on 2026-08-24 (stuart; see the block above the constant
+// in authfmt.h, and ARCHITECTURE.md "Pairing model"). These tests assert the
+// FORMAT, so most of them are written against PIN_LEN rather than a literal —
+// but the two that must name digits (the rejection-sampling walk and the
+// validator's length rule) are pinned to 4 on purpose. A test that computed its
+// own expectation from PIN_LEN would pass whatever the constant said, including
+// a value nobody chose.
+constexpr size_t EXPECTED_PIN_LEN = 4;
+
+void test_pin_length_is_the_agreed_four_digits() {
+  TEST_ASSERT_EQUAL_size_t(EXPECTED_PIN_LEN, PIN_LEN);
+}
 
 void test_pin_is_all_digits_and_the_right_length() {
   char pin[PIN_LEN + 1];
@@ -215,14 +228,28 @@ void test_pin_is_all_digits_and_the_right_length() {
 }
 
 // The whole reason for rejection sampling: bytes 250..255 must be DISCARDED,
-// not folded in with `% 10`. Feeding a counter that starts at 245 walks
-// straight through the rejection window, so the expected digits are
-// 245..249 -> 5,6,7,8,9, then 250..255 dropped, then 0,1,2 -> 0,1,2.
+// not folded in with `% 10`. Starting the counter at 247 walks the PIN straight
+// through the rejection window — 247,248,249 give 7,8,9, then six bytes are
+// thrown away, then 0 completes it.
+//
+// STATED HONESTLY, because the old 8-digit version of this test implied more
+// than it proved: a counter source cannot on its own distinguish rejection from
+// folding. 250..255 fold to 0..5, which is exactly what the bytes after the
+// window produce anyway, so both implementations emit the same string. What
+// actually proves the rejection is a source stuck INSIDE the window, and that
+// is the second half below (and the reason it is asserted here rather than only
+// in the broken-RNG test, which uses 255 for a different reason).
 void test_pin_rejects_the_biasing_bytes() {
   char pin[PIN_LEN + 1];
-  g_next = 245;
+  g_next = 247;
   TEST_ASSERT_TRUE(makePin(pin, sizeof(pin), rngCounter));
-  TEST_ASSERT_EQUAL_STRING("56789012", pin);
+  TEST_ASSERT_EQUAL_STRING("7890", pin);
+
+  // 251 is inside the rejection window. Rejection sampling can never accept it,
+  // so this must fail; `% 10` would cheerfully return "1111".
+  g_fixed = 251;
+  TEST_ASSERT_FALSE(makePin(pin, sizeof(pin), rngFixed));
+  TEST_ASSERT_EQUAL_size_t(0, strlen(pin));
 }
 
 // A source stuck on a rejected value must FAIL, not silently fall back to a
@@ -270,10 +297,15 @@ void test_token_refuses_a_short_buffer() {
 void test_validators_reject_the_obvious_wrongs() {
   TEST_ASSERT_FALSE(validPin(nullptr));
   TEST_ASSERT_FALSE(validPin(""));
-  TEST_ASSERT_FALSE(validPin("1234567"));   // short
-  TEST_ASSERT_FALSE(validPin("123456789"));  // long
-  TEST_ASSERT_FALSE(validPin("1234567a"));   // not a digit
-  TEST_ASSERT_TRUE(validPin("00000000"));
+  TEST_ASSERT_FALSE(validPin("123"));    // short
+  TEST_ASSERT_FALSE(validPin("12345"));  // long
+  // The one that matters for the session endpoint: a candidate that STARTS
+  // with the right digits is not the right PIN. handleSessionCreate() relies on
+  // the same rule, one buffer wider (see the comment at `candidate`).
+  TEST_ASSERT_FALSE(validPin("12345678"));  // the old 8-digit format
+  TEST_ASSERT_FALSE(validPin("123a"));      // not a digit
+  TEST_ASSERT_TRUE(validPin("0000"));
+  TEST_ASSERT_TRUE(validPin("9999"));
 
   TEST_ASSERT_FALSE(validToken(nullptr));
   TEST_ASSERT_FALSE(validToken(""));
@@ -382,6 +414,7 @@ int main(int, char **) {
   RUN_TEST(test_passphrase_rejects_non_ascii);
   RUN_TEST(test_passphrase_accepts_the_printable_range);
   RUN_TEST(test_is_generated_psk);
+  RUN_TEST(test_pin_length_is_the_agreed_four_digits);
   RUN_TEST(test_pin_is_all_digits_and_the_right_length);
   RUN_TEST(test_pin_rejects_the_biasing_bytes);
   RUN_TEST(test_pin_fails_loudly_on_a_broken_rng);

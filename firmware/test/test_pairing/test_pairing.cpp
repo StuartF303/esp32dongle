@@ -26,6 +26,9 @@ void tearDown() { Pairing::subscribe(false); }
 void test_policy_shows_only_while_unpaired_and_up() {
   TEST_ASSERT_TRUE(Pairing::shouldShow(true, 0));    // AP up, nobody paired
   TEST_ASSERT_FALSE(Pairing::shouldShow(true, 1));   // someone paired
+  // Unreachable through mod_http.cpp since 2026-08-24 (MAX_SESSIONS is 1), but
+  // asserted anyway: the predicate takes a COUNT and must stay correct for one,
+  // rather than quietly becoming a boolean that happens to work.
   TEST_ASSERT_FALSE(Pairing::shouldShow(true, 4));   // several paired
   TEST_ASSERT_FALSE(Pairing::shouldShow(false, 0));  // AP down
   TEST_ASSERT_FALSE(Pairing::shouldShow(false, 1));

@@ -19,6 +19,7 @@
 
 #include <atomic>
 
+#include "apgrace.h"
 #include "authfmt.h"
 #include "bus.h"
 #include "console.h"
@@ -26,6 +27,7 @@
 #include "modauth.h"
 #include "otaupload.h"
 #include "pairing.h"
+#include "pinpolicy.h"
 #include "protocol.h"
 #include "ratelimit.h"
 #include "registry.h"
@@ -108,7 +110,7 @@ constexpr size_t MAX_WS_RX = Protocol::MAX_LINE;
 // drift apart: rxBuf_ is allocated at MAX_WS_RX + 1 and POST /api/cmd reads
 // MAX_BODY + 1 into it.
 static_assert(MAX_BODY == MAX_WS_RX, "rxBuf_ is shared by /api/cmd and /ws; their limits must be identical");
-// Largest body accepted at POST /api/session. A PIN is 8 characters; anything
+// Largest body accepted at POST /api/session. A PIN is 4 characters; anything
 // approaching this is someone probing.
 constexpr size_t MAX_SESSION_BODY = 256;
 // Largest single WebSocket response we will build. `modules` with a full
@@ -120,7 +122,21 @@ constexpr size_t MAX_WS_TX = 16384;
 // credential at all.
 constexpr size_t MAX_AUTH_HDR = 96;
 
-constexpr uint8_t MAX_SESSIONS = 4;
+// ONE SESSION. Stuart's decision, 2026-08-24 (ARCHITECTURE.md, "Pairing
+// model"), and it is the same decision as AP_MAX_CLIENTS == 1 below: with one
+// AP slot there is exactly one client, so a second session slot could only ever
+// hold a token that nothing on the air can present. Making that explicit is
+// what lets the Wi-Fi association BE the session boundary (apgrace.h), which is
+// in turn what makes a 4-digit PIN defensible.
+//
+// The table, the loops over it and the eviction path all still work for any
+// value >= 1 and are written that way on purpose — but nothing may now ASSUME
+// a second slot exists. The one place that shows is createSession(): a full
+// table evicts, and with MAX_SESSIONS == 1 that means a successful PIN exchange
+// TAKES OVER the existing session rather than sitting alongside it. That is the
+// intended single-session behaviour (re-pairing displaces the old pairing) and
+// it is reported to the caller as `evicted_oldest`.
+constexpr uint8_t MAX_SESSIONS = 1;
 constexpr uint8_t MAX_WS_CLIENTS = 3;
 // Sockets esp_http_server may hold open at once. Below LWIP_MAX_SOCKETS (16)
 // with room for the DHCP server and the control socket.
@@ -140,7 +156,23 @@ constexpr uint8_t EVENT_SLOTS = 6;
 // AP. Channel 6 is the middle of the three non-overlapping 2.4 GHz channels;
 // nothing here scans first, so it is a fixed choice rather than a clever one.
 constexpr int AP_CHANNEL = 6;
-constexpr int AP_MAX_CLIENTS = 4;
+// SINGLE-CLIENT. Stuart's decision, 2026-08-24. Two things follow from it and
+// both are load-bearing:
+//
+//   * It is half of what makes a 4-digit PIN defensible (authfmt.h). While the
+//     owner's phone holds the one slot, nobody else can associate to guess at
+//     all, so the brute-force window exists only while the device is unpaired.
+//   * It makes "a station left" mean "the session is over" (apgrace.h). With
+//     four slots that inference is not available, because the departing station
+//     need not be the one holding the session.
+//
+// WHAT IT COSTS, stated rather than buried: anyone in radio range who knows the
+// passphrase can squat the single slot and deny pairing, with no recovery
+// except the USB cable. That is not a new exposure — under an owner-chosen,
+// SSID-derived passphrase (see the psk_ note below) a squatter grinding the PIN
+// was already occupying a slot — but it is now a denial of service that costs
+// the attacker one association instead of four.
+constexpr int AP_MAX_CLIENTS = 1;
 
 // The module tick: reaps expired sessions and services a deferred reboot.
 constexpr uint32_t TICK_MS = 250;
@@ -154,6 +186,16 @@ constexpr const char *NVS_KEY_PSK = "psk";
 // free to type something that happens to look generated, and the read response
 // must not lie about where the passphrase came from.
 constexpr const char *NVS_KEY_PSK_SRC = "psksrc";
+// THIS KEY IS NEVER WRITTEN. It survives only so enable() can ERASE it: builds
+// before 2026-08-24 persisted the pairing PIN here, and an 8-digit PIN left
+// sitting in flash from one of those is a stored credential this design no
+// longer has any use for. Removing the constant would leave that old key
+// unreachable and therefore permanent.
+//
+// The PIN is RAM-ONLY now (stuart, ARCHITECTURE.md "Pairing model"). A value
+// that is minted fresh on every enable has no reason to survive a boot, and not
+// writing it also removes a flash-wear vector — the same one ratelimit.h
+// refuses to introduce by persisting failure counts.
 constexpr const char *NVS_KEY_PIN = "pin";
 
 // ===========================================================================
@@ -165,9 +207,19 @@ bool apUp_ = false;
 bool sinkRegistered_ = false;
 
 char ssid_[24] = {0};
-// SECRETS. Both are AUTH_PHYSICAL-only and are written to exactly two places:
-// the `psk` / `pin` actions (which check the level first) and NVS. They are
-// never logged, never emitted as an event, and never rendered into status().
+// SECRETS. Both are AUTH_PHYSICAL-only and go to exactly two places: the `psk`
+// / `pin` actions (which check the level first) and, for the PSK alone, NVS.
+// They are never logged, never emitted as an event, and never rendered into
+// status(). The one further route out of this file is the PIN's, and it is
+// deliberately not a wire route: Pairing::publish() hands it to the LCD through
+// an in-RAM rendezvous with no JSON representation (pairing.h).
+//
+// THE TWO NO LONGER HAVE THE SAME LIFETIME (2026-08-24). The PSK is persisted
+// and is expected to outlive reboots; the PIN is RAM-only, minted on every
+// enable, and rotated on session end and on every rate-limiter lockout. Code
+// that treats them as one kind of thing — one NVS write block, one "refuse if
+// it will not persist" guard — is now wrong, and loadOrCreateCredentials()
+// below says so where it used to do exactly that.
 //
 // ---- THE OWNER-CHOSEN PASSPHRASE, AND WHAT IT COSTS --------------------
 //
@@ -261,9 +313,21 @@ std::atomic<bool> teardownPending_{false};
 char rebootReason_[8] = {0};
 std::atomic<bool> rebootPending_{false};
 uint32_t rebootAtMs_ = 0;
-// True when THIS enable() had to mint a PSK or PIN, i.e. the operator has a new
-// secret to go and read. Reported by status(); the secrets themselves are not.
+// True when THIS enable() had to mint a PASSPHRASE, i.e. the operator has a new
+// secret to go and read over USB. Reported by status(); the secrets themselves
+// are not.
+//
+// It used to mean "a PSK or a PIN was minted". That stopped carrying any
+// information the moment the PIN became RAM-only, because a fresh PIN is now
+// minted on EVERY enable — the flag would simply always be true. The PIN needs
+// no such flag anyway: it is on the LCD whenever the device is pairable
+// (pairing.h), which is the whole point of having a screen.
 bool credentialsNew_ = false;
+// True when an old build's persisted `pin` key could not be erased from NVS
+// (see loadOrCreateCredentials). Not fatal — the PIN in use is the fresh RAM
+// one either way — but a stale credential left in flash must not be a SILENT
+// condition, so status() reports it and there is something to go and look at.
+bool stalePinKey_ = false;
 
 char *rxBuf_ = nullptr;  // MAX_WS_RX + 1, httpd task only
 
@@ -280,7 +344,14 @@ uint32_t sessionsIssued_ = 0;
 uint32_t sessionsExpired_ = 0;
 uint32_t sessionsEvicted_ = 0;
 RateLimit::State pinLimit_;
-SemaphoreHandle_t authLock_ = nullptr;  // sessions_ + pinLimit_ + psk_/pin_
+// The 90-second window between the single AP client disassociating and the
+// session ending (apgrace.h). Updated ONLY from httpTick(), i.e. the loop task,
+// under authLock_ — which is also what makes it safe to read from status() on
+// the HTTP task. Deliberately not a Wi-Fi event handler: that would mutate
+// session state from the Wi-Fi task and add a third writer to this table for no
+// gain, since the tick already runs every 250 ms.
+ApGrace::State grace_;
+SemaphoreHandle_t authLock_ = nullptr;  // sessions_ + pinLimit_ + psk_/pin_ + grace_
 
 struct WsClient {
   bool used;
@@ -377,10 +448,11 @@ void buildSsid() {
   snprintf(ssid_, sizeof(ssid_), "tdongle-%02x%02x", mac[4], mac[5]);
 }
 
-// Loads the PSK and PIN from NVS, generating and persisting whichever is
-// missing or malformed. `err` gets a short reason on failure.
+// Loads the PSK from NVS (generating and persisting it if it is missing or
+// malformed), MINTS A FRESH PIN unconditionally, and erases any `pin` key an
+// older build left in flash. `err` gets a short reason on failure.
 //
-// A stored value that fails its validator is REGENERATED rather than used: a
+// A stored PSK that fails its validator is REGENERATED rather than used: a
 // half-written or truncated PSK would otherwise become an AP passphrase nobody
 // can predict OR read, and the only recovery would be a reflash.
 //
@@ -390,40 +462,97 @@ void buildSsid() {
 // leaves 8+ printable characters is no longer detectable here and would be
 // used as-is. `psk` at AUTH_PHYSICAL is what reveals that, and the owner can
 // always re-set or clear it.
+//
+// ---- THE PIN IS NOT LOADED. IT IS MINTED. (2026-08-24) ------------------
+//
+// This function used to treat the two credentials identically: read both, mint
+// whichever failed its validator, write both back in one block. It does not any
+// more, and the asymmetry is the design rather than an oversight.
+//
+//   * MINT TRIGGER 1 OF 4 IS RIGHT HERE. Power-up and every `enable http` get a
+//     brand new PIN, because nothing is read back. The other three are
+//     consumption at pairing and the rate-limiter lockout, both in
+//     handleSessionCreate(), and session end — the grace-window expiry in
+//     httpTick(), or an explicit unpair via DELETE /api/session or `sessions
+//     revoke`. Together they are what makes 10^4 defensible (authfmt.h). This
+//     one is the cheapest of the four to get wrong silently — a single stray
+//     getString() would quietly restore a permanent PIN — so it is stated
+//     rather than left to be inferred from an absence.
+//   * ANY OLD `pin` KEY IS REMOVED FROM THE NAMESPACE — AND THAT IS NOT THE
+//     SAME AS ERASING THE BYTES. Measured on the real device (nvs partition
+//     dumped either side of the call): Preferences::remove() changed exactly
+//     one byte in 32 KB, 0x39 going 0xa8 -> 0x80, which is the page's two-bit
+//     entry-state bitmap flipping those slots to ERASED. The data entry was
+//     byte-identical afterwards and the old 8-digit PIN was still readable at
+//     nvs offset 0x0d00. It stays there until NVS garbage-collects the page,
+//     which happens when the page fills — on its own schedule, not ours.
+//
+//     WHAT THIS ACTUALLY BUYS, stated so nobody re-derives it from the name:
+//     the key is gone from the API, so no code path — ours or a future one
+//     that gets the idea to read it — can obtain it, and `nvs_get_str` returns
+//     NOT_FOUND. What it does not buy is the disappearance of the digits from
+//     the flash of a device someone can dump.
+//
+//     SCRUBBING IS NOT AVAILABLE AND MUST NOT BE ATTEMPTED. NVS is
+//     log-structured: writing an overwrite value APPENDS a new entry and marks
+//     the old one erased, so "overwrite it with zeros first" leaves the
+//     original bytes exactly where they were and adds a copy of the zeros. The
+//     only real scrub is erasing the whole partition, which takes the Wi-Fi
+//     PSK and every module's enable state with it — a far worse outcome than a
+//     stale 8-digit PIN that no longer opens anything.
+//
+//     THE PROPERTY THAT ACTUALLY MATTERS is one line further down: no NEW PIN
+//     is ever written to flash at all. The residue is bounded, one-off, and
+//     belongs to a build that no longer exists; the design change is that the
+//     credential stopped being persisted. Logged in docs/BACKLOG.md as an
+//     accepted residue so the next person to dump the partition finds an
+//     explanation rather than a surprise.
+//
+//     The read-only pass checks isKey() first, so the common case costs no NVS
+//     write and no flash wear.
+//   * THE "REFUSE RATHER THAN RUN WITH A CREDENTIAL THAT WILL NOT PERSIST"
+//     GUARD NOW APPLIES TO THE PASSPHRASE ONLY. It was written for both, and
+//     for the PSK the reasoning still holds exactly: "the passphrase I wrote
+//     down stopped working after a reboot" is a far worse failure than "it
+//     would not start and said why". For the PIN that reasoning is now
+//     inverted — a PIN that does not persist is CORRECT, so an NVS failure
+//     around it must not block the AP from starting. Nobody writes this PIN
+//     down; it is on the LCD, and the next enable mints another one.
 bool loadOrCreateCredentials(char *err, size_t errCap) {
   credentialsNew_ = false;
+  stalePinKey_ = false;
   psk_[0] = '\0';
   pin_[0] = '\0';
   pskSet_ = false;
 
+  bool stalePin = false;
   Preferences prefs;
   if (prefs.begin(NVS_NAMESPACE, true)) {
     prefs.getString(NVS_KEY_PSK, psk_, sizeof(psk_));
-    prefs.getString(NVS_KEY_PIN, pin_, sizeof(pin_));
     pskSet_ = prefs.getUChar(NVS_KEY_PSK_SRC, 0) != 0;
+    // NOT getString(): the value is of no interest and copying an old PIN into
+    // RAM to decide whether to delete it would defeat the point of deleting it.
+    stalePin = prefs.isKey(NVS_KEY_PIN);
     prefs.end();
   }
   psk_[sizeof(psk_) - 1] = '\0';
-  pin_[sizeof(pin_) - 1] = '\0';
 
   // sizeof(psk_), not the default scan cap: psk_ is PSK_MAX + 1 bytes and
   // walking further would read past it (-Wstringop-overread). 64 is still
   // enough to tell a legal 63 from an over-length value.
   bool needPsk = !AuthFmt::validPassphrase(psk_, sizeof(psk_));
-  bool needPin = !AuthFmt::validPin(pin_);
   if (needPsk) {
     pskSet_ = false;  // whatever the flag said, what we are about to use is ours
-  }
-  if (!needPsk && !needPin) {
-    return true;
   }
 
   // Radio is DOWN at this point (enable() calls this before WiFi.softAP), which
   // is exactly the condition under which esp_random() needs help. See the
-  // entropy note above.
+  // entropy note above. The PIN is drawn here for the same reason the PSK is:
+  // this is the only moment in the module's life when the bracketing is both
+  // necessary and legal.
   bootloader_random_enable();
   bool okPsk = !needPsk || AuthFmt::makePsk(psk_, sizeof(psk_), rngBytes);
-  bool okPin = !needPin || AuthFmt::makePin(pin_, sizeof(pin_), rngBytes);
+  bool okPin = AuthFmt::makePin(pin_, sizeof(pin_), rngBytes);
   bootloader_random_disable();
 
   if (!okPsk || !okPin) {
@@ -434,10 +563,22 @@ bool loadOrCreateCredentials(char *err, size_t errCap) {
     return false;
   }
 
+  if (!needPsk && !stalePin) {
+    // Nothing to write and nothing to erase — the overwhelmingly common path,
+    // and it touches NVS read-only. The PIN minted above simply lives in RAM.
+    return true;
+  }
+
   Preferences w;
   if (!w.begin(NVS_NAMESPACE, false)) {
-    snprintf(err, errCap, "cannot open NVS namespace '%s' to store the AP credentials", NVS_NAMESPACE);
-    return false;
+    if (needPsk) {
+      snprintf(err, errCap, "cannot open NVS namespace '%s' to store the AP passphrase", NVS_NAMESPACE);
+      return false;
+    }
+    // Only the stale-PIN erase wanted the write handle. Refusing to start over
+    // that would take the AP down for a key this build never reads.
+    stalePinKey_ = true;
+    return true;
   }
   bool wrote = true;
   if (needPsk) {
@@ -447,23 +588,33 @@ bool loadOrCreateCredentials(char *err, size_t errCap) {
     // factory reset of that key alone) would keep claiming "set".
     wrote = wrote && w.putUChar(NVS_KEY_PSK_SRC, 0) == sizeof(uint8_t);
   }
-  if (needPin) {
-    wrote = wrote && w.putString(NVS_KEY_PIN, pin_) == strlen(pin_);
-  }
+  // No putString(NVS_KEY_PIN, ...) here, and there must never be one again.
+  bool erased = !stalePin || w.remove(NVS_KEY_PIN);
   w.end();
   if (!wrote) {
-    // Refuse rather than run with a credential that will be different after the
-    // next reboot: "the PIN I wrote down stopped working" is a far worse
-    // failure than "it would not start and said why".
-    snprintf(err, errCap, "NVS write of the AP credentials failed; not starting with credentials that would not persist");
+    // The PASSPHRASE, and only the passphrase. See the guard note above.
+    snprintf(err, errCap,
+             "NVS write of the AP passphrase failed; not starting with a passphrase that would not persist");
     return false;
   }
-  credentialsNew_ = true;
+  stalePinKey_ = !erased;
+  credentialsNew_ = needPsk;
   return true;
 }
 
-// Issues a new PIN and revokes every session. Caller must NOT hold authLock_.
-bool regeneratePin(char *err, size_t errCap) {
+// Mints a fresh PIN into pin_. CALLER HOLDS authLock_.
+//
+// Deliberately does NOTHING else — no session revoke, no rate-limiter reset, no
+// NVS. The three callers want different combinations of those and conflating
+// them is precisely how the lockout path would end up clearing the limiter it
+// was triggered by. Each caller states what it wants at the call site.
+//
+// Into a temporary first, then copied: AuthFmt::makePin() writes digits into
+// its output buffer as it draws them and only terminates on success, so
+// generating straight into pin_ would leave a corrupt PIN behind on RNG
+// failure. "The old PIN is unchanged" is a recoverable outcome; "the PIN is now
+// three digits and nothing on the LCD works" is not.
+bool mintPinLocked(char *err, size_t errCap) {
   char fresh[AuthFmt::PIN_LEN + 1];
   // The radio is UP here (the module is enabled), so esp_random() is already a
   // TRNG and bootloader_random_enable() must NOT be called — doing so with
@@ -472,24 +623,45 @@ bool regeneratePin(char *err, size_t errCap) {
     snprintf(err, errCap, "the RNG would not produce a usable PIN; the old one is unchanged");
     return false;
   }
-  Preferences w;
-  if (!w.begin(NVS_NAMESPACE, false)) {
-    snprintf(err, errCap, "cannot open NVS to store the new PIN; the old one is unchanged");
-    return false;
-  }
-  size_t n = w.putString(NVS_KEY_PIN, fresh);
-  w.end();
-  if (n != strlen(fresh)) {
-    snprintf(err, errCap, "NVS write failed; the old PIN is unchanged");
-    return false;
-  }
-
-  Lock l(authLock_);
   memcpy(pin_, fresh, sizeof(fresh));
+  memset(fresh, 0, sizeof(fresh));
+  return true;
+}
+
+// Caller holds authLock_.
+uint8_t revokeAllLocked() {
+  uint8_t n = 0;
   for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
-    sessions_[i] = Session{};
+    if (sessions_[i].used) {
+      sessions_[i] = Session{};
+      n++;
+    }
   }
-  RateLimit::success(pinLimit_);  // a new PIN starts with a clean slate
+  return n;
+}
+
+// The `pin regenerate:true` action: a new PIN, every session revoked, and a
+// clean limiter. Caller must NOT hold authLock_.
+//
+// THE LIMITER RESET HERE IS DELIBERATE AND IS NOT SHARED WITH THE LOCKOUT PATH.
+// Both decisions live in pinpolicy.h precisely so the two can be read side by
+// side and neither can be "tidied" into the other: this action is AUTH_PHYSICAL
+// (modauth.h), so the caller is holding the USB cable and is the device's owner
+// rather than the party the limiter defends against, and clearing a 15-minute
+// lockout for them is the documented way out of one. The lockout path in
+// handleSessionCreate() must NOT clear — test_pinpolicy asserts both.
+bool regeneratePin(char *err, size_t errCap) {
+  Lock l(authLock_);
+  if (!mintPinLocked(err, errCap)) {
+    // Nothing has changed yet, so nothing to undo: the limiter is only cleared
+    // below, after the new PIN is actually in place. An owner whose RNG just
+    // failed keeps their old PIN AND their old limiter state, which is the
+    // honest outcome — the alternative would clear a lockout in exchange for
+    // nothing.
+    return false;
+  }
+  revokeAllLocked();
+  PinPolicy::operatorRegenerate(pinLimit_);
   return true;
 }
 
@@ -543,6 +715,44 @@ uint32_t touchSession(const char *token, uint32_t now) {
   return found;
 }
 
+// Is `id` a live session, and if so refresh its idle timer. Caller holds
+// authLock_ and must have reaped first.
+//
+// NOT constant time, and it does not need to be: touchSession() above compares
+// a TOKEN, which is attacker-supplied and secret, so its walk and its compare
+// are both CT. This one takes a session id that THIS DEVICE assigned and that
+// the caller read out of its own WebSocket table — an attacker cannot vary it
+// per call, cannot observe the comparison without already holding the socket,
+// and learns nothing from a timing difference that finding the socket in the
+// table has not already told them.
+int8_t sessionIndexLocked(uint32_t id) {
+  if (id == 0) {
+    return -1;
+  }
+  for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
+    if (sessions_[i].used && sessions_[i].id == id) {
+      return (int8_t)i;
+    }
+  }
+  return -1;
+}
+
+bool touchSessionByIdLocked(uint32_t id, uint32_t now) {
+  int8_t i = sessionIndexLocked(id);
+  if (i < 0) {
+    return false;
+  }
+  sessions_[i].lastSeenMs = now;
+  return true;
+}
+
+// The same lookup WITHOUT the refresh, for the event fan-out. The distinction
+// is deliberate: a client RECEIVING a push has not done anything, and counting
+// it as activity would keep a session alive indefinitely for a page left open
+// on a desk — the exact failure SESSION_IDLE_MS exists to prevent, and the one
+// the file's session-lifetime note calls out. Only an inbound frame refreshes.
+bool sessionLiveLocked(uint32_t id) { return sessionIndexLocked(id) >= 0; }
+
 // Mints a session. Returns 0 on failure (which can only be an RNG failure —
 // a full table evicts instead, see below).
 uint32_t createSession(char *tokenOut, size_t cap, uint32_t now, bool *evicted) {
@@ -559,10 +769,18 @@ uint32_t createSession(char *tokenOut, size_t cap, uint32_t now, bool *evicted) 
   }
   if (slot < 0) {
     // Table full of LIVE sessions. Evict the least recently used rather than
-    // refusing: refusing means four stale-but-unexpired sessions lock the
-    // rightful owner out of their own device for up to SESSION_IDLE_MS, with
-    // the only remedy being the USB cable. The eviction is REPORTED, not
-    // silent.
+    // refusing: refusing means a stale-but-unexpired session locks the rightful
+    // owner out of their own device for up to SESSION_IDLE_MS, with the only
+    // remedy being the USB cable. The eviction is REPORTED, not silent.
+    //
+    // WITH MAX_SESSIONS == 1 THIS IS THE RE-PAIRING PATH, not a rare overflow:
+    // whoever presents the correct PIN takes the single session over from
+    // whoever held it. That is the intended behaviour (the device has one
+    // owner, and a phone that lost its token must be able to come back without
+    // waiting out SESSION_IDLE_MS), and it is bounded by the PIN — which is on
+    // the LCD only while the device is unpaired. The `oldest` loop below is
+    // kept general rather than collapsed to `slot = 0`: it is correct for any
+    // MAX_SESSIONS and costs one comparison at 1.
     uint32_t oldest = 0;
     slot = 0;
     for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
@@ -587,6 +805,16 @@ uint32_t createSession(char *tokenOut, size_t cap, uint32_t now, bool *evicted) 
   s.createdMs = now;
   s.lastSeenMs = now;
   sessionsIssued_++;
+  // A NEW SESSION GETS A NEW CLOCK, stated rather than left emergent. The
+  // pairing client is associated at this instant, so httpTick()'s next
+  // ApGrace::update() would clear the latch anyway via `stations > 0` — but
+  // "would anyway" is exactly the kind of reasoning that stops being true when
+  // someone changes the arming condition. Resetting here means the new session
+  // cannot inherit anything from the one it replaced: not an armed deadline,
+  // and not a `fired` latch that would suppress its first legitimate expiry.
+  // Safe here because this function holds authLock_ for its whole body (taken
+  // at the top), and grace_ is guarded by that same lock.
+  ApGrace::reset(grace_);
   return s.id;
 }
 
@@ -603,14 +831,7 @@ bool revokeSession(uint32_t id) {
 
 uint8_t revokeAllSessions() {
   Lock l(authLock_);
-  uint8_t n = 0;
-  for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
-    if (sessions_[i].used) {
-      sessions_[i] = Session{};
-      n++;
-    }
-  }
-  return n;
+  return revokeAllLocked();
 }
 
 uint8_t liveSessionCount() {
@@ -664,10 +885,72 @@ void wsRemove(int fd) {
   }
 }
 
-bool wsIsAuthed(int fd) {
+// The session id this socket authenticated as, or 0 if it never did.
+//
+// wsIsAuthed() USED TO LIVE HERE and answered a weaker question — "did this
+// socket ever present a valid token?" — which is not the question a command
+// frame needs answered. See wsSessionStillLive().
+uint32_t wsSessionOf(int fd) {
   Lock l(wsLock_);
   int8_t i = wsIndexOf(fd);
-  return i >= 0 && wsClients_[i].authed;
+  return (i >= 0 && wsClients_[i].authed) ? wsClients_[i].sessionId : 0;
+}
+
+// ===========================================================================
+// THE WEBSOCKET AUTHORISATION GATE
+// ===========================================================================
+//
+// THE BUG THIS EXISTS TO FIX. Every command frame used to be gated on
+// wsIsAuthed(fd) — a bool set once, when the socket sent its `auth` frame, and
+// never revisited. wsClients_[i].sessionId was written and never read by
+// anything. touchSession() therefore ran EXACTLY ONCE per socket, at the `auth`
+// frame, and two things followed, both wrong:
+//
+//   * A SOCKET OUTLIVED THE SESSION THAT AUTHORISED IT. An unpair revoked the
+//     token, rotated the PIN and put fresh digits on the LCD, while the socket
+//     opened under the revoked session kept executing at AUTH_TOKEN — HID
+//     injection, OTA image selection, everything Console::execute() offers.
+//     Someone then reads the new PIN off the panel and pairs, and the device
+//     has TWO live token-level capabilities against it. That directly
+//     contradicts MAX_SESSIONS == 1, which is cited (with AP_MAX_CLIENTS == 1)
+//     as half of what makes a 4-digit PIN defensible — the guarantee is not
+//     "one session record exists" but "one party can act", and the second is
+//     what the constant is worth.
+//   * A WS-ONLY CLIENT NEVER REFRESHED ITS IDLE TIMER. Nothing called
+//     touchSession() after the handshake, so a page that pairs and then drives
+//     everything over /ws was reaped at SESSION_IDLE_MS while actively in use.
+//     `live` went to 0, the LCD started advertising a PIN, and a second party
+//     could pair — while the first socket carried on working, because of the
+//     bug above. The two failures were the same missing lookup, and they cover
+//     for each other, which is why neither is visible from the outside.
+//
+// FIXED IN THE GATE, NOT AT THE REVOKE SITES. Every path that ends a session
+// would otherwise have to remember to hunt down sockets — four such paths
+// today, and setPassphrase() already half-knew, being the only one that calls
+// dropAllWsClients(). Re-checking here means a session ending is enough on its
+// own, whatever ended it and whatever gets added later.
+//
+// LOCKING, and why it is two acquisitions rather than one nested pair: wsLock_
+// and authLock_ have no order defined between them anywhere in this file, and
+// this is not the place to invent one. The session id is copied out under
+// wsLock_, that lock is RELEASED, and only then is authLock_ taken. Neither is
+// held across wsSendText() or Bus::emit().
+//
+// COST PER FRAME: two uncontended FreeRTOS mutex take/give pairs, a scan of
+// MAX_WS_CLIENTS (3) and a scan of MAX_SESSIONS (1), plus the reap that
+// touchSession() would have done anyway. Tens of microseconds on a 240 MHz
+// core, against a frame that is about to be JSON-parsed and dispatched through
+// the registry — i.e. lost in the noise of the work it authorises. It is not
+// worth caching, and a cache would reintroduce exactly the staleness this
+// removes.
+bool wsSessionStillLive(int fd, uint32_t now) {
+  uint32_t id = wsSessionOf(fd);
+  if (id == 0) {
+    return false;
+  }
+  Lock l(authLock_);
+  reapLocked(now);
+  return touchSessionByIdLocked(id, now);
 }
 
 void wsSetAuthed(int fd, uint32_t sessionId) {
@@ -762,16 +1045,46 @@ void drainEvents(void *arg) {
     // Lock released BEFORE the send: a slow or dead client must not stall the
     // loop task's next emit().
     int fds[MAX_WS_CLIENTS];
+    uint32_t ids[MAX_WS_CLIENTS];
     uint8_t n = 0;
     {
       Lock l(wsLock_);
       for (uint8_t i = 0; i < MAX_WS_CLIENTS; i++) {
         if (wsClients_[i].used && wsClients_[i].authed) {
-          fds[n++] = wsClients_[i].fd;
+          fds[n] = wsClients_[i].fd;
+          ids[n] = wsClients_[i].sessionId;
+          n++;
         }
       }
     }
+
+    // THE SAME QUESTION THE COMMAND GATE ASKS, because this is the same
+    // capability from the other direction. Fixing only the gate would stop a
+    // revoked socket EXECUTING while leaving it SUBSCRIBED: every module event,
+    // every activity record, every OTA progress line and the `session_ended`
+    // event announcing its own revocation would keep streaming to a party the
+    // device believes it has unpaired. A socket whose session has gone is
+    // dropped and closed here rather than waiting for it to send a frame,
+    // because an idle listener never sends one.
+    //
+    // Two acquisitions again, never nested: the ids were copied out under
+    // wsLock_, which is released above, and authLock_ is released before the
+    // first send. No lock is held across wsSendText().
+    bool live[MAX_WS_CLIENTS];
+    {
+      Lock l(authLock_);
+      reapLocked(millis());
+      for (uint8_t i = 0; i < n; i++) {
+        live[i] = sessionLiveLocked(ids[i]);
+      }
+    }
+
     for (uint8_t i = 0; i < n; i++) {
+      if (!live[i]) {
+        wsRemove(fds[i]);
+        httpd_sess_trigger_close(server_, fds[i]);
+        continue;
+      }
       if (wsSendText(fds[i], frame, len) == ESP_OK) {
         eventsSent_++;
       } else {
@@ -989,6 +1302,17 @@ struct AuthEvt {
   uint8_t remaining;
   uint32_t retryMs;
   uint32_t session;
+  // True for the outcomes of a PIN ATTEMPT ("fail", "rate_limited", "locked"),
+  // false for lifecycle outcomes ("ok", "session_ended"). It used to be
+  // inferred from `session != 0`, which worked only while every non-attempt
+  // event carried a session id — and "session_ended" may not: the grace window
+  // can close with nothing in the table, and reporting
+  // `attempts_remaining: 0` there would say the exact opposite of the truth.
+  bool reportAttempts;
+  // A fresh PIN was minted as part of THIS outcome. Not the PIN, obviously, and
+  // not its length either — just the fact that whatever a client or an operator
+  // last read is now void.
+  bool pinRotated;
 };
 
 void fillAuthEvent(JsonObject d, void *ctx) {
@@ -996,12 +1320,76 @@ void fillAuthEvent(JsonObject d, void *ctx) {
   d["result"] = e->result;
   if (e->session != 0) {
     d["session"] = e->session;
-  } else {
+  }
+  if (e->reportAttempts) {
     d["attempts_remaining"] = e->remaining;
     if (e->retryMs != 0) {
       d["retry_after_ms"] = e->retryMs;
     }
   }
+  if (e->pinRotated) {
+    d["pin_rotated"] = true;
+  }
+}
+
+// ---- THE RULE FOR ROTATING THE PIN AFTER A REVOCATION -------------------
+//
+// AN ACTUAL REVOCATION ROTATES THE PIN; ANYTHING THAT REVOKES NOTHING ROTATES
+// NOTHING. That is the whole rule, it is stated once here rather than three
+// times at three call sites, and every path that can end a pairing obeys it:
+// the grace-window expiry in httpTick(), DELETE /api/session, `sessions
+// revoke`, and the session cull inside `psk set`.
+//
+// WHY A REVOCATION MUST ROTATE. The PIN is single-use and pairing spent it
+// (mint trigger 2). The instant the session ends, Pairing::shouldShow() becomes
+// true again and httpTick() publishes pin_ to the LCD — so without a mint the
+// panel would display a PIN that has already been used and cannot open
+// anything. It would look exactly like a valid pairing code and fail silently,
+// which is the worst shape a failure can take on a device whose only output is
+// four digits on a screen.
+//
+// WHY "REVOKED NOTHING" MUST NOT. Rotating on a request that ended no pairing
+// hands anyone who can reach the endpoint a way to churn the PIN — and the LCD
+// — with calls that fail. `revoke:7` naming a dead id, or a DELETE whose
+// session was reaped a moment earlier, changed nothing about the device's
+// pairing state and must change nothing about its PIN.
+//
+// WHAT IS DELIBERATELY NOT AN INPUT: whether whatever came after the revocation
+// then SUCCEEDED. `psk set` is the case that makes this explicit — it revokes
+// every session, then restarts the AP, and that restart can fail and be
+// reverted, on the air and in NVS. None of those branches matter here. The
+// sessions are gone either way, so a PIN has been spent either way, and the
+// question this function answers is only ever "was a pairing ended?". Making
+// the rotation conditional on the restart's outcome would leave the failure
+// branch showing a spent PIN.
+//
+// THE GUARD IS IN THE SIGNATURE, not at the call sites. `revoked` is how many
+// sessions the caller actually revoked; 0 returns false and does nothing at
+// all. It was a caller-side `n > 0 &&` conjunction at four sites, which is four
+// chances to forget and a fifth site guaranteed to — and the failure mode is
+// quiet: a PIN that churns, and an LCD that changes, on requests that ended
+// nothing. Passing the count makes the rule impossible to express wrongly.
+//
+// Caller must NOT hold authLock_. `endedId` is the session that ended, or 0
+// when there is no single meaningful id (a cull of several, or a re-key).
+bool rotateAfterRevocation(uint8_t revoked, uint32_t endedId) {
+  if (revoked == 0) {
+    return false;
+  }
+  bool rotated;
+  {
+    Lock l(authLock_);
+    char rerr[128];
+    // A failed mint leaves the OLD (spent) PIN in place. Reported rather than
+    // swallowed; the next enable, lockout or session end mints again.
+    rotated = mintPinLocked(rerr, sizeof(rerr));
+  }
+  // Visible on the console and to every WebSocket client, in the same shape as
+  // every other auth outcome. Never the PIN, never the token that just stopped
+  // working.
+  AuthEvt ev{"session_ended", 0, 0, endedId, false, rotated};
+  Bus::emit("http.auth", fillAuthEvent, &ev);
+  return rotated;
 }
 
 // ===========================================================================
@@ -1026,6 +1414,12 @@ esp_err_t handlePage(httpd_req_t *req) {
 // DELIBERATELY ABSENT: the module list, the MAC, the partition table, heap
 // figures, session count, the SSID's parent MAC, and of course the PSK and PIN.
 // If you are tempted to add a field here, add it to GET /api/modules instead.
+//
+// `pin_len` is the one deliberate addition (2026-08-24) and the distinction it
+// draws is the one to apply to anything else proposed for this endpoint: the
+// FORMAT of a credential is public — it is in this repository, in the protocol
+// docs, and visible in the shape of every rejection message — while its VALUE
+// is not. A client that needs to size an input box is asking about the format.
 esp_err_t handleStatus(httpd_req_t *req) {
   const esp_app_desc_t *app = esp_app_get_description();
   char build[48];
@@ -1038,6 +1432,15 @@ esp_err_t handleStatus(httpd_req_t *req) {
   d["fw"] = app->version;
   d["build"] = (const char *)build;
   d["auth_required"] = true;
+  // The PIN's LENGTH, which is a published format constant, not a secret — the
+  // value is the secret and is never here (see the DELIBERATELY ABSENT list
+  // above). It is on this UNAUTHENTICATED endpoint on purpose: the pairing page
+  // is what needs it, and the pairing page runs before there is any session to
+  // authenticate with. Without it the UI has to hardcode 4, in an input's
+  // maxlength and a validation branch, in a file that nothing recompiles when
+  // AuthFmt::PIN_LEN moves — which is precisely how the wrong number survives a
+  // change like the one that took this from 8 to 4.
+  d["pin_len"] = (uint32_t)AuthFmt::PIN_LEN;
   d["api"] = 1;
   return sendJsonDoc(req, "200 OK", doc);
 }
@@ -1062,9 +1465,11 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
   // wrote — and every PIN would then compare equal to "".
   //
   // The buffer is PIN_LEN + 2 and the comparison below uses PIN_LEN + 1, so a
-  // candidate that merely STARTS with the right 8 digits ("123456789") has a
-  // different length inside the compared window and is rejected. Sizing either
-  // of those at PIN_LEN would accept it.
+  // candidate that merely STARTS with the right PIN_LEN digits — "12345" when
+  // the PIN is "1234" — has a different length inside the compared window and
+  // is rejected. Sizing either of those at PIN_LEN would accept it. Both are
+  // derived from PIN_LEN and stay correct now that it is 4; nothing here
+  // assumes a particular number of digits.
   char candidate[AuthFmt::PIN_LEN + 2] = {0};
   const char *pinIn = reqDoc["pin"] | (const char *)nullptr;
   bool havePin = pinIn != nullptr;
@@ -1078,8 +1483,21 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
     // Deliberately NOT counted as a failed attempt and NOT rate-limited: a
     // request with no PIN in it has not guessed anything, so charging it an
     // attempt would let anyone lock the owner out with malformed requests.
-    return sendErr(req, "400 Bad Request", "EARGS",
-                   "missing p.pin: POST {\"pin\":\"12345678\"} — the PIN is a string of digits, not a number");
+    //
+    // The example is BUILT from PIN_LEN, not written out. A literal "12345678"
+    // sat here through the change to 4 digits and would have told every caller
+    // hitting this path to send eight — an error message that teaches the wrong
+    // format is worse than no error message. The count goes in too, so the
+    // caller does not have to count the characters in the example.
+    char example[AuthFmt::PIN_LEN + 1];
+    for (size_t i = 0; i < AuthFmt::PIN_LEN; i++) {
+      example[i] = (char)('1' + (i % 9));
+    }
+    example[AuthFmt::PIN_LEN] = '\0';
+    char msg[128];
+    snprintf(msg, sizeof(msg), "missing p.pin: POST {\"pin\":\"%s\"} — the PIN is a string of %u digits, not a number",
+             example, (unsigned)AuthFmt::PIN_LEN);
+    return sendErr(req, "400 Bad Request", "EARGS", msg);
   }
 
   uint32_t now = millis();
@@ -1111,22 +1529,60 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
     char secs[12];
     snprintf(secs, sizeof(secs), "%u", (unsigned)((retryMs + 999) / 1000));
     httpd_resp_set_hdr(req, "Retry-After", secs);
-    AuthEvt ev{decision == RateLimit::LOCKED ? "locked" : "rate_limited", 0, retryMs, 0};
+    // attemptsLeft, not a hardcoded 0 — the SAME figure the body carries three
+    // lines up, for the same reason. On LOCKED it is genuinely 0; on WAIT the
+    // escalating delay is in force and there may be seven attempts left, and an
+    // event saying 0 tells an operator watching http.auth that the device is
+    // locked out when it is not. reportAttempts exists precisely so this field
+    // is only emitted where it is true (see AuthEvt); emitting it with a
+    // fabricated value defeats that.
+    AuthEvt ev{decision == RateLimit::LOCKED ? "locked" : "rate_limited", attemptsLeft, retryMs, 0, true, false};
     Bus::emit("http.auth", fillAuthEvent, &ev);
     return sendJsonDoc(req, "429 Too Many Requests", doc);
   }
 
   bool ok;
+  bool rotated = false;
+  bool mintOnSuccess = false;
   {
     Lock l(authLock_);
     // Constant time, and it runs whatever the candidate looks like — an early
     // return on a wrong-length PIN is a timing signal too.
     ok = CT::equalStr(pin_, candidate, AuthFmt::PIN_LEN + 1);
-    if (ok) {
-      RateLimit::success(pinLimit_);
-    } else {
-      RateLimit::fail(pinLimit_, now);
+
+    // ---- MINT TRIGGERS 2 AND 4, DECIDED IN ONE PLACE (pinpolicy.h) ------
+    //
+    // The limiter transition and the mint decision used to be open-coded here,
+    // interleaved with the compare above and the session table below. They are
+    // now one call, for one reason: the invariant they encode — THE LOCKOUT
+    // MINTS A NEW PIN AND MUST NOT CLEAR THE LIMITER — is what makes 10^4
+    // defensible (authfmt.h), and it could not be tested from this repository
+    // while it lived in a .cpp the native env excludes. It has a host suite of
+    // its own now (test_pinpolicy), which is the only coverage it can ever have
+    // here: this handler is registered on the softAP listener and the build
+    // machine has no radio to reach it with.
+    //
+    // afterAttempt() performs the limiter transition itself and returns what to
+    // do about the PIN. Its precondition is satisfied above: check() returned
+    // ALLOW, so this attempt is one the limiter agreed to count.
+    PinPolicy::Outcome out = PinPolicy::afterAttempt(pinLimit_, ok, now);
+
+    if (!ok && out.mint) {
+      // Trigger 4: the tenth consecutive failure. The 15-minute lockout stands
+      // — pinpolicy.h is what guarantees that, and its test asserts check()
+      // still returns LOCKED for the full duration afterwards.
+      //
+      // A failed mint leaves the OLD PIN in place, which is the safe direction:
+      // the lockout still stands, and the next trip (or enable, or session end)
+      // mints again. Reported on the event rather than swallowed.
+      char rerr[128];
+      rotated = mintPinLocked(rerr, sizeof(rerr));
     }
+
+    // Trigger 2 is DEFERRED, not skipped — see below. The policy decides
+    // WHETHER the successful attempt spends the PIN; this handler decides WHEN,
+    // and the answer is "once a session actually exists".
+    mintOnSuccess = ok && out.mint;
   }
 
   if (!ok) {
@@ -1137,9 +1593,20 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
       left = RateLimit::remaining(pinLimit_);
       RateLimit::check(pinLimit_, now, &wait);
     }
-    char msg[160];
-    snprintf(msg, sizeof(msg), "incorrect PIN; %u attempt(s) before a %u-minute lockout", (unsigned)left,
-             (unsigned)(RateLimit::LOCKOUT_MS / 60000u));
+    char msg[192];
+    if (left == 0) {
+      // The attempt that tripped the lockout. Saying "0 attempt(s) before a
+      // 15-minute lockout" here would be true and useless — the lockout has
+      // ALREADY started, and (unless the RNG failed) the PIN the caller was
+      // typing no longer exists. A UI that does not learn the second half
+      // leaves the user retyping a dead PIN for fifteen minutes.
+      snprintf(msg, sizeof(msg), "incorrect PIN; locked out for %u minutes%s",
+               (unsigned)(RateLimit::LOCKOUT_MS / 60000u),
+               rotated ? " — and a NEW PIN is now on the device's screen" : "");
+    } else {
+      snprintf(msg, sizeof(msg), "incorrect PIN; %u attempt(s) before a %u-minute lockout", (unsigned)left,
+               (unsigned)(RateLimit::LOCKOUT_MS / 60000u));
+    }
     JsonDocument doc;
     doc["ok"] = false;
     JsonObject e = doc["e"].to<JsonObject>();
@@ -1148,9 +1615,14 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
     JsonObject d = doc["d"].to<JsonObject>();
     d["attempts_remaining"] = left;
     d["retry_after_ms"] = wait;
+    if (rotated) {
+      // The fact, never the value. This is what tells the page to stop offering
+      // the PIN the user just typed and send them back to the LCD.
+      d["pin_rotated"] = true;
+    }
     // Logged as an event, not a Serial line: stdout is the JSON-lines console
     // protocol. No secret, no candidate PIN, not even its length.
-    AuthEvt ev{"fail", left, wait, 0};
+    AuthEvt ev{"fail", left, wait, 0, true, rotated};
     Bus::emit("http.auth", fillAuthEvent, &ev);
     memset(candidate, 0, sizeof(candidate));
     return sendJsonDoc(req, "401 Unauthorized", doc);
@@ -1165,6 +1637,59 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
                    "could not generate a session token; no session was created");
   }
 
+  // ---- MINT TRIGGER 2 OF 4: THE PIN IS CONSUMED BY USE ------------------
+  //
+  // `mintOnSuccess` is PinPolicy::afterAttempt()'s instruction, carried down
+  // from the compare above. WHY IT IS CARRIED RATHER THAN ACTED ON THERE: the
+  // PIN must not be spent for a session that does not exist. createSession()
+  // can fail (an RNG failure minting the token), and rotating before that is
+  // known would leave the caller holding a dead PIN, no session, and a 500 —
+  // recoverable only by walking over to read the LCD again. The policy decides
+  // whether pairing spends the PIN; this is the point at which pairing has
+  // actually happened.
+  //
+  // Stuart's model is a "4-digit pin code (single use)", and this is the line
+  // that makes "single use" true rather than aspirational. The PIN that was
+  // just exchanged for a token is spent; from here it must never open a session
+  // again.
+  //
+  // IT IS A SESSION-TAKEOVER HOLE OTHERWISE, not untidiness. MAX_SESSIONS is 1
+  // and createSession() EVICTS rather than refusing, so a still-valid PIN is a
+  // credential that displaces the rightful owner's session — anyone who read
+  // the digits off the LCD before the owner paired could come back at any point
+  // inside SESSION_IDLE_MS and take the device. Rotating here closes it: the
+  // window in which a PIN is worth anything ends the moment it is used.
+  //
+  // AND IT MATTERS MORE ONCE THE PIN IS IN A QR CODE. The pair QR carries the
+  // PIN in the URL (ARCHITECTURE.md, "QR pairing on the LCD"), so it is
+  // photographable off the panel from across a room and survives in a camera
+  // roll. Consumption is what makes that photograph worthless the instant the
+  // owner pairs; the page's history.replaceState() only stops a RELOAD from
+  // re-pairing, which is a different and much smaller problem.
+  //
+  // ORDERING, checked rather than assumed:
+  //   * The token in `token` was minted by createSession() from esp_random()
+  //     and has no relationship to the PIN, so rotating now cannot affect what
+  //     goes back in the response body below.
+  //   * The value minted here is NOT reachable by this caller. It never enters
+  //     a response, and httpTick()'s Pairing::shouldShow(apUp_, live) is false
+  //     while a session is live, so the tick withdraws from the LCD instead of
+  //     publishing it. It sits in RAM until the session ends, at which point
+  //     trigger 3 or 4 replaces it again anyway.
+  //   * A failed mint leaves the OLD PIN live. That is the pre-existing
+  //     behaviour rather than a new hole, it is reported as `pin_rotated:
+  //     false`, and the next enable/lockout/session-end mints again.
+  //
+  // Named apart from the `rotated` the lockout path uses, deliberately: that
+  // one belongs to a failed attempt and this one to a successful pairing, and
+  // reusing the variable would make two unrelated outcomes look like one.
+  bool pinConsumed = false;
+  if (mintOnSuccess) {
+    Lock l(authLock_);
+    char rerr[128];
+    pinConsumed = mintPinLocked(rerr, sizeof(rerr));
+  }
+
   JsonDocument doc;
   doc["ok"] = true;
   JsonObject d = doc["d"].to<JsonObject>();
@@ -1177,24 +1702,48 @@ esp_err_t handleSessionCreate(httpd_req_t *req) {
   if (evicted) {
     d["evicted_oldest"] = true;
   }
-  AuthEvt ev{"ok", 0, 0, id};
+  // The fact, never the value — and the caller has just spent the PIN it sent,
+  // so a UI holding it (from a typed field or a scanned QR) knows to discard it
+  // rather than offer it again.
+  d["pin_rotated"] = pinConsumed;
+  AuthEvt ev{"ok", 0, 0, id, false, pinConsumed};
   Bus::emit("http.auth", fillAuthEvent, &ev);
   esp_err_t r = sendJsonDoc(req, "200 OK", doc);
   memset(token, 0, sizeof(token));
   return r;
 }
 
+// ---- MINT TRIGGER 3 OF 4, THE OTHER HALF: EXPLICIT UNPAIR ---------------
+//
+// The user pressing "unpair" in the web UI. ARCHITECTURE.md defines session end
+// as "90 s after the single AP client disassociates, OR an explicit unpair",
+// and design/BRIEF.md 4.2 promises the user that unpairing "revokes the session
+// and puts a new PIN on the device's screen". Revoking without minting would
+// republish the OLD PIN — the one this very caller just spent to pair — and
+// silently break that promise while looking like it kept it.
+//
+// Only an ACTUAL revocation rotates. `was_live` false means the token
+// authenticated but its session had already gone (reaped between the
+// authenticate() above and the revoke), so there was no pairing to end.
 esp_err_t handleSessionDelete(httpd_req_t *req) {
   uint32_t id = authenticate(req);
   if (id == 0) {
     return send401(req);
   }
   bool gone = revokeSession(id);
+  // `was_live` false means the token authenticated but its session had already
+  // gone — reaped between the authenticate() above and the revoke. Nothing
+  // ended, so nothing rotates; rotateAfterRevocation() enforces that from the
+  // count rather than trusting this call site to.
+  bool rotated = rotateAfterRevocation(gone ? 1 : 0, id);
   JsonDocument doc;
   doc["ok"] = true;
   JsonObject d = doc["d"].to<JsonObject>();
   d["revoked"] = id;
   d["was_live"] = gone;
+  // So the page can say "a new PIN is on the screen" rather than guessing, and
+  // so it knows to discard anything it was holding. The fact, never the value.
+  d["pin_rotated"] = rotated;
   return sendJsonDoc(req, "200 OK", doc);
 }
 
@@ -1419,7 +1968,12 @@ esp_err_t handleWs(httpd_req_t *req) {
     return ESP_OK;
   }
 
-  if (!wsIsAuthed(fd)) {
+  // EVERY command frame, not just the first: the socket's session must still be
+  // live right now. See the block above wsSessionStillLive() for what this
+  // replaced and why a one-shot flag was the wrong question. It also refreshes
+  // the session's idle timer, which is what stops a WS-only client being reaped
+  // mid-use.
+  if (!wsSessionStillLive(fd, now)) {
     JsonDocument doc;
     if (!request["id"].isNull()) {
       doc["id"] = request["id"];
@@ -1427,8 +1981,22 @@ esp_err_t handleWs(httpd_req_t *req) {
     doc["ok"] = false;
     JsonObject e = doc["e"].to<JsonObject>();
     e["code"] = "EAUTH";
-    e["msg"] = "this socket is not authenticated; send {\"act\":\"auth\",\"p\":{\"token\":\"...\"}} first";
+    // One message for two causes — never authenticated, and authenticated
+    // under a session that has since ended — because the remedy is identical
+    // and the difference is not the client's business. A socket that WAS
+    // authenticated is told plainly that its session ended rather than that it
+    // never authenticated, which is the difference between "re-pair" and "your
+    // code is broken".
+    e["msg"] =
+        "this socket has no live session: it never authenticated, or its session was revoked, expired or "
+        "unpaired. Re-pair and send {\"act\":\"auth\",\"p\":{\"token\":\"...\"}}";
     wsSendDoc(fd, doc);
+    // Out of the table BEFORE the close is triggered.
+    // httpd_sess_trigger_close() only QUEUES the close onto the server task, so
+    // until that runs the socket still exists — and a slot left in place would
+    // still be `authed` for the event fan-out's next pass. wsRemove() clears
+    // the whole entry, so both the fan-out and any further frame on this fd see
+    // an unknown socket.
     wsRemove(fd);
     httpd_sess_trigger_close(server_, fd);
     return ESP_OK;
@@ -1819,8 +2387,12 @@ bool httpEnable(const char **errMsg) {
   buildSsid();
 
   // BEFORE the radio comes up — see the entropy note. A failure here is fatal
-  // to enable(): starting an AP with a credential we could not persist would
-  // mean the PIN silently changing at the next boot.
+  // to enable(), and what makes it fatal is now the PASSPHRASE alone: bringing
+  // an AP up on a key we could not persist would mean the WPA2 credential the
+  // owner just wrote down stops working at the next boot. The PIN changing at
+  // the next boot is not a failure any more, it is the design — it changes at
+  // every enable by construction, and loadOrCreateCredentials() will not refuse
+  // to start over it.
   if (!loadOrCreateCredentials(enableErr_, sizeof(enableErr_))) {
     *errMsg = enableErr_;
     return false;
@@ -1926,12 +2498,17 @@ void teardownNow() {
     // work after the next enable — the operator's mental model is "I turned it
     // off", and a surviving session would quietly contradict it.
     Lock l(authLock_);
-    for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
-      sessions_[i] = Session{};
-    }
+    revokeAllLocked();
+    // The grace clock goes with them. A window left armed across a disable
+    // would fire on the next enable's first tick — revoking a session that
+    // belongs to a different AP session entirely and rotating a PIN that was
+    // just minted — and a stale `associated` flag would arm a fresh one
+    // against a station that disassociated because we took the radio down.
+    ApGrace::reset(grace_);
     // The secrets are not needed while the AP is down, so they do not sit in
-    // RAM waiting for a memory-disclosure bug. They come back from NVS on the
-    // next enable(), and so does pskSet_.
+    // RAM waiting for a memory-disclosure bug. The PSK comes back from NVS on
+    // the next enable(), and so does pskSet_; the PIN does not come back at
+    // all — a NEW one is minted, because it is RAM-only now.
     memset(psk_, 0, sizeof(psk_));
     memset(pin_, 0, sizeof(pin_));
     pskSet_ = false;
@@ -1983,36 +2560,119 @@ void httpTick() {
     esp_restart();
   }
 
-  // Expired sessions are reaped opportunistically here as well as on lookup, so
-  // a token that has aged out stops counting against MAX_SESSIONS even if
-  // nobody ever presents it again.
-  Lock l(authLock_);
-  reapLocked(now);
+  // ---- the session follows the Wi-Fi association (apgrace.h) ------------
+  //
+  // POLLED, not event-driven, and that is a decision rather than laziness. A
+  // Wi-Fi event handler runs on the Wi-Fi task, which would make it a THIRD
+  // task mutating sessions_ and pin_ — the two things authLock_ exists to
+  // protect and the two things every comment in this file reasons about as
+  // "loop task or HTTP task". This tick already runs every TICK_MS (250 ms),
+  // so the cost is one esp_wifi call per tick and the worst-case lateness of
+  // the 90-second window is 250 ms.
+  //
+  // OUTSIDE authLock_ ON PURPOSE: softAPgetStationNum() goes into esp_wifi and
+  // can block on the Wi-Fi task, and nothing in this file holds a lock across
+  // a call it does not control. fillApStatus() reads it the same way.
+  uint8_t stations = apUp_ ? (uint8_t)WiFi.softAPgetStationNum() : 0;
 
-  // ---- the pairing PIN's out-of-band channel (pairing.h) ----------------
-  //
-  // Evaluated here, every TICK_MS, because both inputs move on their own: a
-  // session can expire in reapLocked() immediately above, and the last one
-  // being revoked has to put the PIN back on the LCD without anyone asking.
-  //
-  // Counted inline rather than via liveSessionCount(): authLock_ is a PLAIN
-  // mutex (xSemaphoreCreateMutex, not recursive) and is already held here, so
-  // calling that function would deadlock the loop task on its first tick.
-  //
-  // This is also the only place pin_ leaves this file, and it goes to a buffer
-  // with no JSON representation and no transport — never into status(), which
-  // is wire-visible. publish() is itself a no-op unless `display` has
-  // subscribed, so with the LCD off the PIN never leaves this file at all.
-  uint8_t live = 0;
-  for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
-    if (sessions_[i].used) {
-      live++;
+  uint32_t endedId = 0;
+  bool graceExpired = false;
+  bool rotated = false;
+
+  // SCOPED, so the bus event at the bottom is emitted with authLock_ RELEASED.
+  // The sink takes ringLock_, and no path in this file takes authLock_ while
+  // holding ringLock_; keeping it that way means the two never have to have a
+  // documented order at all.
+  {
+    Lock l(authLock_);
+
+    // Expired sessions are reaped opportunistically here as well as on lookup,
+    // so a token that has aged out stops counting against MAX_SESSIONS even if
+    // nobody ever presents it again. FIRST, because everything below is a
+    // function of whether a session is live and a session that aged out three
+    // minutes ago must not keep a grace clock armed.
+    reapLocked(now);
+
+    // Counted inline rather than via liveSessionCount(): authLock_ is a PLAIN
+    // mutex (xSemaphoreCreateMutex, not recursive) and is already held here, so
+    // calling that function would deadlock the loop task on its first tick.
+    uint8_t live = 0;
+    for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
+      if (sessions_[i].used) {
+        live++;
+      }
+    }
+
+    if (!apUp_) {
+      // The radio is down (a failed enable, or a teardown in flight). No
+      // association means no association-derived session lifetime; anything
+      // armed is meaningless and is dropped rather than allowed to fire later.
+      ApGrace::reset(grace_);
+    } else if (ApGrace::update(grace_, stations, live > 0, now) == ApGrace::EXPIRED) {
+      // ---- MINT TRIGGER 3 OF 4: SESSION END -------------------------------
+      //
+      // 90 seconds with a live session and nobody associated. The phone is not
+      // coming back, so the token it holds must stop working and the device
+      // must become pairable again — which means BOTH halves: revoke, and
+      // mint. Revoking alone would put the PIN that the departed client
+      // already used back on the LCD, and that PIN is spent by definition
+      // (trigger 2 consumed it at pairing).
+      //
+      // `live > 0` is the arming condition, not just a filter: a station that
+      // associates and leaves WITHOUT pairing arms nothing at all. See the
+      // long note at ApGrace::update() for why — the short version is that
+      // rotating in that case defends against nobody (the PIN is on the LCD in
+      // plain sight anyway) and breaks the flow of someone mid-way through
+      // reading or scanning it.
+      //
+      // The id is captured BEFORE the revoke so the event can name what ended;
+      // with MAX_SESSIONS == 1 there is at most one.
+      //
+      // The limiter is NOT touched here. A session ending is not evidence
+      // about the person who was grinding PINs, and the lockout is theirs to
+      // serve.
+      for (uint8_t i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions_[i].used) {
+          endedId = sessions_[i].id;
+          break;
+        }
+      }
+      revokeAllLocked();
+      live = 0;
+      char rerr[128];
+      rotated = mintPinLocked(rerr, sizeof(rerr));
+      graceExpired = true;
+    }
+
+    // ---- the pairing PIN's out-of-band channel (pairing.h) ----------------
+    //
+    // Evaluated here, every TICK_MS, because both inputs move on their own: a
+    // session can expire in reapLocked() above, and the last one being revoked
+    // has to put the PIN back on the LCD without anyone asking.
+    //
+    // This is also the only place pin_ leaves this file, and it goes to a
+    // buffer with no JSON representation and no transport — never into
+    // status(), which is wire-visible. publish() is itself a no-op unless
+    // `display` has subscribed, so with the LCD off the PIN never leaves this
+    // file at all.
+    //
+    // shouldShow() is what keeps a PIN minted at pairing (trigger 2) off the
+    // screen: `live` is 1 at that moment, so the branch below withdraws rather
+    // than publishing, and the fresh PIN stays in RAM until the session ends.
+    if (Pairing::shouldShow(apUp_, live)) {
+      Pairing::publish(pin_);
+    } else {
+      Pairing::withdraw();
     }
   }
-  if (Pairing::shouldShow(apUp_, live)) {
-    Pairing::publish(pin_);
-  } else {
-    Pairing::withdraw();
+
+  // The revoke is visible on the console and to every WebSocket client, in the
+  // same shape as every other auth outcome (fillAuthEvent). It carries what
+  // ENDED and whether the PIN rotated — never the PIN, and never the token that
+  // just stopped working. Emitted outside the lock; see the scope note above.
+  if (graceExpired) {
+    AuthEvt ev{"session_ended", 0, 0, endedId, false, rotated};
+    Bus::emit("http.auth", fillAuthEvent, &ev);
   }
 }
 
@@ -2055,11 +2715,28 @@ void fillApStatus(JsonObject d) {
     // renderActionResult in console.cpp).
     // So a stack buffer assigned uncast, or cast to const char*, is fine.
     d["ip"] = ipStr;
-    d["clients"] = WiFi.softAPgetStationNum();
+    d["clients"] = (uint8_t)WiFi.softAPgetStationNum();
   }
+  // Explicit, even though it is `clients > 0`, because with AP_MAX_CLIENTS == 1
+  // this is no longer a count — it is the session's lifeline, and it is what
+  // design/BRIEF.md 4.2 needs to tell "live" from "reconnecting". A client
+  // rendering that state should not have to know that the AP is single-client
+  // to read `clients` correctly.
+  //
+  // OUTSIDE the apUp_ block, unlike `clients` and `ip`. With the AP down there
+  // is definitively no station associated, so the honest answer is false rather
+  // than absent — and `grace_ms`/`grace_active` beside it are unconditional, so
+  // a client parsing the pairing state would otherwise have to handle one of
+  // the three being missing while the others are present.
+  d["station_associated"] = apUp_ && WiFi.softAPgetStationNum() > 0;
   d["server_up"] = server_ != nullptr;
-  // First enable on a virgin NVS mints both secrets — which is exactly when
-  // the operator needs to be told to go and read the PIN over USB.
+  // A PASSPHRASE was minted by this enable — a virgin NVS, or a stored one that
+  // failed its validator. That is the one credential an operator has to go and
+  // read over USB, so it is the one worth flagging. It is NOT "both secrets"
+  // any more: the PIN is minted on every enable without exception, so a flag
+  // for it would be permanently true and carry no information, and the LCD is
+  // where the PIN is meant to be read from anyway. See the note beside
+  // credentialsNew_ for the full reasoning.
   d["credentials_new"] = credentialsNew_;
   d["teardown_pending"] = teardownPending_.load(std::memory_order_acquire);
   d["in_registry"] = inRegistry_.load(std::memory_order_relaxed);
@@ -2079,14 +2756,42 @@ void fillApStatus(JsonObject d) {
   d["ws_rejected"] = wsRejected_;
   d["events_sent"] = eventsSent_;
   d["events_dropped"] = eventsDropped_;
+  // The grace window (apgrace.h), which is the state design/BRIEF.md 4.2 calls
+  // "reconnecting": the station has gone but its token is still good. The UI
+  // needs both halves — that a clock is running, and how much of it is left —
+  // to render an honest countdown instead of an indefinite spinner, and to know
+  // when to stop retrying and send the user back to the LCD.
+  //
+  // grace_ms is reported unconditionally so a client can size its own UI before
+  // the window ever opens; grace_ms_left only while one is actually armed, so
+  // its absence means "not in that state" rather than "zero seconds left".
+  d["grace_ms"] = (uint32_t)ApGrace::GRACE_MS;
   {
     Lock l(authLock_);
+    // grace_ is written only by httpTick() on the loop task, under this same
+    // lock. This function usually runs on the HTTP task, so the lock is what
+    // makes the pair of reads below consistent with each other rather than
+    // straddling a tick.
+    bool armed = ApGrace::armed(grace_);
+    d["grace_active"] = armed;
+    if (armed) {
+      d["grace_ms_left"] = ApGrace::remainingMs(grace_, millis());
+    }
     d["pin_fails"] = pinLimit_.totalFails;
     d["pin_lockouts"] = pinLimit_.lockouts;
     d["pin_locked"] = pinLimit_.locked;
     d["pin_attempts_remaining"] = RateLimit::remaining(pinLimit_);
   }
-  // NOTHING here is a secret: no PSK, no PIN, no token, no client MACs.
+  // A stored PIN from a pre-2026-08-24 build that could not be erased. Almost
+  // always false; false is not the same as "never checked", so it is reported
+  // rather than assumed.
+  if (stalePinKey_) {
+    d["nvs_stale_pin_key"] = true;
+  }
+  // NOTHING here is a secret: no PSK, no PIN — not its value, not its length,
+  // not the fact that it just changed — no token, no client MACs. The PIN's
+  // only route out of this file is Pairing::publish() to the LCD (pairing.h),
+  // and status() is wire-visible to every authenticated client.
 }
 
 // ===========================================================================
@@ -2133,6 +2838,7 @@ struct RestartReport {
   bool apUp;          // the AP's REAL state when this returned, not its intent
   bool reverted;      // the old passphrase was put back on the radio
   bool nvsReverted;   // ...and in NVS too
+  bool pinRotated;    // a pairing was ended, so the spent PIN was replaced
 };
 
 // Drops every WebSocket client and closes its socket. Returns how many.
@@ -2220,6 +2926,15 @@ bool setPassphrase(const char *fresh, RestartReport *rep, CmdError *err) {
   rep->clientsDisassociated = apUp_ ? WiFi.softAPgetStationNum() : 0;
   rep->sessionsRevoked = revokeAllSessions();
   rep->wsDropped = dropAllWsClients();
+  // A re-key ends any pairing, and the general rule applies unchanged: a
+  // revocation that actually revoked something rotates the PIN. See
+  // rotateAfterRevocation() for the rule and for why the AP restart below —
+  // including its failure and revert branches — is deliberately not an input to
+  // it. The sessions are already gone at this point; whether the radio comes
+  // back on the new key, the old key, or not at all cannot un-spend the PIN
+  // that paired them, and leaving a spent PIN on the LCD is precisely the
+  // outcome the rule exists to prevent.
+  rep->pinRotated = rotateAfterRevocation(rep->sessionsRevoked, 0);
 
   if (!apUp_) {
     // Enabled but the radio is down (a failed enable, or a teardown in
@@ -2358,6 +3073,11 @@ DispatchResult actPsk(JsonObjectConst p, JsonObject d, CmdError *err) {
   d["sessions_revoked"] = rep.sessionsRevoked;
   d["ws_clients_dropped"] = rep.wsDropped;
   d["clients_disassociated"] = rep.clientsDisassociated;
+  // Reported for the same reason the count of revoked sessions is: the operator
+  // on the cable has just invalidated a pairing, and needs to know the device is
+  // showing a different PIN now. The fact, never the value — `pin` is a separate
+  // AUTH_PHYSICAL action.
+  d["pin_rotated"] = rep.pinRotated;
   {
     Lock l(authLock_);
     d["source"] = pskSet_ ? "set" : "generated";
@@ -2375,7 +3095,12 @@ DispatchResult actSessions(JsonObjectConst p, JsonObject d, CmdError *err) {
 
   if (!rev.isNull()) {
     if (rev.is<const char *>() && strcmp(rev.as<const char *>(), "all") == 0) {
-      d["revoked"] = revokeAllSessions();
+      uint8_t n = revokeAllSessions();
+      d["revoked"] = n;
+      // 0 for the ended id: "all" may in principle have ended more than one,
+      // and naming an arbitrary member of a set is worse than naming none of
+      // it. n == 0 revoked nothing and therefore rotates nothing.
+      d["pin_rotated"] = rotateAfterRevocation(n, 0);
       d["sessions"] = liveSessionCount();
       return DISPATCH_OK;
     }
@@ -2390,6 +3115,8 @@ DispatchResult actSessions(JsonObjectConst p, JsonObject d, CmdError *err) {
       return DISPATCH_FAIL;
     }
     d["revoked"] = id;
+    // revokeSession() returned true to get here, so exactly one ended.
+    d["pin_rotated"] = rotateAfterRevocation(1, id);
     d["sessions"] = liveSessionCount();
     return DISPATCH_OK;
   }
@@ -2446,11 +3173,22 @@ DispatchResult httpDispatch(const CmdContext &ctx, const char *act, JsonObjectCo
     }
     Lock l(authLock_);
     d["pin"] = (const char *)pin_;
-    // The LCD is not driven yet. When W5 lands, THIS is the value the
-    // `display` module should be showing on the 160x80 ST7735 — an
-    // out-of-band channel for the PIN is the security asset ARCHITECTURE.md
-    // section 4 counts on, and it removes the need to read it over USB at all.
-    d["lcd"] = false;
+    // Whether this same value is ALSO on the 160x80 ST7735 right now. It was a
+    // hardcoded `false` with a note saying "when W5 lands"; W5 has landed, and
+    // a field that always says false is worse than no field — an operator on
+    // the cable would conclude the out-of-band channel is not working. The
+    // out-of-band channel is the security asset ARCHITECTURE.md section 4
+    // counts on, and when this reads true there was no need to come over USB
+    // for the PIN at all.
+    //
+    // Pairing::visible() reports the LCD's copy, not the policy: it is false
+    // when `display` is disabled (nothing ever subscribed, so publish() stored
+    // nothing) and false when the device is already paired.
+    //
+    // NOT a leak of the PIN through a second route: this action is
+    // AUTH_PHYSICAL, which has just handed the caller the PIN itself on the
+    // line above. It must never be copied into status(), which is not.
+    d["lcd"] = Pairing::visible();
     return DISPATCH_OK;
   }
 
@@ -2469,7 +3207,8 @@ void httpStatus(JsonObject d) { fillApStatus(d); }
 const ModuleParam PSK_PARAMS[] = {
     ModParam::str("set", false,
                   "omit to READ the current passphrase. 8..63 printable ASCII replaces it, restarts the AP and "
-                  "drops every session, client and WebSocket."),
+                  "drops every session, client and WebSocket. Ending a session rotates the pairing PIN, so the "
+                  "LCD will show a new one."),
 };
 
 const ModuleParam PIN_PARAMS[] = {
@@ -2494,7 +3233,7 @@ constexpr ModuleAction HTTP_ACTIONS[] = {
      ModAuth::requiredFor("http", "status")},
     {"psk",
      "the AP's WPA2 passphrase; set:\"...\" replaces it (8..63 printable ASCII) and restarts the AP, dropping "
-     "every session and client. USB console only (auth >= physical), both ways",
+     "every session and client and rotating the pairing PIN. USB console only (auth >= physical), both ways",
      MOD_PARAMS(PSK_PARAMS), ModAuth::requiredFor("http", "psk")},
     {"pin", "the pairing PIN. USB console only; regenerate:true issues a new one and revokes every session",
      MOD_PARAMS(PIN_PARAMS), ModAuth::requiredFor("http", "pin")},

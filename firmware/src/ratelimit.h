@@ -6,9 +6,22 @@
 // interesting states are 15 minutes and 49 days apart, and neither is testable
 // on hardware in any reasonable time.
 //
-// WHY. AuthFmt::PIN_LEN is 8 digits — 10^8 combinations. A fast loop over the
-// AP's ~1-2 ms round trip finds that in a couple of days of grinding, and a
-// 6-digit PIN in under an hour. The PIN is only meaningful WITH this file.
+// WHY. AuthFmt::PIN_LEN is 4 digits — 10^4 combinations. A fast loop over the
+// AP's ~1-2 ms round trip finds that in SECONDS. The PIN is only meaningful
+// WITH this file, and since 2026-08-24 that is not an overstatement: the PIN
+// was 8 digits (10^8, a couple of days of grinding) and is now 4, so this file
+// went from "the thing that makes an already-slow search hopeless" to a
+// load-bearing part of the credential itself.
+//
+// AND THIS FILE IS NOT SUFFICIENT ON ITS OWN EITHER. The schedule below allows
+// about 34 guesses an hour, which still walks 10^4 in roughly six days. What
+// closes that is mod_http.cpp minting a NEW PIN every time this limiter trips
+// into a lockout: each 17.5-minute cycle then spends its 10 guesses against a
+// fresh space and the attacker accumulates nothing. The rule that falls out of
+// that, and which mod_http.cpp states again at the site: THE LOCKOUT PATH MUST
+// NOT CALL success(). Rotating the PIN is not a reason to forgive the failures
+// — if it were, ten guesses would buy a limiter reset and this file would be a
+// no-op dressed up as a control.
 //
 // The policy, chosen to punish a script without bricking the device for the
 // person holding it:

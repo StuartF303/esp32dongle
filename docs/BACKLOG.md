@@ -26,6 +26,20 @@ passphrase, **the security boundary of this device is radio range.** Recorded he
 revisited on purpose, not rediscovered. The mitigations that remain: the PIN rate limiter,
 session lifetimes, the AP never being default-enabled, and the fact that an upload never reboots.
 
+**S10. A pre-2026-08-24 8-digit PIN is still readable in the `nvs` partition, and is accepted.**
+The pairing PIN stopped being persisted on 2026-08-24 and `enable http` now calls
+`Preferences::remove("pin")` on any key an older build left behind. That removes the key from the
+API — nothing can read it and `nvs_get_str` returns NOT_FOUND — but NVS is log-structured, so the
+call flips two bits in the page's entry-state bitmap and leaves the data entry untouched. Measured
+on the device: one byte changed in 32 KB (`0x39: 0xa8 -> 0x80`), and the old PIN was still legible
+at nvs offset `0x0d00` afterwards. It goes when NVS garbage-collects that page, on its own
+schedule. **Not fixable without cost:** overwriting the value first would append a new entry and
+still leave the original bytes, and the only true scrub is erasing the whole partition, which takes
+the Wi-Fi PSK and every module's enable state with it. Accepted because the residue is a one-off
+from a build that no longer exists, the value opens nothing, and the design property that matters —
+no new PIN is ever written to flash — holds regardless. Recorded so the next person to dump the
+partition finds an explanation instead of a live-looking credential.
+
 ---
 
 ## Correctness and robustness
@@ -69,6 +83,22 @@ current 26-action surface, and it grows with the same multiplier every new modul
 **C10. `Protocol::MAX_LINE` costs 3 KB of RAM per line-framing transport.**
 CDC and the WebSocket each carry a 4 KB line buffer; BLE will want a third. Worth revisiting if
 RAM gets tight, which it will.
+
+**C11. The grace window is bound to the station COUNT, not to the session holder.**
+`ApGrace::update()` takes `uint8_t stations` (`apgrace.h`), so *any* association cancels a
+departed holder's window. The header justifies that on the AP being single-client, but the
+inference it actually needs is "the only party who can associate is the session holder", and the
+PSK does not guarantee that — `psk set` exists precisely so the owner can share the passphrase, and
+S3 notes it may be a public secret by choice. The scenario, which is ordinary rather than
+adversarial: the owner pairs from phone A, phone A leaves, the 90 s window arms, and the owner's
+laptop associates within it. The window cancels, phone A's now-unreachable session is preserved,
+no PIN appears on the LCD, and the laptop cannot pair for the remaining `SESSION_IDLE_MS` — up to
+15 minutes with the device looking paired and nothing able to reach it. Recovery is the USB cable
+(`http sessions revoke:all`) or waiting it out. **Binding the window to the holder needs the
+station MAC** — captured at pairing from `esp_wifi_ap_get_sta_list()` and compared per tick rather
+than counted — which is a design decision about identifying a client by MAC, not a tweak, so it is
+stuart's call rather than something to do quietly. Note the same list call would also make
+`station_associated` mean "the holder is here" rather than "someone is here".
 
 ---
 
@@ -114,6 +144,9 @@ project's pin-everything rule. Vendoring the library into `lib/` is the only cle
 
 **T4. No CI.** `pio run` for both envs plus `pio test -e native` (the host suite — count lives in `README.md`, deliberately not repeated here) is a natural gate,
 and the native tests already cover the security-critical path sanitisation.
+Evidence that this is not theoretical: `README.md`'s figure had drifted from 229 to 236 without
+anyone noticing, because nothing checks it — it is only ever corrected when someone happens to run
+the suite and read the total.
 
 ---
 

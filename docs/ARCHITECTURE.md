@@ -335,23 +335,73 @@ irrelevant to every browser.
 Fit on the 160×80 panel — height is the only constraint, and the pitch is 0.136 mm (0.96 inch
 diagonal, 178.9 px across it):
 
-| payload | mode | version | +4-module quiet zone | at 2 px/module |
-|---|---|---|---|---|
-| `HTTP://192.168.4.1/4821` | alnum | 1 (21×21) | 29 | 58 px |
-| `http://192.168.4.1/?p=4821` | byte, ECC M | 2 (25×25) | 33 | 66 px |
-| `WIFI:T:WPA;S:...;P:...;;` (38 ch) | byte, ECC L | 3 (29×29) | 37 | 74 px |
+**Measured, not estimated** — run through the vendored encoder itself (`firmware/lib/qrcodegen`,
+`qrcodegen_encodeText` at ECC LOW with `boostEcl`, which is what the firmware will call), against
+the real SSID format `tdongle-%02x%02x` and the real generated passphrase form:
 
-All three fit with a spec-compliant quiet zone. At 2 px/module a module is 0.27 mm, which a 12 MP
-phone at 10 cm resolves at ~8 camera pixels — far above the ~3 px threshold. Version 1 at 3
+| payload | ch | version | modules | scale @ quiet 4 | module |
+|---|---|---|---|---|---|
+| `HTTP://192.168.4.1/4821` | 23 | **1** | 21×21 | 2 px → 58 px | 0.27 mm |
+| `http://192.168.4.1/4821` (lowercase) | 23 | 2 | 25×25 | 2 px → 66 px | 0.27 mm |
+| `http://192.168.4.1/?p=4821` | 26 | 2 | 25×25 | 2 px → 66 px | 0.27 mm |
+| `WIFI:` + generated 15-char PSK | 45 | **3** | 29×29 | 2 px → 74 px | 0.27 mm |
+| `WIFI:` + a 63-char owner-set PSK | 93 | 5 | 37×37 | **1 px → 45 px** | **0.14 mm** |
+
+The first four fit with a spec-compliant quiet zone. At 2 px/module a module is 0.27 mm, which a
+12 MP phone at 10 cm resolves at ~8 camera pixels — far above the ~3 px threshold. Version 1 at 3
 px/module with a 2-module quiet zone is 75 px and gives 0.41 mm modules; that is the robust
-option if the panel turns out to smear adjacent modules. **Decide it by scanning both off the
-real glass, not by arithmetic** — the risks here are specular glare and ST7735 pixel bleed, not
-resolution.
+option if the panel turns out to smear adjacent modules. **Decide between them by scanning both
+off the real glass, not by arithmetic** — the risks here are specular glare and ST7735 pixel
+bleed, not resolution.
+
+The uppercase scheme is worth a whole version and costs nothing: URL schemes are case-insensitive
+to every browser, and `HTTP://192.168.4.1/4821` is entirely inside QR alphanumeric mode
+(`0-9 A-Z $%*+-./: `), where the lowercase form falls back to byte mode.
+
+**The last row is the rule that had to be measured.** `psk set` accepts any legal WPA2
+passphrase up to 63 characters, and a long one pushes the join code to version 5, where 80 pixels
+of panel leaves 1 px per module — 0.14 mm, below what a phone can resolve. So the renderer
+**refuses to draw below 2 px/module and prints the SSID and passphrase as text instead**. An
+unreadable QR is worse than no QR: it looks like it should work.
 
 Security is unchanged by the QR: a camera needs line of sight to the screen, the same out-of-band
 property as reading the digits. The QR is therefore governed by the same `Pairing::shouldShow()`
 predicate and must never be reachable through `display.screen` over the wire. The page strips the
 PIN from the URL with `history.replaceState` on load, so a reload cannot re-pair.
+
+#### Answering the captive-network probes — decided 2026-08-24 with stuart
+
+Both phone platforms probe for internet the moment they associate, and both react badly when the
+probe fails: iOS raises the Captive Network Assistant sheet over whatever you were doing, and
+Android marks the network as having no connectivity, warns, and **may silently move back to
+mobile data** — which drops the association, which under the model above ends the session 90
+seconds later. The 90 s grace window exists partly to survive that. Not provoking it is better
+than surviving it.
+
+So the device runs a **DNS responder that answers every query with 192.168.4.1**, and replies to
+the two well-known probes with exactly what a working connection returns:
+
+| probe | expected |
+|---|---|
+| `http://captive.apple.com/hotspot-detect.html` (and the other Apple hosts) | `200` with the body `<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>` |
+| `http://connectivitycheck.gstatic.com/generate_204` (and `clients3.google.com`, `www.google.com/generate_204`) | `204` with an empty body |
+
+The DNS responder is required, not optional: the probes are fetched **by hostname**, so without
+one they never reach this device at all and the answer is moot.
+
+**This is deliberately a lie, and it is recorded as one.** The device is telling the phone that a
+network with no route anywhere has working internet. The justification is that the user joined
+this AP on purpose, to drive a tool, for a few minutes at a time — the OS warning is protecting
+against a case that does not exist here, and the cost of it firing is a dropped session. The
+honest alternative (a full captive portal that redirects the probe to the pairing page) was
+considered and rejected: the CNA sheet is a restricted browser with no durable `localStorage`, so
+the session token would not survive it, and Android would still treat the network as internetless
+and still consider leaving. It optimises first contact — which the pair QR already solves — at
+the cost of every reconnect after it.
+
+**mDNS was considered and deferred** (backlog F8). The QR carries the IP, so a name buys little,
+and mDNS wants 5–10 KB of heap on a board where TinyUSB already took 37 KB and BLE (F1) still
+needs ~40 KB of the ~145 KB free with Wi-Fi up.
 
 ### Tool modules
 

@@ -39,6 +39,21 @@
 // It comes BACK when the last session expires or is revoked, because at that
 // point the device is unpaired again and pairing must be possible.
 //
+// ---- WHAT PUBLISH() NOW CARRIES (changed 2026-08-24) --------------------
+//
+// The predicate is unchanged, but the VALUE is no longer stable. The PIN is
+// 4 digits, lives in RAM only, is never written to NVS, and mod_http.cpp mints
+// a fresh one on power-up/AP enable, ON USE (it is single-use — the moment it
+// is exchanged for a token it is spent), on session end (an explicit unpair, or
+// 90 s after the single AP client disassociates), and on every rate-limiter
+// lockout. So publish() may
+// arrive with a different string at any time and the panel must simply follow
+// it — seq() already makes that a redraw. Nothing downstream may cache the PIN,
+// print it into a scrollback, or treat "the PIN" as a fact about the device
+// that outlives the current pairing attempt: it is a one-shot token, and
+// shouldShow() now describes its whole lifetime rather than just its
+// visibility.
+//
 // ---- HEADER-ONLY, ON PURPOSE --------------------------------------------
 //
 // Same reason as activity.h and claims.h: `pio test -e native` excludes
@@ -61,8 +76,12 @@
 
 namespace Pairing {
 
-// AuthFmt::PIN_LEN is 8 today. Sized with room so that changing the PIN format
-// does not silently truncate the thing on screen; publish() bounds anyway.
+// AuthFmt::PIN_LEN is 4 today (it was 8 until 2026-08-24). Left at 16 on
+// purpose, and NOT tracked down to 4: this buffer exists so that changing the
+// PIN format does not silently truncate the thing on screen, which is exactly
+// the failure a tightly-sized buffer would produce the next time the length
+// moves. publish() bounds to MAX_PIN anyway, so the slack costs 12 bytes of
+// .bss and buys immunity to a format change.
 constexpr size_t MAX_PIN = 16;
 
 // THE POLICY. Pure, so it is unit-tested rather than asserted in a comment.

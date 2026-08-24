@@ -161,8 +161,17 @@ revokes the session and puts a new PIN on the device's screen.
 
 Joining a Wi-Fi network with no internet is a hostile experience on both platforms — iOS raises a
 captive-portal sheet, Android warns and may silently switch back to mobile data. The device
-mitigates this with QR codes on its own LCD, and this changes the shape of the pairing flow you
-are designing.
+mitigates this in two ways, and both change the shape of the pairing flow you are designing.
+
+**First, the device answers the platforms' connectivity probes as though the internet works.** It
+runs a DNS responder pointing everything at itself and returns the exact success responses Apple
+and Google's probes expect. The practical effect on your design: **no captive-portal sheet, no
+"no internet" warning, and the phone stays on the AP** instead of wandering back to mobile data.
+You are designing for an ordinary browser tab, not for a captive sheet. Note the honest edge of
+this — the page genuinely has no route to anywhere, so a link to any external URL is a dead end
+that will now *look* like it should work.
+
+**Second, QR codes on its own LCD.**
 
 Two distinct codes, because no single QR can both join a network and open a page:
 

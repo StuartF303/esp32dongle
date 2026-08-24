@@ -7,13 +7,22 @@
 // host and this would go untested.
 //
 // WHY IT EXISTS. The HTTP transport compares two secrets against attacker-
-// supplied input on every request: an 8-digit PIN and a 48-hex-character
+// supplied input on every request: a 4-digit PIN and a 48-hex-character
 // session token. The obvious `strcmp()` returns as soon as it finds a
 // differing byte, so the time it takes leaks HOW MANY LEADING BYTES WERE
 // RIGHT. Over a LAN that difference is small but measurable with enough
-// samples, and it converts a 10^8 PIN search into ~10*8 guesses — i.e. it
+// samples, and it converts a 10^4 PIN search into ~10*4 guesses — i.e. it
 // defeats the rate limiter as well, because each guess is a *legitimate*
-// failed attempt that happens to be informative.
+// failed attempt that happens to be informative. Since the PIN dropped from 8
+// digits to 4 (2026-08-24) that attack got cheaper in the only currency that
+// matters here: ~40 informative guesses instead of ~80, i.e. four lockout
+// cycles rather than eight. The other half of the defence — mod_http.cpp mints
+// a NEW PIN on every lockout — caps an attacker at the limiter's 10 guesses
+// against any one PIN, which is about what a prefix oracle needs to nail ONE
+// digit position before the value it was solving is thrown away. The two
+// controls are therefore not redundant: rotation bounds how long a PIN can be
+// attacked, and this file is what stops each of those 10 attempts being worth a
+// whole position instead of one value out of 10,000.
 //
 // The rule these functions obey: the number of loop iterations, and the set of
 // bytes touched, depend ONLY on the declared buffer length — never on the
