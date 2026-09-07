@@ -186,6 +186,44 @@ actual point of a macro pad. Note macros are layout-dependent — see the en_GB 
 
 ---
 
+## Awaiting a decision from stuart
+
+Not deferred for cost — deferred because they are his call and were never answered.
+
+**D1. Which LCD screens are in scope.** Brainstormed 2026-08-24; he picked the QR and the
+joining experience and did not choose from the rest. Ranked by value over cost at the time:
+
+| idea | cost | note |
+|---|---|---|
+| clock (HH:MM + date) | low | **no RTC battery and no NTP** — nothing calls `settimeofday`. Wall time can only be seeded by the browser on every WS hello, so it reads `--:--` until the first pairing and again after a power cycle. The 40 MHz crystal drifts under a second a day, and re-seeding on reconnect makes that moot. |
+| countdown / stopwatch | low | `millis()`-based, so none of the clock's problem. Expiry → APA102 red + backlight pulse. **Not** a HID action on expiry — a timer that types on the host is a footgun. |
+| boot button (GPIO 0) as UI | low | unused at runtime today. Short press = cycle screen, long = backlight. Makes the panel useful when the phone is not out, which matters because the dongle may be behind a machine. |
+| client presence + RSSI | low | useful for finding where the AP dies while walking a workshop. |
+| idle dim / auto-cycle | low | backlight is already LEDC PWM on GPIO 38; `backlightApply()` exists. |
+| alarm at a wall-clock time | low | free once the clock exists. |
+| macro legend | defer | waits on F7. |
+
+**D2. QR mask: `AUTO` or forced.** `qrcodegen_Mask_AUTO` is most of the ~24 ms encode; forcing
+one mask cuts it roughly 8×. Deliberately not taken, because mask choice affects how a real
+camera copes with a real symbol on real glass, and nothing on this machine can test that. Decide
+after scanning off the panel.
+
+**D3. Row-banding the QR blit.** `QR_ROWS_PER_BAND = 8` measures **~175 µs slower** than
+per-row (5,660 vs 5,485 µs, six repaints each, both arms built from the same source and flashed
+back to back) and costs 1,280 bytes of stack, because the cost is 6,400 `qrcodegen_getModule()`
+calls at ~0.8 µs, not the 70 SPI transactions it removes. Left in place because reversing it is
+a behaviour change he should make knowingly; both arms' numbers are in the comment.
+
+**D4. The phone test plan.** Everything needing an association or a camera is unproven and
+permanently unprovable here (see CLAUDE.md). In rough order: scan the join QR and associate;
+whether iOS stays quiet and what Android actually does; the panel switching join → pair;
+scanning the pair QR and landing already paired; a 20-minute idle page surviving on the
+keepalive; reassociating inside and outside the 90 s window; unpair putting a new PIN up; ten
+wrong PINs giving `ELOCKED` **and** a changed PIN; and scan quality at arm's length in workshop
+light.
+
+---
+
 ## Tooling and hygiene
 
 **T1. Adafruit GFX drags in `Wire`.** ~8.5 KB flash and 204 B RAM of I2C machinery on a board

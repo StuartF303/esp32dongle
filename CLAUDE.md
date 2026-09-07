@@ -175,8 +175,44 @@ See the **`flash-dongle` skill** (`.claude/skills/flash-dongle/`) for the build/
 command sequence and every failure mode hit so far with its actual cause. Read it before
 flashing rather than rediscovering them.
 
-No application code yet. Architecture and feature plan agreed 2026-08-15 — see
-`docs/ARCHITECTURE.md`. Headlines:
+### Where the firmware stands (2026-08-24)
+
+Six modules are live — `cdc`, `led`, `hid`, `storage`, `http`, `display` — on a
+transport-agnostic command bus, with OTA upload and rollback, a module registry with resource
+claims, and 311 host tests in 21 suites (`pio test -e native`; the count lives in `README.md`
+and nowhere else, deliberately).
+
+**Pairing was reworked on 2026-08-24** — see `docs/ARCHITECTURE.md` §"Pairing model". The AP
+takes one client and holds one session; the PIN is 4 digits, RAM only, minted on power-up, on
+session end, on rate-limiter lockout and on being consumed, and never written to flash. A 90 s
+grace window between the station leaving and the session being revoked is what stops a phone
+that silently drops the AP from locking its owner out. `apgrace.h`, `pinpolicy.h`, `qrfit.h`,
+`wifiqr.h` and `pairurl.h` exist because `pio test -e native` excludes `src/*.cpp`, so any
+predicate that matters has to live in a header to be testable at all.
+
+**QR pairing landed the same day.** The panel shows a `WIFI:` join code while no station is
+associated and a `HTTP://<ip>/<pin>` pair code once one is. A DNS responder plus captive-probe
+answers keep iOS quiet; **Android is expected to warn anyway** and the reasoning is in
+ARCHITECTURE.md §"Answering the captive-network probes".
+
+**What is proven and what is not.** Everything reachable over the USB cable is verified on
+hardware, including the running image proven by byte-for-byte comparison against a local build.
+Nothing that needs an association or a camera is proven — see the verification ceiling below.
+
+### This machine cannot verify half of this project
+
+`/sys/class/ieee80211/` does not exist here and there is no camera. So the Wi-Fi association
+paths — pairing over HTTP, the WebSocket, the captive probes actually answering, the `/<pin>`
+route on the wire, the OTA upload — and anything about whether a QR scans **cannot be tested
+from this machine at all**. That is permanent, not a matter of time.
+
+The correct response is to say "unproven" and name what it would take (stuart's phone, or a USB
+Wi-Fi adapter), not to reason to a pass. Where a property matters, push it into a
+dependency-free header so the host suite can cover it: that is why `pairurl.h` exists, and the
+`/<pin>` route's "every 4-digit path gets the identical response" property is asserted
+exhaustively there rather than argued in a comment.
+
+Architecture and feature plan agreed 2026-08-15 — see `docs/ARCHITECTURE.md`. Headlines:
 
 - Transport-agnostic command bus; USB CDC, HTTP/WebSocket and BLE GATT are adapters onto it.
 - **ESP32-S3 is BLE-only** (no Bluetooth Classic, no SPP/PAN), and iOS has no Web Bluetooth,
